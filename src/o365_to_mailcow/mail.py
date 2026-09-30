@@ -73,9 +73,10 @@ WELL_KNOWN_SKIP = (
     "localfailures",
 )
 _KEYWORD_BAD = re.compile(r"[^A-Za-z0-9_\-.+:@#&!]")
-# RFC 5322 msg-id, restricted to printable ASCII without spaces; anything else is treated
-# as "no Message-ID" so tenant data never reaches an IMAP SEARCH unvalidated.
-_MESSAGE_ID = re.compile(r"^<[\x21-\x3b\x3d\x3f-\x7e]{1,995}>$")
+# RFC 5322 msg-id restricted to atext (no IMAP atom-specials, no domain literals); anything
+# else is treated as "no Message-ID" so tenant data never reaches an IMAP SEARCH unquoted.
+_ATEXT = r"[A-Za-z0-9!#$&'+\-/=?^_`|~.]"
+_MESSAGE_ID = re.compile(rf"^<{_ATEXT}{{1,500}}@{_ATEXT}{{1,494}}>$")
 _WS = re.compile(r"\s+")
 
 
@@ -303,14 +304,16 @@ def same_message(source: bytes, dest: bytes) -> str:
     """
     if _normalised_sha256(source) == _normalised_sha256(dest):
         return "identical"
-    parser = BytesHeaderParser(policy=policy.default)
     try:
+        # policy.default parses header values lazily inside get(); a malformed From or
+        # Message-ID raises there, so the whole comparison sits inside the try.
+        parser = BytesHeaderParser(policy=policy.default)
         a, b = parser.parsebytes(source), parser.parsebytes(dest)
+        for name in ("message-id", "date", "from", "subject"):
+            if _header(a, name) != _header(b, name):
+                return "different"
     except Exception:  # noqa: BLE001 - unparsable headers are simply "different"
         return "different"
-    for name in ("message-id", "date", "from", "subject"):
-        if _header(a, name) != _header(b, name):
-            return "different"
     src_parts, dst_parts = _leaf_digests(source), _leaf_digests(dest)
     if src_parts is None or dst_parts is None or src_parts != dst_parts:
         return "different"
@@ -318,6 +321,14 @@ def same_message(source: bytes, dest: bytes) -> str:
 
 
 # -- migrator --------------------------------------------------------------------------
+
+class _DeltaLinkError(Exception):
+    """A GraphError raised by the delta call itself (not by a per-message fetch)."""
+
+    def __init__(self, cause: GraphError) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
 
 class MailMigrator:
     """Plan, migrate and verify the mail of one mailbox."""
@@ -391,6 +402,8 @@ class MailMigrator:
                 skip_reason = "parent skipped"
             elif wk in WELL_KNOWN_SKIP:
                 skip_reason = f"well-known folder {wk}"
+            elif folder.get("isHidden") and not folder.get("totalItemCount"):
+                skip_reason = "hidden empty system folder"
             elif path.lower() in user_skips or display.lower() in user_skips:
                 skip_reason = "source_folder_skip"
             if wk in WELL_KNOWN_MAP:
@@ -450,7 +463,10 @@ class MailMigrator:
 
     def _delta_messages(self, link: str, fr: FolderResult,
                         done: set[str]) -> tuple[list[dict], str | None]:
-        items, new_link = self._graph.get_delta(link, headers=PREFER_DELTA)
+        try:
+            items, new_link = self._graph.get_delta(link, headers=PREFER_DELTA)
+        except GraphError as exc:
+            raise _DeltaLinkError(exc) from exc
         out: list[dict] = []
         for item in items:
             if "@removed" in item:
@@ -576,9 +592,10 @@ class MailMigrator:
             if stored_link:
                 try:
                     messages, new_link = self._delta_messages(stored_link, fr, done)
-                except GraphError as exc:
+                except _DeltaLinkError as wrapped:
+                    exc = wrapped.cause
                     if not delta_expired(exc):
-                        raise
+                        raise exc from None
                     # Graph discards old delta tokens; a stale one must never wedge the
                     # folder, so forget it and list fully in the same run.
                     log.warning("%s: delta link for %r expired (%s); listing fully",
@@ -625,10 +642,16 @@ class MailMigrator:
                     self._progress.advance(self._key)
                     continue
                 if not mid:
-                    # cannot be searched for; the folder was recreated, so copy it again
-                    # (a duplicate is visible and fixable, a silent gap is not)
-                    fr.reappended_after_uidvalidity += 1
-                    todo.append(msg)
+                    # cannot be searched for; if it was recorded under the old UIDVALIDITY
+                    # the folder was recreated since, so copy it again (a duplicate is
+                    # visible and fixable, a silent gap is not); a row already carrying
+                    # the current UIDVALIDITY was appended after the change and is done
+                    if self._state.message_uidvalidity(src, fid, gid) == uidvalidity:
+                        fr.already_done += 1
+                    else:
+                        fr.reappended_after_uidvalidity += 1
+                        todo.append(msg)
+                    self._progress.advance(self._key)
                     continue
                 if dest.has_message_id(name, mid):
                     fr.already_done += 1
@@ -643,7 +666,14 @@ class MailMigrator:
                 continue
             # ISC-48/98: only messages with a Message-ID, only if the folder had content
             if mid and gid not in done and count_at_start > 0:
-                verdict = self._dedupe(dest, fp, fr, msg, mid, uidvalidity)
+                try:
+                    verdict = self._dedupe(dest, fp, fr, msg, mid, uidvalidity)
+                except ImapConnectionError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - a dedupe problem never loses mail
+                    log.warning("%s: dedupe check failed for a message in %r (%s); appending",
+                                src, name, exc.__class__.__name__)
+                    verdict = "append"
                 if verdict != "append":
                     continue
             todo.append(msg)

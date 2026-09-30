@@ -80,6 +80,7 @@ class Config:
     # run
     state_dir: Path
     mailboxes: tuple[MailboxMapping, ...]
+    mailcow_ca_file: str | None = None  # private CA bundle for the mailcow host (API, DAV, IMAP)
     parallel_mailboxes: int = 2
     max_message_bytes: int = 150 * 1024 * 1024
     calendar_exceptions_from_days: int = 730
@@ -195,10 +196,14 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
     # Two mappings onto one destination would share one mailbox's app password and
     # IMAP folders from two threads; refuse rather than race (Silas M3).
     seen_dst: set[str] = set()
+    seen_src: set[str] = set()
     for m in mailboxes:
         if m.destination in seen_dst:
             raise ConfigError(f"destination mailbox {m.destination} is listed more than once")
+        if m.source in seen_src:
+            raise ConfigError(f"source mailbox {m.source} is listed more than once")
         seen_dst.add(m.destination)
+        seen_src.add(m.source)
 
     if missing:
         raise ConfigError("missing required configuration: " + ", ".join(missing))
@@ -207,6 +212,10 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         raise ConfigError("run.calendar_attendees must be 'keep' or 'strip'")
     if mailcow_host and not _HOSTNAME.match(mailcow_host):
         raise ConfigError("mailcow.host must be a bare hostname, e.g. mail.example.net")
+    ca_file = mc.get("ca_file")
+    if ca_file is not None:
+        if not isinstance(ca_file, str) or not Path(ca_file).is_file():
+            raise ConfigError(f"mailcow.ca_file must name a readable PEM file, got {ca_file!r}")
 
     state_dir = Path(run.get("state_dir", "/state"))
     return Config(
@@ -216,9 +225,10 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         client_secret=client_secret,
         mailcow_host=mailcow_host,
         mailcow_api_key=api_key,
+        mailcow_ca_file=ca_file,
         state_dir=state_dir,
         mailboxes=tuple(mailboxes),
-        parallel_mailboxes=_int(run, "parallel_mailboxes", 2, 1, 8),
+        parallel_mailboxes=_int(run, "parallel_mailboxes", 2, 1, 4),
         max_message_bytes=_int(run, "max_message_bytes", 150 * 1024 * 1024,
                                1024, 1024 * 1024 * 1024),
         calendar_exceptions_from_days=_int(run, "calendar_exceptions_from_days", 730, 0, 36500),

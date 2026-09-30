@@ -273,11 +273,11 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
         lines.append(f"  ! {text}")
 
     for source, entry in mailboxes.items():
-        lines.append(f"{source} -> {entry.get('destination', source)}")
+        lines.append(f"{clean(source)} -> {clean(entry.get('destination', source))}")
         if entry.get("status") == "missing":
             problem("destination mailbox does not exist in mailcow")
         for err in entry.get("errors", []):
-            problem(f"error: {err}")
+            problem(f"error: {clean(err)}")
         mail = entry.get("mail")
         if mail:
             lines.append("  mail folder                          graph  skip  fail  "
@@ -285,7 +285,7 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
             for f in mail.get("folders", []):
                 mark = "MISMATCH" if f["mismatch"] else "ok"
                 lines.append(
-                    f"    {f['dest_name'][:34]:<34} {f['graph_total']:>6} {f['skipped']:>5} "
+                    f"    {clean(f['dest_name'])[:34]:<34} {f['graph_total']:>6} {f['skipped']:>5} "
                     f"{f['failed']:>5} {f['expected']:>7} {f['imap_count']:>5}  {mark}")
                 if f["failed"]:
                     problem(f"mail {f['dest_name']}: {f['failed']} failed", f["failed"])
@@ -298,7 +298,8 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
                 if f.get("note"):
                     lines.append(f"      note: {f['note']}")
             for sk in mail.get("skipped_folders", []):
-                text = f"mail folder skipped: {sk['path']} ({sk['reason']}), {sk['total']} messages"
+                text = (f"mail folder skipped: {clean(sk['path'])} ({sk['reason']}), "
+                        f"{sk['total']} messages")
                 if sk["total"]:
                     problem(text, sk["total"])
                 else:
@@ -313,7 +314,7 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
                 for mm in mail["sample_mismatches"]:
                     problem(f"sample content mismatch: {mm}")
             for err in mail.get("errors", []):
-                problem(f"mail: {err}")
+                problem(f"mail: {clean(err)}")
         for kind in ("calendar", "contacts"):
             sec = entry.get(kind)
             if not sec:
@@ -321,7 +322,7 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
             for c in sec.get("collections", []):
                 mark = "MISMATCH" if c["mismatch"] else "ok"
                 lines.append(
-                    f"  {kind} {c['name'][:30]:<30} graph {c['graph_count']:>5} "
+                    f"  {kind} {clean(c['name'])[:30]:<30} graph {c['graph_count']:>5} "
                     f"fail {c['failed']:>4} expect {c['expected']:>5} "
                     f"dav {c['dav_count']:>5}  {mark}")
                 if c["failed"]:
@@ -330,12 +331,12 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
                     problem(f"{kind} {c['name']}: expected {c['expected']}, "
                             f"DAV has {c['dav_count']}")
             for sk in sec.get("skipped", []):
-                lines.append(f"  - {kind} skipped by design: {sk}")
+                lines.append(f"  - {kind} skipped by design: {clean(sk)}")
                 listed_by_design += 1
             for fb in sec.get("fallbacks", []):
-                problem(f"{kind} fallback (address book not created): {fb}")
+                problem(f"{kind} fallback (address book not created): {clean(fb)}")
             for err in sec.get("errors", []):
-                problem(f"{kind}: {err}")
+                problem(f"{kind}: {clean(err)}")
     if problems:
         lines.append(f"VERIFY FAILED: {problems} skipped/failed/mismatched item(s) listed above")
     elif listed_by_design:

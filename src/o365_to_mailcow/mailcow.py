@@ -68,7 +68,9 @@ class MailcowApi:
     """Thin client for ``https://{host}/api/v1/``."""
 
     def __init__(self, host: str, api_key: str, session: requests.Session | None = None,
-                 verify: bool = True, allow_provision: bool = False) -> None:
+                 verify: bool | str = True, allow_provision: bool = False) -> None:
+        """``verify`` is True (system CAs) or the path of a private CA bundle; never False
+        outside tests."""
         self._allowed = ALLOWED_PREFIXES + (PROVISION_PREFIXES if allow_provision else ())
         self._base = f"https://{host}/api/v1/"
         self._session = session or requests.Session()

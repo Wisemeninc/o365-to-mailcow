@@ -51,7 +51,8 @@ class SogoDav:
     """CalDAV/CardDAV access to one SOGo user with Basic auth (an app password)."""
 
     def __init__(self, host: str, user: str, password: str,
-                 session: requests.Session | None = None, verify: bool = True) -> None:
+                 session: requests.Session | None = None, verify: bool | str = True) -> None:
+        """``verify`` is True (system CAs) or the path of a private CA bundle."""
         self._host = host.lower()
         self._user = user
         self._base = f"https://{host}/SOGo/dav/{quote(user, safe='@')}/"

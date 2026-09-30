@@ -262,7 +262,7 @@ def test_non_boolean_and_out_of_range_values_rejected(tmp_path):
     with pytest.raises(ConfigError, match="true or false"):
         config.load_config(bad_bool, env=ENV)
     too_many = _write(tmp_path, 'mailboxes = ["a@x"]\nparallel_mailboxes = 50\n')
-    with pytest.raises(ConfigError, match="between 1 and 8"):
+    with pytest.raises(ConfigError, match="between 1 and 4"):
         config.load_config(too_many, env=ENV)
 
 
@@ -337,6 +337,8 @@ def test_append_after_reconnect_returns_existing_uid_instead_of_duplicating():
     first.append.side_effect = OSError("connection reset")
     second = mock.MagicMock(name="client2")
     second.search.return_value = [42]
+    # the copy committed before the drop is byte-identical to what we are appending
+    second.fetch.return_value = {42: {b"BODY[]": b"Message-ID: <m@x>\r\n\r\nbody\r\n"}}
     clients = iter([first, second])
     dest = imap_dest.ImapDestination("mail.example.net", 993, "a@x", "pw",
                                      client_factory=lambda *a, **k: next(clients))
@@ -345,6 +347,45 @@ def test_append_after_reconnect_returns_existing_uid_instead_of_duplicating():
     assert uid == 42
     second.append.assert_not_called()  # the copy was already committed before the drop
     second.select_folder.assert_called_once_with("INBOX", readonly=True)
+
+
+def test_append_after_reconnect_appends_when_existing_copy_differs():
+    from unittest import mock
+
+    from o365_to_mailcow import imap_dest
+
+    first = mock.MagicMock(name="client1")
+    first.append.side_effect = OSError("connection reset")
+    second = mock.MagicMock(name="client2")
+    second.search.return_value = [7]  # a same-Message-ID message that is NOT ours
+    second.fetch.return_value = {7: {b"BODY[]": b"Message-ID: <m@x>\r\n\r\nforged\r\n"}}
+    second.append.return_value = b"[APPENDUID 1 8] done"
+    clients = iter([first, second])
+    dest = imap_dest.ImapDestination("mail.example.net", 993, "a@x", "pw",
+                                     client_factory=lambda *a, **k: next(clients))
+    uid = dest.append("INBOX", b"Message-ID: <m@x>\r\n\r\nbody\r\n", [], datetime.now(UTC),
+                      message_id="<m@x>")
+    assert uid == 8 and second.append.call_count == 1
+
+
+def test_same_message_survives_malformed_headers():
+    bad = b'From: "\r\nMessage-ID: <x@[>\r\nDate: Tue, 1 Sep 99999999999 10:00:00 +0000\r\n\r\nx'
+    good = b"From: a@x\r\nMessage-ID: <m@x>\r\n\r\ny"
+    assert mail.same_message(bad, good) == "different"
+    assert mail.same_message(good, bad) == "different"
+
+
+@pytest.mark.parametrize("value", ["<a(b@x>", "<a@x)>", "<a{b}@x>", "<a%b@x>", "<a*@x>",
+                                   "<x@[10.0.0.1]>", '<a"b@x>', "<a\\b@x>"])
+def test_message_ids_with_imap_specials_are_rejected(value):
+    assert mail.valid_message_id(value) is None
+
+
+def test_duplicate_source_rejected(tmp_path):
+    path = _write(tmp_path, 'mailboxes = [{ source = "a@t", destination = "u@x" }, '
+                            '{ source = "a@t", destination = "v@x" }]\n')
+    with pytest.raises(ConfigError, match="source mailbox a@t is listed more than once"):
+        config.load_config(path, env=ENV)
 
 
 def test_concurrent_runs_on_one_state_dir_are_refused(tmp_path):

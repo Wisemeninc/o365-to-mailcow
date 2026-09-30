@@ -88,3 +88,23 @@ def test_absolute_monthly_30th_short_month_occurrence_becomes_rdate() -> None:
     assert [(d.month, d.day) for d in rdates] == [(2, 28)]
     assert "EXDATE" not in vevent
     assert any("RDATE" in w for w in conv.warnings)
+
+
+def test_overlapping_instance_at_window_start_is_not_an_rdate() -> None:
+    """Graph returns occurrences that overlap the window; one in progress at the window
+    start (or on its partial first day) must not be duplicated as an RDATE."""
+    pattern = {"type": "weekly", "interval": 1, "daysOfWeek": ["monday"],
+               "firstDayOfWeek": "monday"}
+    master = _master(pattern, "2025-12-29T09:00:00.0000000", "2025-12-29T10:00:00.0000000")
+    window = (datetime(2026, 1, 5, 9, 30, tzinfo=UTC), datetime(2026, 2, 1, tzinfo=UTC))
+    starts = ["2026-01-05T09:00:00.0000000", "2026-01-12T09:00:00.0000000",
+              "2026-01-19T09:00:00.0000000", "2026-01-26T09:00:00.0000000"]
+    instances = [
+        {"type": "occurrence", "seriesMasterId": master["id"], "originalStart": s,
+         "start": {"dateTime": s, "timeZone": "UTC"},
+         "end": {"dateTime": s[:11] + "10:00:00.0000000", "timeZone": "UTC"}}
+        for s in starts
+    ]
+    converted = convert_event(master, instances, window=window)
+    vevent = next(c for c in Calendar.from_ical(converted.ics).walk("VEVENT"))
+    assert "RDATE" not in vevent and "EXDATE" not in vevent

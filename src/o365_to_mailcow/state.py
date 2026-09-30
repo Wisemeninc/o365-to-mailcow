@@ -103,6 +103,13 @@ class State:
         ).fetchone()
         return row[0] if row else None
 
+    def message_uidvalidity(self, mailbox: str, folder_id: str, graph_id: str) -> int | None:
+        row = self._exec(
+            "SELECT uidvalidity FROM messages WHERE mailbox=? AND folder_id=? AND graph_id=?",
+            (mailbox, folder_id, graph_id),
+        ).fetchone()
+        return row[0] if row else None
+
     def set_folder_meta(self, mailbox: str, folder_id: str, dest_name: str,
                         uidvalidity: int | None) -> None:
         self._exec(

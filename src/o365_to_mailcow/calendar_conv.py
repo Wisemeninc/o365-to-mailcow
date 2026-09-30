@@ -894,14 +894,25 @@ def _derive_exdates(
                 missing.append(occurrence)
         elif occurrence not in present:
             missing.append(occurrence)
+    # Graph returns instances that merely *overlap* the window (one in progress at the
+    # window start, or an all-day one on the window's first, partial day). Those have no
+    # counterpart in the window-limited rule expansion, so only anchors strictly inside the
+    # window may become RDATEs; otherwise an RRULE occurrence would be listed twice.
+    window_start, window_end = _as_utc(window[0]), _as_utc(window[1])
     extra: list[datetime | date] = []
     tzinfo = span.dtstart_value.tzinfo if isinstance(span.dtstart_value, datetime) else None
     for anchor in sorted(present, key=str):
         if isinstance(anchor, datetime):
-            if not _has_instant_near(expected_instants, anchor.astimezone(UTC)):
+            instant = anchor.astimezone(UTC)
+            if not window_start <= instant < window_end:
+                continue
+            if not _has_instant_near(expected_instants, instant):
                 extra.append(anchor.astimezone(tzinfo) if tzinfo else anchor)
-        elif anchor not in expected_dates:
-            extra.append(anchor)
+        else:
+            if not window_start.date() < anchor < window_end.date():
+                continue
+            if anchor not in expected_dates:
+                extra.append(anchor)
     return missing, extra
 
 

@@ -46,8 +46,9 @@ class ImapDestination:
     """One authenticated IMAP connection to the mailcow host for one mailbox."""
 
     def __init__(self, host: str, port: int, user: str, password: str,
-                 verify: bool = True, client_factory: Callable[..., IMAPClient] = IMAPClient,
+                 verify: bool | str = True, client_factory: Callable[..., IMAPClient] = IMAPClient,
                  timeout: SocketTimeout | None = None) -> None:
+        """``verify`` is True (system CAs) or the path of a private CA bundle."""
         self._host = host
         self._port = port
         self._user = user
@@ -61,8 +62,9 @@ class ImapDestination:
     # -- connection --------------------------------------------------------------------
 
     def _ssl_context(self) -> ssl.SSLContext:
-        ctx = ssl.create_default_context()
-        if not self._verify:  # test hook only; production callers never pass False
+        cafile = self._verify if isinstance(self._verify, str) else None
+        ctx = ssl.create_default_context(cafile=cafile)
+        if self._verify is False:  # test hook only; production callers never pass False
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         return ctx
@@ -187,9 +189,11 @@ class ImapDestination:
             try:
                 self.connect()
                 if message_id:
-                    found = self._search(self._client, folder, message_id)  # type: ignore[arg-type]
-                    if found:
-                        return found[-1]
+                    client = self._client
+                    for uid in self._search(client, folder, message_id)[-5:]:  # type: ignore[arg-type]
+                        data = client.fetch([uid], ["BODY.PEEK[]"]).get(uid) or {}  # type: ignore[union-attr]
+                        if _same_bytes(bytes(data.get(b"BODY[]", b"")), mime):
+                            return uid  # committed before the connection dropped
                 resp = do_append(self._client)  # type: ignore[arg-type]
             except CONNECTION_ERRORS as exc2:
                 self._client = None
@@ -216,3 +220,8 @@ class ImapDestination:
 
 def _short(exc: BaseException) -> str:
     return str(exc)[:200]
+
+
+def _same_bytes(a: bytes, b: bytes) -> bool:
+    norm = (lambda d: d.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))  # noqa: E731
+    return norm(a) == norm(b)
