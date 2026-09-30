@@ -167,21 +167,29 @@ docker compose run --rm o365mig --mailboxes /config/mailboxes.csv provision --dr
 docker compose run --rm o365mig --mailboxes /config/mailboxes.csv provision
 ```
 
-### The four commands
+### The commands
 
 ```sh
-docker compose run --rm o365mig plan      # what would move; creates nothing
-docker compose run --rm o365mig migrate   # move it (safe to re-run)
-docker compose run --rm o365mig verify    # prove it; exit 1 if anything is off
-docker compose run --rm o365mig cleanup   # delete all o365-migration app passwords
+docker compose run --rm o365mig plan        # what would move; creates nothing
+docker compose run --rm o365mig provision   # create missing destination mailboxes + aliases
+docker compose run --rm o365mig migrate     # move it (safe to re-run; later runs copy changes)
+docker compose run --rm o365mig verify      # prove it; exit 1 if anything is off
+docker compose run --rm o365mig cleanup     # delete all o365-migration-* app passwords
+docker compose up -d web                    # the web UI (see below) does all of the above
 ```
 
 | Command | Does | Writes |
 |---------|------|--------|
 | `plan` | Lists folders with message counts and sizes, calendars, contact folders, skipped items; checks that each destination mailbox exists | nothing (Graph reads, mailcow `get` calls) |
-| `migrate` | Creates a temporary app password per mailbox, migrates, deletes the app password | IMAP APPEND, DAV MKCALENDAR/MKCOL/PUT, app password add/delete |
-| `verify` | Per folder: Graph total, skipped, failed, expected, IMAP count. Per calendar/address book: Graph count vs DAV count. Prints every skipped and failed category | app password add/delete only |
+| `provision` | Creates destination mailboxes that do not exist (domain must exist), then their aliases; writes initial passwords to a 0600 file | mailcow `add/mailbox`, `add/alias` |
+| `migrate` | Creates a temporary app password per mailbox, migrates mail, calendars and contacts, deletes the app password. Re-runs copy only what is new or changed | IMAP APPEND, DAV MKCALENDAR/MKCOL/PUT, app password add/delete |
+| `verify` | Per folder: messages Graph lists, skipped, failed, expected, IMAP count (notes when Graph's raw item count differs). Per calendar/address book: Graph count vs DAV count. Prints every skipped and failed category | app password add/delete only |
 | `cleanup` | Deletes every app password named `o365-migration-*` for the configured mailboxes plus any recorded in state | app password delete |
+| `web` | Serves the local web UI: connections, tenant list, selection, and all of the commands above with live output | what the started commands write |
+
+Mailboxes are migrated `parallel_mailboxes` at a time (default 2, at most 4; each holds up to
+about 5 × `max_message_bytes` in memory, and the compose file caps the container at 3 GiB).
+Inside a mailbox, up to four Graph downloads run at once and one IMAP connection appends.
 
 Options (before or after the command):
 
@@ -220,7 +228,18 @@ docker compose logs web    # web UI: http://0.0.0.0:8080/#token=<token>
 
 Open `http://127.0.0.1:8080/#token=<token>` on the Docker host. Without Docker,
 `o365mig --config config.toml web` prints `http://127.0.0.1:8080/#token=<token>`
-(options `--bind ADDRESS`, `--port N`).
+(options `--bind ADDRESS`, `--port N`, `--lock-settings`, `--allow-host NAME`). If port
+8080 is taken on the host, publish another one without editing `compose.yaml`: a
+`compose.override.yaml` with
+
+```yaml
+services:
+  web:
+    ports: !override
+      - "127.0.0.1:8091:8080"
+```
+
+(the same file can carry `user: "1000:1000"` so `state/` and `config/` stay owned by you).
 
 - **Connections panel.** The tenant id, client id, sign-in mode, client secret, mailcow
   host and API key can be entered in the page instead of the files. They are saved to
