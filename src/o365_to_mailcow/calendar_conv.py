@@ -222,19 +222,24 @@ def convert_event(
         master_event.add("rrule", rrule_map)
 
     exdate_values: list[datetime | date] = []
+    rdate_values: list[datetime | date] = []
     if master_type == "seriesmaster" and rrule_map:
-        exdate_values = _derive_exdates(
+        exdate_values, rdate_values = _derive_exdates(
             span=master_span,
             rrule_text=rrule_text,
             instances=instances,
             window=window,
             warnings=warnings,
         )
-    if exdate_values and master_span.is_all_day:
-        # icalendar omits VALUE=DATE on date lists; RFC 5545 defaults EXDATE to DATE-TIME.
-        master_event.add("exdate", exdate_values, parameters={"VALUE": "DATE"})
-    elif exdate_values:
-        master_event.add("exdate", exdate_values)
+    date_params = {"VALUE": "DATE"} if master_span.is_all_day else None
+    # icalendar omits VALUE=DATE on date lists; RFC 5545 defaults EXDATE to DATE-TIME.
+    if exdate_values:
+        master_event.add("exdate", exdate_values, parameters=date_params)
+    if rdate_values:
+        # Graph reported these occurrences but the RRULE cannot produce them (Outlook's
+        # last-day-of-month booking, or other Outlook-only pattern quirks).
+        master_event.add("rdate", rdate_values, parameters=date_params)
+        warnings.warn(f"{len(rdate_values)} occurrence(s) not expressible in RRULE added as RDATE")
 
     exception_events: list[Event] = []
     if master_type == "seriesmaster":
@@ -288,11 +293,13 @@ def convert_event(
     calendar.add("prodid", _PRODID)
     calendar.add("calscale", "GREGORIAN")
 
+    open_ended = bool(rrule_map) and "UNTIL" not in rrule_map and "COUNT" not in rrule_map
+    horizon = latest.year + (12 if open_ended else 2)
     for tzid in sorted(used_tzids):
         tz_component = Timezone.from_tzinfo(
             zone(tzid),
             first_date=date(earliest.year - 1, 1, 1),
-            last_date=date(latest.year + 2, 1, 1),
+            last_date=date(horizon, 1, 1),
         )
         calendar.add_component(tz_component)
 
@@ -707,7 +714,7 @@ def _rrule_from_master(
             warnings.warn("invalid recurrence.pattern.dayOfMonth; RRULE omitted")
             return None, None, None
         rule["FREQ"] = "MONTHLY"
-        rule.update(_monthday_rule(day_of_month))
+        rule.update(_monthday_rule(day_of_month, None, warnings))
     elif pattern_type == "relativemonthly":
         relative = _relative_byday(pattern=pattern, warnings=warnings)
         if relative is None:
@@ -722,7 +729,7 @@ def _rrule_from_master(
             return None, None, None
         rule["FREQ"] = "YEARLY"
         rule["BYMONTH"] = month
-        rule.update(_monthday_rule(day_of_month))
+        rule.update(_monthday_rule(day_of_month, month, warnings))
     elif pattern_type == "relativeyearly":
         month = _bounded_int(pattern.get("month"), min_value=1, max_value=12)
         if month is None:
@@ -785,17 +792,25 @@ def _rrule_from_master(
     return rule, rrule_value, latest_until
 
 
-def _monthday_rule(day_of_month: int) -> dict[str, Any]:
-    """BYMONTHDAY for a Graph ``dayOfMonth``, keeping Outlook's short-month behaviour.
+def _monthday_rule(day_of_month: int, month: int | None, warnings: _WarningSink) -> dict[str, Any]:
+    """BYMONTHDAY for a Graph ``dayOfMonth``, in a form SOGo expands correctly.
 
     Outlook books a series on the 29th, 30th or 31st on the *last* day of months that are
-    shorter, whereas RFC 5545 simply skips a month with no such day. ``BYMONTHDAY=28..d``
-    with ``BYSETPOS=-1`` picks the latest existing candidate in every month (or, under
-    FREQ=YEARLY with BYMONTH, in that month), which reproduces Outlook exactly.
+    shorter, whereas RFC 5545 skips a month with no such day. ``BYMONTHDAY=-1`` is exactly
+    Outlook's meaning for the 31st (and for 29 February in a yearly series), and SOGo
+    supports negative month days. The 29th and 30th have no single-rule equivalent that
+    SOGo evaluates (it ignores BYSETPOS without BYDAY), so those keep the plain rule and
+    the Graph occurrences that fall on a shorter month's last day are added as RDATEs by
+    the instance comparison, with a warning.
     """
-    if day_of_month <= 28:
-        return {"BYMONTHDAY": day_of_month}
-    return {"BYMONTHDAY": list(range(28, day_of_month + 1)), "BYSETPOS": -1}
+    if day_of_month == 31 or (month == 2 and day_of_month >= 29):
+        return {"BYMONTHDAY": -1}
+    if day_of_month >= 29:
+        warnings.warn(
+            f"day-of-month {day_of_month} series: shorter months are covered by RDATE "
+            "entries inside the exceptions window only"
+        )
+    return {"BYMONTHDAY": day_of_month}
 
 
 def _relative_byday(
@@ -835,8 +850,11 @@ def _derive_exdates(
     instances: list[dict[str, Any]],
     window: tuple[datetime, datetime],
     warnings: _WarningSink,
-) -> list[datetime | date]:
-    """Return EXDATE values for rule occurrences in ``window`` that Graph did not return.
+) -> tuple[list[datetime | date], list[datetime | date]]:
+    """Return ``(EXDATEs, RDATEs)`` for the rule occurrences in ``window``.
+
+    EXDATE: rule occurrences Graph did not return (cancelled). RDATE: Graph occurrences
+    (or exception origins) the rule does not generate, so they are not lost.
 
     Timed series are expanded from the tz-aware local DTSTART, so dateutil keeps the local
     wall time across DST changes, and compared as UTC instants. All-day series are expanded
@@ -846,13 +864,13 @@ def _derive_exdates(
     fetch far more often than a series whose every occurrence was cancelled.
     """
     if rrule_text is None:
-        return []
+        return [], []
     expected = _expected_occurrences(span, rrule_text, window, warnings=warnings)
     if not expected:
-        return []
+        return [], []
     if not instances:
         warnings.warn("series master has empty instances list; EXDATE derivation skipped")
-        return []
+        return [], []
 
     present: set[datetime | date] = set()
     for item in instances:
@@ -865,6 +883,10 @@ def _derive_exdates(
             present.add(anchor)
 
     present_instants = sorted(a for a in present if isinstance(a, datetime))
+    expected_instants = sorted(
+        o.astimezone(UTC) for o in expected if isinstance(o, datetime)
+    )
+    expected_dates = {o for o in expected if isinstance(o, date) and not isinstance(o, datetime)}
     missing: list[datetime | date] = []
     for occurrence in expected:
         if isinstance(occurrence, datetime):
@@ -872,7 +894,15 @@ def _derive_exdates(
                 missing.append(occurrence)
         elif occurrence not in present:
             missing.append(occurrence)
-    return missing
+    extra: list[datetime | date] = []
+    tzinfo = span.dtstart_value.tzinfo if isinstance(span.dtstart_value, datetime) else None
+    for anchor in sorted(present, key=str):
+        if isinstance(anchor, datetime):
+            if not _has_instant_near(expected_instants, anchor.astimezone(UTC)):
+                extra.append(anchor.astimezone(tzinfo) if tzinfo else anchor)
+        elif anchor not in expected_dates:
+            extra.append(anchor)
+    return missing, extra
 
 
 def _has_instant_near(sorted_instants: list[datetime], target: datetime) -> bool:

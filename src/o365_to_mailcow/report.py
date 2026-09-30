@@ -265,6 +265,7 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
     """
     lines: list[str] = []
     problems = 0
+    listed_by_design = 0
 
     def problem(text: str, count: int = 1) -> None:
         nonlocal problems
@@ -302,6 +303,7 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
                     problem(text, sk["total"])
                 else:
                     lines.append(f"  - {text}")
+                    listed_by_design += 1
             if mail.get("sample_requested"):
                 lines.append(
                     f"  sample: {mail['sample_checked']} compared, "
@@ -329,12 +331,16 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
                             f"DAV has {c['dav_count']}")
             for sk in sec.get("skipped", []):
                 lines.append(f"  - {kind} skipped by design: {sk}")
+                listed_by_design += 1
             for fb in sec.get("fallbacks", []):
-                lines.append(f"  - {kind} fallback: {fb}")
+                problem(f"{kind} fallback (address book not created): {fb}")
             for err in sec.get("errors", []):
                 problem(f"{kind}: {err}")
     if problems:
         lines.append(f"VERIFY FAILED: {problems} skipped/failed/mismatched item(s) listed above")
+    elif listed_by_design:
+        lines.append(f"All counts match; nothing failed. {listed_by_design} item(s) skipped by "
+                     "design are listed above (empty system folders, calendars shared by others).")
     else:
         lines.append("All counts match; nothing skipped, nothing failed.")
     return lines, problems

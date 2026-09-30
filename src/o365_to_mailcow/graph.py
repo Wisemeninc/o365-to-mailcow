@@ -13,6 +13,7 @@ import random
 import threading
 import time
 from collections.abc import Callable, Iterator
+from typing import Any
 from urllib.parse import urlsplit
 
 import requests
@@ -54,9 +55,13 @@ def _clamp(seconds: float) -> float:
 
 
 def delta_expired(exc: GraphError) -> bool:
-    """True when Graph says a stored delta link can no longer be used (HTTP 410 or code)."""
+    """True when a stored delta link should be discarded: Graph answers 410, names a known
+    sync-state error, or rejects the link with any other client error (4xx except
+    throttling). Server errors and throttling are transient and are not treated as expiry."""
     text = str(exc)
-    return exc.status == 410 or any(code.lower() in text.lower() for code in DELTA_EXPIRED_CODES)
+    if exc.status == 410 or any(code.lower() in text.lower() for code in DELTA_EXPIRED_CODES):
+        return True
+    return 400 <= exc.status < 500 and exc.status not in (401, 429)
 
 
 class GraphClient:
@@ -112,25 +117,32 @@ class GraphClient:
 
     def get_bytes(self, path: str, headers: dict | None = None,
                   max_bytes: int | None = None) -> bytes:
-        """Download a binary resource, streaming; abandon it once ``max_bytes`` is exceeded."""
+        """Download a binary resource, streaming; abandon it once ``max_bytes`` is exceeded.
+
+        The body is read while the in-flight slot is still held, so the 4-per-mailbox cap
+        covers the whole transfer, not only the response headers.
+        """
         hdrs = {"Accept": "*/*"}
         if headers:
             hdrs.update(headers)
-        resp = self._request(path, params=None, headers=hdrs, stream=True)
-        try:
+
+        def read(resp: requests.Response) -> bytes:
             chunks: list[bytes] = []
             total = 0
-            for chunk in resp.iter_content(chunk_size=1 << 16):
-                total += len(chunk)
-                if max_bytes is not None and total > max_bytes:
-                    raise GraphTooLarge(path, max_bytes)
-                chunks.append(chunk)
+            try:
+                for chunk in resp.iter_content(chunk_size=1 << 16):
+                    total += len(chunk)
+                    if max_bytes is not None and total > max_bytes:
+                        raise GraphTooLarge(path, max_bytes)
+                    chunks.append(chunk)
+            except requests.RequestException as exc:
+                raise GraphError(0, f"network error while streaming: {exc.__class__.__name__}",
+                                 path) from exc
+            finally:
+                resp.close()
             return b"".join(chunks)
-        except requests.RequestException as exc:
-            raise GraphError(0, f"network error while streaming: {exc.__class__.__name__}",
-                             path) from exc
-        finally:
-            resp.close()
+
+        return self._request(path, params=None, headers=hdrs, stream=True, reader=read)
 
     # -- internals ---------------------------------------------------------------------
 
@@ -159,8 +171,11 @@ class GraphClient:
         return min(60.0, (2**attempt) + random.uniform(0, 1))  # noqa: S311 - jitter only
 
     def _request(
-        self, path: str, params: dict | None, headers: dict | None, stream: bool
-    ) -> requests.Response:
+        self, path: str, params: dict | None, headers: dict | None, stream: bool,
+        reader: Callable[[requests.Response], Any] | None = None,
+    ) -> Any:
+        """GET with retries. With ``reader``, the response body is consumed by ``reader``
+        inside the in-flight slot and its result is returned instead of the response."""
         url = self._resolve(path)
         base_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
         if headers:
@@ -181,7 +196,7 @@ class GraphClient:
                     self._sleep(self._retry_after_network(attempt))
                     continue
                 if resp.status_code < 300:
-                    return resp
+                    return reader(resp) if reader is not None else resp
                 if 300 <= resp.status_code < 400:
                     resp.close()
                     raise GraphError(resp.status_code, "redirect refused", path)

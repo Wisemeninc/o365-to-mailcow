@@ -91,7 +91,8 @@ class ContactsMigrator:
                     n += 1
                     slug = f"{slug_base}-{n}"
                 used.add(slug)
-                self._state.set_collection_slug(self._src, self.kind, fid, slug)
+                if not self._dry_run:  # plan creates nothing, not even state rows
+                    self._state.set_collection_slug(self._src, self.kind, fid, slug)
             qfid = quote(fid, safe="")
             out.append(ContactFolder(fid, name, f"{base}/contactFolders/{qfid}/contacts", slug))
             children = list(self._graph.iter_pages(
@@ -102,7 +103,9 @@ class ContactsMigrator:
     def _contacts(self, folder: ContactFolder):
         return self._graph.iter_pages(folder.contacts_path, params={"$top": PAGE_SIZE})
 
-    def _photo(self, contact_id: str) -> bytes | None:
+    def _photo(self, contact_id: str) -> tuple[bytes | None, bool]:
+        """Return ``(photo, ok)``; ``ok`` is False when the fetch failed for a reason other
+        than "no photo", so the caller can leave the contact eligible for a retry."""
         try:
             user = quote(self._src, safe="@")
             cid = quote(contact_id, safe="")
@@ -111,8 +114,9 @@ class ContactsMigrator:
             if exc.status != 404:  # 404 = no photo (ISC-111); anything else: go on without
                 self._photo_errors += 1
                 log.warning("%s: photo for a contact unavailable: %s", self._src, exc)
-            return None
-        return data or None
+                return None, False
+            return None, True
+        return data or None, True
 
     # -- plan --------------------------------------------------------------------------
 
@@ -192,7 +196,7 @@ class ContactsMigrator:
             if category not in cats:
                 cats.append(category)
             contact = {**contact, "categories": cats}
-        photo = self._photo(gid) if self._cfg.contacts_photos else None
+        photo, photo_ok = self._photo(gid) if self._cfg.contacts_photos else (None, True)
         try:
             conv = contacts_conv.convert_contact(contact, photo)
         except Exception as exc:  # a converter bug must not end the whole run
@@ -203,7 +207,10 @@ class ContactsMigrator:
         except DavError as exc:
             self._fail(cr, gid, last_modified, str(exc))
             return
-        self._state.mark_contact(self._src, gid, cr.slug, last_modified, STATUS_DONE)
+        # a contact whose photo could not be fetched is stored without its last_modified
+        # so the next run tries again (the vCard itself is complete apart from PHOTO)
+        self._state.mark_contact(self._src, gid, cr.slug,
+                                 last_modified if photo_ok else None, STATUS_DONE)
         cr.put += 1
 
     def _fail(self, cr: CollectionResult, gid: str, last_modified: str | None,

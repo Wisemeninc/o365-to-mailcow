@@ -156,7 +156,9 @@ class MailcowApi:
         return str(newest["id"]), pw
 
     def delete_app_password(self, mailcow_id: str) -> None:
-        data = self._request("POST", "delete/app-passwd", {"items": [str(mailcow_id)]})
+        # mailcow's json_api.php decodes the raw body as the list of ids for every
+        # delete endpoint (`$_POST['items'] = $request`), so the body is a bare array.
+        data = self._request("POST", "delete/app-passwd", [str(mailcow_id)])
         self._check_result(data, "delete/app-passwd")
         log.info("deleted app password id=%s", mailcow_id)
 

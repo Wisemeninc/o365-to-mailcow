@@ -358,8 +358,9 @@ def test_uidvalidity_change_forces_message_id_check_isc_121(env):
     inbox = next(f for f in res.folders if f.dest_name == "INBOX")
     assert inbox.uidvalidity_changed
     assert f"{U}/mailFolders/f-inbox/messages" in graph.paths("iter_pages")  # full listing
-    # m1 (has Message-ID, missing) re-appended; m2 cannot be checked and stays done
-    assert [s.message_id for s in world.folders["INBOX"]] == ["<m1@x>"]
+    # m1 (has Message-ID, missing) re-appended; m2 cannot be checked, so it is re-copied too
+    assert sorted(s.message_id or "" for s in world.folders["INBOX"]) == ["", "<m1@x>"]
+    assert inbox.reappended_after_uidvalidity == 1
 
 
 def test_dry_run_makes_zero_writes_isc_96(env):

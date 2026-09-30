@@ -79,9 +79,19 @@ class CalendarMigrator:
 
     # -- listing -----------------------------------------------------------------------
 
-    def _owned(self, cal: dict) -> bool:
-        owner = str((cal.get("owner") or {}).get("address") or "").lower()
-        return bool(cal.get("isDefaultCalendar")) or owner == self._src.lower()
+    @staticmethod
+    def _owner(cal: dict) -> str:
+        return str((cal.get("owner") or {}).get("address") or "").lower()
+
+    def _owned(self, cal: dict, mine: set[str]) -> bool:
+        """A calendar is the mailbox's own when it is the default one, when Graph says the
+        user may share it (only the creator can), or when its owner address is one of the
+        mailbox's addresses. ``mine`` holds the configured source address plus the owner
+        address Graph reports on the default calendar, so a UPN that differs from the
+        primary SMTP address does not turn every secondary calendar into "shared"."""
+        if cal.get("isDefaultCalendar") or cal.get("canShare") is True:
+            return True
+        return self._owner(cal) in mine
 
     def _calendars(self) -> tuple[list[tuple[dict, str]], list[str]]:
         """Owned calendars with their destination slug, plus a list of skipped shared ones."""
@@ -91,10 +101,14 @@ class CalendarMigrator:
         # same name keep their own destinations across runs whatever the listing order.
         known = self._state.collection_slugs(self._src, self.kind)
         used = {DEFAULT_SLUG, *known.values()}
-        for cal in self._graph.iter_pages(f"/users/{quote(self._src, safe='@')}/calendars",
-                                          params={"$top": PAGE_SIZE}):
+        calendars = list(self._graph.iter_pages(
+            f"/users/{quote(self._src, safe='@')}/calendars", params={"$top": PAGE_SIZE}))
+        mine = {self._src.lower()}
+        mine.update(self._owner(c) for c in calendars if c.get("isDefaultCalendar"))
+        mine.discard("")
+        for cal in calendars:
             name = str(cal.get("name") or "Calendar")
-            if not self._owned(cal):
+            if not self._owned(cal, mine):
                 owner = (cal.get("owner") or {}).get("address") or "unknown owner"
                 skipped.append(f"{name} (shared by {owner})")
                 continue
@@ -109,7 +123,8 @@ class CalendarMigrator:
                     n += 1
                     slug = f"{base}-{n}"
                 used.add(slug)
-                self._state.set_collection_slug(self._src, self.kind, cal["id"], slug)
+                if not self._dry_run:  # plan creates nothing, not even state rows
+                    self._state.set_collection_slug(self._src, self.kind, cal["id"], slug)
             owned.append((cal, slug))
         return owned, skipped
 

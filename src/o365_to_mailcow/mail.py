@@ -23,7 +23,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from email import policy
+from email import message_from_bytes, policy
 from email.parser import BytesHeaderParser
 from urllib.parse import quote
 
@@ -116,7 +116,7 @@ class FolderResult:
     skipped_too_large: int = 0
     removed_in_source: int = 0
     vanished_in_source: int = 0
-    unverifiable_after_uidvalidity: int = 0
+    reappended_after_uidvalidity: int = 0
     would_append: int = 0
     uidvalidity_changed: bool = False
     delta_reset: bool = False
@@ -265,7 +265,27 @@ def folder_size(folder: dict) -> int | None:
 
 
 def _normalised_sha256(data: bytes) -> str:
-    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+    # IMAP APPEND (imaplib) rewrites bare CR/LF as CRLF; compare line-ending-agnostic
+    return hashlib.sha256(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")).hexdigest()
+
+
+def _leaf_digests(raw: bytes) -> list[str] | None:
+    """SHA-256 of every decoded leaf part (text and attachments), boundaries excluded.
+    Stable across Exchange's MIME re-rendering, which changes boundaries, header order
+    and encodings but not the payload bytes. None if the message cannot be parsed."""
+    try:
+        msg = message_from_bytes(raw, policy=policy.default)
+        out: list[str] = []
+        for part in msg.walk():
+            if part.is_multipart():
+                continue
+            payload = part.get_payload(decode=True) or b""
+            if part.get_content_maintype() == "text":
+                payload = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n").strip()
+            out.append(hashlib.sha256(payload).hexdigest())
+        return sorted(out)
+    except Exception:  # noqa: BLE001 - malformed MIME: no verdict possible
+        return None
 
 
 def _header(msg, name: str) -> str:
@@ -276,9 +296,10 @@ def _header(msg, name: str) -> str:
 def same_message(source: bytes, dest: bytes) -> str:
     """Decide whether two MIME renderings are the same message.
 
-    Returns ``"identical"`` (byte-equal after CRLF normalisation), ``"regenerated"``
+    Returns ``"identical"`` (byte-equal after line-ending normalisation), ``"regenerated"``
     (Exchange re-renders MIME for items it stores as MAPI: same Message-ID, Date, From and
-    Subject and a size within a third of each other) or ``"different"``.
+    Subject, and every decoded leaf part, attachments included, has the same digest) or
+    ``"different"``. A copy that lost or changed any part is therefore never "regenerated".
     """
     if _normalised_sha256(source) == _normalised_sha256(dest):
         return "identical"
@@ -290,8 +311,10 @@ def same_message(source: bytes, dest: bytes) -> str:
     for name in ("message-id", "date", "from", "subject"):
         if _header(a, name) != _header(b, name):
             return "different"
-    big, small = max(len(source), len(dest)), max(1, min(len(source), len(dest)))
-    return "regenerated" if big / small <= 4 / 3 else "different"
+    src_parts, dst_parts = _leaf_digests(source), _leaf_digests(dest)
+    if src_parts is None or dst_parts is None or src_parts != dst_parts:
+        return "different"
+    return "regenerated"
 
 
 # -- migrator --------------------------------------------------------------------------
@@ -335,7 +358,7 @@ class MailMigrator:
 
     def _walk(self) -> Iterator[tuple[dict, list[dict]]]:
         """Yield ``(folder, ancestors)`` depth-first, parents before children."""
-        params = {"$top": PAGE_SIZE, "$expand": FOLDER_EXPAND}
+        params = {"$top": PAGE_SIZE, "$expand": FOLDER_EXPAND, "includeHiddenFolders": "true"}
         stack: list[tuple[dict, list[dict]]] = [
             (f, []) for f in self._graph.iter_pages(
                 self._user_path("mailFolders"), params=params, headers=PREFER_IMMUTABLE)
@@ -602,9 +625,10 @@ class MailMigrator:
                     self._progress.advance(self._key)
                     continue
                 if not mid:
-                    fr.unverifiable_after_uidvalidity += 1  # cannot be searched for
-                    fr.already_done += 1
-                    self._progress.advance(self._key)
+                    # cannot be searched for; the folder was recreated, so copy it again
+                    # (a duplicate is visible and fixable, a silent gap is not)
+                    fr.reappended_after_uidvalidity += 1
+                    todo.append(msg)
                     continue
                 if dest.has_message_id(name, mid):
                     fr.already_done += 1
@@ -646,7 +670,6 @@ class MailMigrator:
             return "skipped"
         except GraphError:
             return "append"  # the normal path records the failure
-        msg["_mime"] = mime  # no second download if we end up appending
         for uid in uids[-5:]:
             if same_message(mime, dest.fetch_message(name, uid)) != "different":
                 self._state.mark_message(src, fid, gid, name, mid, STATUS_DONE,
@@ -663,15 +686,12 @@ class MailMigrator:
         queue = iter(todo)
         pending: deque[tuple[dict, Future[bytes]]] = deque()
 
-        def fetch(m: dict) -> bytes:
-            return m["_mime"] if "_mime" in m else self._download(m["id"])
-
         def refill() -> None:
             while len(pending) < PREFETCH_WINDOW:
                 nxt = next(queue, None)
                 if nxt is None:
                     return
-                pending.append((nxt, pool.submit(fetch, nxt)))
+                pending.append((nxt, pool.submit(self._download, nxt["id"])))
 
         refill()
         while pending:

@@ -173,8 +173,8 @@ least every 30 seconds.
 Inbox > `INBOX`, Sent Items > `Sent`, Drafts > `Drafts`, Deleted Items > `Trash`,
 Junk Email > `Junk`, Archive > `Archive`. Other folders keep their names and hierarchy;
 control characters are removed, a hierarchy delimiter inside a name becomes `_`, and a
-name that collides with a mapped folder gets ` (2)`. Messages are appended as the exact
-MIME Graph returns, with `\Seen` (read), `\Flagged` (flagged), `\Draft` (draft), Outlook
+name that collides with a mapped folder gets ` (2)`. Messages are appended as the
+MIME Graph returns (line endings normalised to CRLF by IMAP), with `\Seen` (read), `\Flagged` (flagged), `\Draft` (draft), Outlook
 categories as IMAP keywords (spaces and special characters become `_`), and the received
 date as the internal date. Messages above `max_message_bytes` (default 150 MiB) are skipped
 and reported.

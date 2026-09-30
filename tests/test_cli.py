@@ -169,7 +169,9 @@ def mailcow(world):
                                          "log": ["app_passwd", "add", body]}])
 
         def delete_pw(req):
-            ids = {str(i) for i in json.loads(req.body)["items"]}
+            body = json.loads(req.body)
+            assert isinstance(body, list), "mailcow delete takes a bare JSON array of ids"
+            ids = {str(i) for i in body}
             with lock:
                 for addr, items in list(world.app_passwords.items()):
                     world.app_passwords[addr] = [p for p in items if str(p["id"]) not in ids]
@@ -321,7 +323,7 @@ def test_leftover_app_passwords_deleted_first_isc_125(world, config, mailcow, tm
     world.app_passwords["alice@example.net"] = [{"id": 7, "name": "o365-migration"}]
     assert cli.main(["--config", config(), "--mailbox", "alice@contoso.com", "--only",
                      "mail", "migrate"]) == 0
-    deletes = [json.loads(c.request.body)["items"] for c in mailcow.calls
+    deletes = [json.loads(c.request.body) for c in mailcow.calls
                if c.request.url.endswith("delete/app-passwd")]
     assert deletes[0] == ["7"]
     state = State(tmp_path / "state" / "state.db")

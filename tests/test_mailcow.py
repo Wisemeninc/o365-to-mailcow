@@ -109,7 +109,7 @@ def test_create_failure_never_leaks_password_or_log(api):
 def test_delete_app_password_payload(api):
     responses.post(BASE + "delete/app-passwd", json=[{"type": "success", "msg": "ok"}])
     api.delete_app_password("12")
-    assert json.loads(responses.calls[0].request.body) == {"items": ["12"]}
+    assert json.loads(responses.calls[0].request.body) == ["12"]  # bare array (json_api.php)
 
 
 @responses.activate

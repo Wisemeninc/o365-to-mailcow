@@ -129,8 +129,11 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
     if not path.is_file():
         raise ConfigError(f"config file not found: {path}")
     _check_file_mode(path)
-    with path.open("rb") as fh:
-        data = tomllib.load(fh)
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
 
     ms = data.get("microsoft", {})
     mc = data.get("mailcow", {})

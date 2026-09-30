@@ -7,6 +7,7 @@ or a mailbox errored, 2 configuration or sign-in error.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
 import os
 import re
@@ -283,7 +284,12 @@ class Runner:
     def with_app_password(self, api: MailcowApi, m: MailboxMapping,
                           fn: Callable[[str], None]) -> None:
         """Create a temporary app password, run ``fn(password)``, always delete it."""
-        leftovers = self.purge_app_passwords(api, m.destination, include_named=False)
+        try:
+            leftovers = self.purge_app_passwords(api, m.destination, include_named=False)
+        except MailcowError as exc:  # a stuck leftover must not block the migration itself
+            leftovers = 0
+            log.warning("%s: could not delete leftover app password(s): %s; "
+                        "run 'o365mig cleanup' later", m.destination, exc)
         if leftovers:
             log.info("%s: deleted %d leftover app password(s)", m.destination, leftovers)
         pw_id, password = api.create_app_password(m.destination)
@@ -509,6 +515,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"configuration error: {exc}", file=sys.stderr)
         return 2
 
+    lock = _acquire_lock(cfg.state_dir)
+    if lock is None:
+        print("another o365mig run is using this state directory; wait for it to finish",
+              file=sys.stderr)
+        return 2
     secret_filter = SecretFilter()
     secret_filter.add(cfg.client_secret)
     secret_filter.add(cfg.mailcow_api_key)
@@ -537,7 +548,22 @@ def main(argv: Iterable[str] | None = None) -> int:
         for h in handlers:
             root.removeHandler(h)
             h.close()
+        lock.close()
     return code
+
+
+def _acquire_lock(state_dir: Path):
+    """Hold an exclusive lock on ``<state_dir>/.lock`` for the whole run, so two containers
+    sharing one state volume cannot purge each other's live app passwords."""
+    path = state_dir / ".lock"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    handle = os.fdopen(fd, "w")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -94,11 +94,13 @@ def test_second_run_idempotent_on_last_modified(env):
     mig(cfg, state, graph, dav).migrate()
     conv.calls.clear()
     res = mig(cfg, state, graph, dav).migrate()
-    assert conv.calls == []
-    assert sum(c.unchanged for c in res.collections) == 4
+    # c3's photo fetch failed (not a 404), so it alone is retried on the next run
+    assert [c["id"] for c, _ in conv.calls] == ["c3"]
+    assert sum(c.unchanged for c in res.collections) == 3
+    conv.calls.clear()
     graph.routes[f"{U}/contacts"][1]["lastModifiedDateTime"] = "2025-01-01T00:00:00Z"
     mig(cfg, state, graph, dav).migrate()
-    assert [c["id"] for c, _ in conv.calls] == ["c2"]
+    assert sorted(c["id"] for c, _ in conv.calls) == ["c2", "c3"]
 
 
 def test_mkcol_refused_falls_back_to_personal_with_category_isc_84(env):

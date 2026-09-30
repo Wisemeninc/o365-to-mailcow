@@ -83,7 +83,9 @@ def test_retry_after_is_clamped():
 def test_delta_expired_detection():
     assert graph.delta_expired(graph.GraphError(410, "Gone", "/x"))
     assert graph.delta_expired(graph.GraphError(400, "SyncStateNotFound: token", "/x"))
-    assert not graph.delta_expired(graph.GraphError(403, "Forbidden", "/x"))
+    assert graph.delta_expired(graph.GraphError(404, "link unknown", "/x"))  # any other 4xx
+    assert not graph.delta_expired(graph.GraphError(429, "throttled", "/x"))
+    assert not graph.delta_expired(graph.GraphError(503, "busy", "/x"))
 
 
 # -- mailcow and DAV clients -----------------------------------------------------------
@@ -134,12 +136,15 @@ def test_same_message_identical_regenerated_different_cato_f9():
     head = b"Message-ID: <m@x>\r\nDate: Tue, 1 Sep 2026 10:00:00 +0000\r\n"
     a = head + b"From: a@x\r\nSubject: hi\r\n\r\nbody\r\n"
     b = a.replace(b"\r\n", b"\n")
-    c = head + b"From: a@x\r\nSubject: hi\r\n\r\nbody re-rendered\r\n"
+    # Exchange re-rendering: header order and extra headers change, payload does not
+    extra = b"Subject: hi\r\nX-MS-Exchange-Organization-Foo: 1\r\nFrom: a@x\r\n"
+    c = extra + head + b"\r\nbody\r\n"
     d = head + b"From: b@x\r\nSubject: hi\r\n\r\nbody\r\n"
+    e = head + b"From: a@x\r\nSubject: hi\r\n\r\nbody but not the same\r\n"
     assert mail.same_message(a, b) == "identical"
     assert mail.same_message(a, c) == "regenerated"
     assert mail.same_message(a, d) == "different"
-    assert mail.same_message(a, a + b"x" * 5000) == "different"  # size class differs
+    assert mail.same_message(a, e) == "different"  # a changed leaf part is never "regenerated"
 
 
 # -- delta expiry (Cato F2) ----------------------------------------------------------------
@@ -207,9 +212,9 @@ def test_calendar_slugs_are_stable_across_listing_order(tmp_path):
     mapping = MailboxMapping("alice@contoso.com", "alice@example.net")
     route = "/users/alice@contoso.com/calendars"
     first = CalendarMigrator(cfg, FakeGraph({route: [cal_a, cal_b]}),
-                             state, None, mapping, True)._calendars()[0]
+                             state, None, mapping, False)._calendars()[0]
     second = CalendarMigrator(cfg, FakeGraph({route: [cal_b, cal_a]}),
-                              state, None, mapping, True)._calendars()[0]
+                              state, None, mapping, False)._calendars()[0]
     expected = {"A": "team", "B": "team-2"}
     assert {c["id"]: s for c, s in first} == expected
     assert {c["id"]: s for c, s in second} == expected
@@ -319,3 +324,32 @@ def test_state_is_safe_under_threads(tmp_path):
 def test_internal_date_falls_back(tmp_path):
     fixed = datetime(2026, 1, 1, tzinfo=UTC)
     assert mail.internal_date({}, now=lambda: fixed) == fixed
+
+
+# -- reconnect during APPEND (Cato F10) ------------------------------------------------
+
+def test_append_after_reconnect_returns_existing_uid_instead_of_duplicating():
+    from unittest import mock
+
+    from o365_to_mailcow import imap_dest
+
+    first = mock.MagicMock(name="client1")
+    first.append.side_effect = OSError("connection reset")
+    second = mock.MagicMock(name="client2")
+    second.search.return_value = [42]
+    clients = iter([first, second])
+    dest = imap_dest.ImapDestination("mail.example.net", 993, "a@x", "pw",
+                                     client_factory=lambda *a, **k: next(clients))
+    uid = dest.append("INBOX", b"Message-ID: <m@x>\r\n\r\nbody\r\n", [], datetime.now(UTC),
+                      message_id="<m@x>")
+    assert uid == 42
+    second.append.assert_not_called()  # the copy was already committed before the drop
+    second.select_folder.assert_called_once_with("INBOX", readonly=True)
+
+
+def test_concurrent_runs_on_one_state_dir_are_refused(tmp_path):
+    held = cli._acquire_lock(tmp_path)
+    assert held is not None
+    assert cli._acquire_lock(tmp_path) is None
+    held.close()
+    assert cli._acquire_lock(tmp_path) is not None
