@@ -1,0 +1,144 @@
+"""Persistent run state (sqlite) that makes every command idempotent.
+
+Every write is its own transaction so an interrupted run can resume at the item after the
+last one recorded. The file never contains credentials: identifiers, statuses and error
+summaries only.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+import time
+from pathlib import Path
+
+STATUS_DONE = "done"
+STATUS_FAILED = "failed"
+STATUS_SKIPPED = "skipped"
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages (
+    mailbox TEXT NOT NULL, graph_id TEXT NOT NULL, folder TEXT NOT NULL,
+    message_id TEXT, status TEXT NOT NULL, error TEXT, updated_at REAL NOT NULL,
+    PRIMARY KEY (mailbox, graph_id));
+CREATE TABLE IF NOT EXISTS folder_delta (
+    mailbox TEXT NOT NULL, folder_id TEXT NOT NULL, delta_link TEXT NOT NULL,
+    updated_at REAL NOT NULL, PRIMARY KEY (mailbox, folder_id));
+CREATE TABLE IF NOT EXISTS events (
+    mailbox TEXT NOT NULL, calendar TEXT NOT NULL, uid TEXT NOT NULL,
+    last_modified TEXT, status TEXT NOT NULL, error TEXT, updated_at REAL NOT NULL,
+    PRIMARY KEY (mailbox, calendar, uid));
+CREATE TABLE IF NOT EXISTS contacts (
+    mailbox TEXT NOT NULL, graph_id TEXT NOT NULL, book TEXT NOT NULL,
+    last_modified TEXT, status TEXT NOT NULL, error TEXT, updated_at REAL NOT NULL,
+    PRIMARY KEY (mailbox, graph_id));
+"""
+
+
+class State:
+    def __init__(self, path: Path | str) -> None:
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.executescript(_SCHEMA)
+
+    def close(self) -> None:
+        self._conn.close()
+
+    def _exec(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+        with self._lock:
+            return self._conn.execute(sql, params)
+
+    # -- messages ----------------------------------------------------------------------
+
+    def message_status(self, mailbox: str, graph_id: str) -> str | None:
+        row = self._exec(
+            "SELECT status FROM messages WHERE mailbox=? AND graph_id=?", (mailbox, graph_id)
+        ).fetchone()
+        return row[0] if row else None
+
+    def mark_message(self, mailbox: str, graph_id: str, folder: str, message_id: str | None,
+                     status: str, error: str | None = None) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?,?)",
+            (mailbox, graph_id, folder, message_id, status, _trim(error), time.time()),
+        )
+
+    def message_counts(self, mailbox: str) -> dict[str, dict[str, int]]:
+        """{folder: {status: count}} for one mailbox."""
+        out: dict[str, dict[str, int]] = {}
+        for folder, status, n in self._exec(
+            "SELECT folder, status, COUNT(*) FROM messages WHERE mailbox=? GROUP BY folder, status",
+            (mailbox,),
+        ):
+            out.setdefault(folder, {})[status] = n
+        return out
+
+    def get_delta(self, mailbox: str, folder_id: str) -> str | None:
+        row = self._exec(
+            "SELECT delta_link FROM folder_delta WHERE mailbox=? AND folder_id=?",
+            (mailbox, folder_id),
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_delta(self, mailbox: str, folder_id: str, delta_link: str) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO folder_delta VALUES (?,?,?,?)",
+            (mailbox, folder_id, delta_link, time.time()),
+        )
+
+    # -- events ------------------------------------------------------------------------
+
+    def event_last_modified(self, mailbox: str, calendar: str, uid: str) -> str | None:
+        row = self._exec(
+            "SELECT last_modified FROM events WHERE mailbox=? AND calendar=? AND uid=? AND status=?",
+            (mailbox, calendar, uid, STATUS_DONE),
+        ).fetchone()
+        return row[0] if row else None
+
+    def mark_event(self, mailbox: str, calendar: str, uid: str, last_modified: str | None,
+                   status: str, error: str | None = None) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO events VALUES (?,?,?,?,?,?,?)",
+            (mailbox, calendar, uid, last_modified, status, _trim(error), time.time()),
+        )
+
+    def event_counts(self, mailbox: str) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for cal, status, n in self._exec(
+            "SELECT calendar, status, COUNT(*) FROM events WHERE mailbox=? GROUP BY calendar, status",
+            (mailbox,),
+        ):
+            out.setdefault(cal, {})[status] = n
+        return out
+
+    # -- contacts ----------------------------------------------------------------------
+
+    def contact_last_modified(self, mailbox: str, graph_id: str) -> str | None:
+        row = self._exec(
+            "SELECT last_modified FROM contacts WHERE mailbox=? AND graph_id=? AND status=?",
+            (mailbox, graph_id, STATUS_DONE),
+        ).fetchone()
+        return row[0] if row else None
+
+    def mark_contact(self, mailbox: str, graph_id: str, book: str, last_modified: str | None,
+                     status: str, error: str | None = None) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO contacts VALUES (?,?,?,?,?,?,?)",
+            (mailbox, graph_id, book, last_modified, status, _trim(error), time.time()),
+        )
+
+    def contact_counts(self, mailbox: str) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        for book, status, n in self._exec(
+            "SELECT book, status, COUNT(*) FROM contacts WHERE mailbox=? GROUP BY book, status",
+            (mailbox,),
+        ):
+            out.setdefault(book, {})[status] = n
+        return out
+
+
+def _trim(error: str | None) -> str | None:
+    return None if error is None else error[:300]

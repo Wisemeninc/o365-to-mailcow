@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "o365-to-mailcow"
+version = "0.1.0"
+description = "Migrate Microsoft 365 mail, calendars and contacts into mailcow (SOGo) via Microsoft Graph"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "msal>=1.31,<2",
+    "requests>=2.32,<3",
+    "imapclient>=3.0,<4",
+    "icalendar>=6.0,<7",
+    "python-dateutil>=2.9,<3",
+    "tzlocal>=5.2,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "responses>=0.25",
+    "vobject>=0.9.7",
+    "ruff>=0.6",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
+]
+
+[project.scripts]
+o365mig = "o365_to_mailcow.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "S", "UP"]
+ignore = ["S101"]  # assert in tests
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]  # test fixtures contain dummy secrets
