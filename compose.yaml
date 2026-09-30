@@ -1,0 +1,24 @@
+# Usage:
+#   mkdir -p state config && sudo chown 10001:10001 state
+#   cp config.example.toml config/config.toml && chmod 600 config/config.toml
+#   cp .env.example .env && chmod 600 .env        # then fill in the two secrets
+#   docker compose run --rm o365mig plan
+#   docker compose run --rm o365mig migrate
+#   docker compose run --rm o365mig verify
+#   docker compose run --rm o365mig cleanup
+services:
+  o365mig:
+    build: .
+    image: o365-to-mailcow:latest
+    env_file: .env
+    volumes:
+      - ./state:/state
+      - ./config:/config:ro
+    command: ["plan"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

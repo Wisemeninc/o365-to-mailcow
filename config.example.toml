@@ -1,0 +1,59 @@
+# o365-to-mailcow configuration.
+#
+# Copy to config/config.toml and `chmod 600` it (the tool warns if others can read it).
+# Keep secrets out of this file: set O365MIG_CLIENT_SECRET and O365MIG_MAILCOW_API_KEY in
+# the environment (for example in .env next to compose.yaml) instead.
+
+[microsoft]
+# Directory (tenant) ID of your Microsoft 365 tenant (Entra admin center > Overview).
+tenant_id = "00000000-0000-0000-0000-000000000000"
+# Application (client) ID of the app registration you created for this tool.
+client_id = "00000000-0000-0000-0000-000000000000"
+# "app" = client credentials with application permissions (default, no user sign-in);
+# "delegated" = device-code sign-in of an admin with Full Access to the mailboxes.
+auth_mode = "app"
+# Client secret for auth_mode = "app". Prefer the O365MIG_CLIENT_SECRET env variable,
+# which overrides this value. Not needed for "delegated".
+# client_secret = ""
+
+[mailcow]
+# Bare hostname of the mailcow server (no scheme, no port, no path). Used for the API,
+# IMAP (port imap_port) and SOGo DAV. It is the only non-Microsoft host ever contacted.
+host = "mail.example.net"
+# mailcow read-write API key (System > Configuration > Access > API). Prefer the
+# O365MIG_MAILCOW_API_KEY env variable, which overrides this value.
+# api_key = ""
+
+[run]
+# Where state.db, the MSAL token cache, logs/ and reports/ live. Mount it as a volume.
+state_dir = "/state"
+# Mailboxes to migrate: a plain address (same address on both sides) or a table that maps
+# a Microsoft 365 source address to a different mailcow destination address.
+mailboxes = [
+    "alice@example.net",
+    { source = "bob@contoso.com", destination = "bob@example.net" },
+]
+# Optional CSV of "source[,destination]" rows (lines starting with # are ignored), added
+# to the list above. The --mailboxes option does the same from the command line.
+# mailboxes_csv = "/config/mailboxes.csv"
+# How many mailboxes are migrated at the same time (each gets its own 4-request Graph cap).
+parallel_mailboxes = 2
+# Messages larger than this many bytes are skipped and reported (default 150 MiB).
+max_message_bytes = 157286400
+# Recurring-event exceptions are read from this many days in the past ...
+calendar_exceptions_from_days = 730
+# ... up to this many days in the future.
+calendar_exceptions_to_days = 1095
+# Also copy contact photos (one extra Graph request per contact).
+contacts_photos = false
+# "keep" copies attendees and organizer with SCHEDULE-AGENT=CLIENT so SOGo sends nothing;
+# "strip" removes ATTENDEE/ORGANIZER entirely for zero scheduling risk.
+calendar_attendees = "keep"
+# TLS certificate verification towards mailcow. Leave true; false exists only for tests.
+verify_tls = true
+# IMAPS port of the mailcow host.
+imap_port = 993
+# Log level for stderr and state_dir/logs (DEBUG, INFO, WARNING, ERROR); -v forces DEBUG.
+log_level = "INFO"
+# Extra source folders to skip, by display path ("Inbox/Newsletters") or name ("RSS Feeds").
+source_folder_skip = []

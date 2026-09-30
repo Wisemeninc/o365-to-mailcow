@@ -7,6 +7,7 @@ summaries only.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -44,8 +45,13 @@ class State:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        if not self._path.exists():
-            self._path.touch(mode=0o600)
+        # SQLite creates the -wal/-shm side files with the process umask; pre-creating
+        # them keeps every file of the state database at 0600 (ISC-130).
+        for side in ("", "-wal", "-shm"):
+            side_path = self._path.with_name(self._path.name + side)
+            if not side_path.exists():
+                side_path.touch(mode=0o600)
+            os.chmod(side_path, 0o600)
         self._conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)

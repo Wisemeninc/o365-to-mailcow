@@ -1,0 +1,17 @@
+.git
+.github
+.claude
+.venv
+.env
+.env.*
+state
+config
+tests
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+*.egg-info
+build
+dist
+ISA.md

@@ -1,0 +1,326 @@
+"""Progress output and the JSON run report.
+
+``Progress`` prints one line per active mailbox scope with done/total and items per
+minute, at most every ``interval`` seconds from ``advance`` calls and at least every
+``interval`` seconds from the ticker thread (ISC-118).
+
+``RunReport`` collects per-mailbox results and writes
+``<state_dir>/reports/<UTC timestamp>.json`` (ISC-114). ``verify_summary`` turns verify
+results into lines plus a problem count; it never produces an all-clear line while any
+skipped or failed category is non-zero (ISC-128).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import json
+import os
+import sys
+import threading
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, TextIO
+
+
+@dataclasses.dataclass
+class CollectionPlan:
+    """One Graph calendar or contact folder and where it would go in SOGo."""
+
+    source_id: str
+    name: str
+    slug: str
+    count: int
+    skip: bool = False
+    skip_reason: str | None = None
+
+
+@dataclasses.dataclass
+class CollectionsPlan:
+    mailbox: str
+    kind: str  # "calendar" | "contacts"
+    collections: list[CollectionPlan] = dataclasses.field(default_factory=list)
+    skipped: list[str] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class CollectionResult:
+    source_id: str
+    name: str
+    slug: str
+    listed: int = 0
+    put: int = 0
+    unchanged: int = 0
+    failed: int = 0
+    would_put: int = 0
+    error: str | None = None
+
+
+@dataclasses.dataclass
+class CollectionsResult:
+    mailbox: str
+    kind: str
+    dry_run: bool
+    collections: list[CollectionResult] = dataclasses.field(default_factory=list)
+    skipped: list[str] = dataclasses.field(default_factory=list)
+    fallbacks: list[str] = dataclasses.field(default_factory=list)
+    warnings: list[str] = dataclasses.field(default_factory=list)
+    errors: list[str] = dataclasses.field(default_factory=list)
+    duration_s: float = 0.0
+
+    @property
+    def failed(self) -> int:
+        return (sum(c.failed for c in self.collections)
+                + sum(1 for c in self.collections if c.error) + len(self.errors))
+
+
+@dataclasses.dataclass
+class CollectionVerify:
+    name: str
+    slug: str
+    graph_count: int
+    done: int
+    failed: int
+    dav_count: int
+    expected: int
+    mismatch: bool
+
+
+@dataclasses.dataclass
+class CollectionsVerify:
+    mailbox: str
+    kind: str
+    collections: list[CollectionVerify] = dataclasses.field(default_factory=list)
+    skipped: list[str] = dataclasses.field(default_factory=list)
+    fallbacks: list[str] = dataclasses.field(default_factory=list)
+    errors: list[str] = dataclasses.field(default_factory=list)
+
+
+def utc_stamp(now: datetime | None = None) -> str:
+    """Filesystem-safe UTC timestamp, e.g. ``20260930T201500Z``."""
+    return (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
+
+
+# -- progress --------------------------------------------------------------------------
+
+class NullProgress:
+    """Progress sink that does nothing (tests, dry library use)."""
+
+    def start(self, key: str, total: int) -> None:
+        """Register ``total`` more items for ``key``."""
+
+    def advance(self, key: str, n: int = 1) -> None:
+        """Record ``n`` processed items."""
+
+    def finish(self, key: str) -> None:
+        """Mark ``key`` complete."""
+
+
+class Progress(NullProgress):
+    """Thread-safe progress printer."""
+
+    def __init__(self, out: TextIO | None = None, interval: float = 30.0,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._out = out or sys.stderr
+        self._interval = interval
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._scopes: dict[str, dict[str, float]] = {}
+        self._last_print = clock()
+
+    def start(self, key: str, total: int) -> None:
+        with self._lock:
+            scope = self._scopes.setdefault(
+                key, {"done": 0, "total": 0, "started": self._clock(), "finished": 0})
+            scope["total"] += total
+
+    def advance(self, key: str, n: int = 1) -> None:
+        with self._lock:
+            scope = self._scopes.setdefault(
+                key, {"done": 0, "total": 0, "started": self._clock(), "finished": 0})
+            scope["done"] += n
+        self.maybe_print()
+
+    def finish(self, key: str) -> None:
+        with self._lock:
+            scope = self._scopes.get(key)
+            if scope is None:
+                return
+            scope["finished"] = 1
+            line = self._line(key, scope)
+        print(f"{line} (finished)", file=self._out, flush=True)
+
+    def _line(self, key: str, scope: dict[str, float]) -> str:
+        elapsed = max(self._clock() - scope["started"], 1e-9)
+        rate = scope["done"] / elapsed * 60.0
+        return f"[{key}] {int(scope['done'])}/{int(scope['total'])} items, {rate:.0f}/min"
+
+    def maybe_print(self, force: bool = False) -> bool:
+        """Print all active scopes if ``interval`` elapsed (or ``force``)."""
+        with self._lock:
+            now = self._clock()
+            if not force and now - self._last_print < self._interval:
+                return False
+            self._last_print = now
+            lines = [self._line(k, s) for k, s in self._scopes.items() if not s["finished"]]
+        for line in lines:
+            print(line, file=self._out, flush=True)
+        return bool(lines)
+
+    def run_ticker(self, stop: threading.Event) -> None:
+        """Thread target: print at least every ``interval`` seconds until ``stop`` is set."""
+        while not stop.wait(self._interval):
+            self.maybe_print(force=True)
+
+
+# -- run report ------------------------------------------------------------------------
+
+def _plain(obj: Any) -> Any:
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        return {k: _plain(v) for k, v in dataclasses.asdict(obj).items()}
+    if isinstance(obj, dict):
+        return {str(k): _plain(v) for k, v in obj.items()}
+    if isinstance(obj, list | tuple | set):
+        return [_plain(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    return obj
+
+
+class RunReport:
+    """Accumulates one command's results; thread-safe; written once at the end."""
+
+    def __init__(self, command: str, state_dir: Path, dry_run: bool = False,
+                 now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> None:
+        self._now = now
+        self._state_dir = Path(state_dir)
+        self._lock = threading.Lock()
+        self._t0 = time.monotonic()
+        started = now()
+        self._stamp = utc_stamp(started)
+        self.data: dict[str, Any] = {
+            "command": command,
+            "dry_run": dry_run,
+            "started": started.isoformat(),
+            "mailboxes": {},
+        }
+
+    def mailbox(self, source: str, destination: str) -> None:
+        with self._lock:
+            self.data["mailboxes"].setdefault(source, {
+                "destination": destination, "status": "pending", "errors": [],
+            })
+
+    def set(self, source: str, section: str, value: Any) -> None:
+        with self._lock:
+            self.data["mailboxes"].setdefault(source, {"errors": []})[section] = _plain(value)
+
+    def error(self, source: str, message: str) -> None:
+        with self._lock:
+            self.data["mailboxes"].setdefault(source, {"errors": []}).setdefault(
+                "errors", []).append(message)
+
+    def write(self, exit_code: int) -> Path:
+        with self._lock:
+            self.data["finished"] = self._now().isoformat()
+            self.data["duration_s"] = round(time.monotonic() - self._t0, 3)
+            self.data["exit_code"] = exit_code
+            reports = self._state_dir / "reports"
+            reports.mkdir(parents=True, exist_ok=True)
+            path = reports / f"{self._stamp}.json"
+            n = 1
+            while path.exists():
+                n += 1
+                path = reports / f"{self._stamp}-{n}.json"
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+            return path
+
+
+# -- verify summary --------------------------------------------------------------------
+
+def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int]:
+    """Render verify results (plain dicts from ``RunReport``) as lines + problem count.
+
+    Problems (each makes verify exit 1): failed items, skipped items (too large, skipped
+    folders holding messages), count mismatches, sample mismatches, errors, missing
+    destination mailboxes, address-book fallbacks. Shared calendars that are skipped by
+    design (ISC-83) and messages removed at the source are listed but are not problems.
+    """
+    lines: list[str] = []
+    problems = 0
+
+    def problem(text: str, count: int = 1) -> None:
+        nonlocal problems
+        problems += count
+        lines.append(f"  ! {text}")
+
+    for source, entry in mailboxes.items():
+        lines.append(f"{source} -> {entry.get('destination', source)}")
+        if entry.get("status") == "missing":
+            problem("destination mailbox does not exist in mailcow")
+        for err in entry.get("errors", []):
+            problem(f"error: {err}")
+        mail = entry.get("mail")
+        if mail:
+            lines.append("  mail folder                          graph  skip  fail  "
+                         "expect  imap")
+            for f in mail.get("folders", []):
+                mark = "MISMATCH" if f["mismatch"] else "ok"
+                lines.append(
+                    f"    {f['dest_name'][:34]:<34} {f['graph_total']:>6} {f['skipped']:>5} "
+                    f"{f['failed']:>5} {f['expected']:>7} {f['imap_count']:>5}  {mark}")
+                if f["failed"]:
+                    problem(f"mail {f['dest_name']}: {f['failed']} failed", f["failed"])
+                if f["skipped"]:
+                    problem(f"mail {f['dest_name']}: {f['skipped']} skipped (too large)",
+                            f["skipped"])
+                if f["mismatch"]:
+                    problem(f"mail {f['dest_name']}: expected {f['expected']}, "
+                            f"IMAP has {f['imap_count']}")
+                if f.get("note"):
+                    lines.append(f"      note: {f['note']}")
+            for sk in mail.get("skipped_folders", []):
+                text = f"mail folder skipped: {sk['path']} ({sk['reason']}), {sk['total']} messages"
+                if sk["total"]:
+                    problem(text, sk["total"])
+                else:
+                    lines.append(f"  - {text}")
+            if mail.get("sample_requested"):
+                lines.append(
+                    f"  sample: {mail['sample_checked']} compared, "
+                    f"{len(mail['sample_mismatches'])} mismatched, "
+                    f"{mail['sample_unverifiable']} without Message-ID/gone at source")
+                for mm in mail["sample_mismatches"]:
+                    problem(f"sample SHA-256 mismatch: {mm}")
+            for err in mail.get("errors", []):
+                problem(f"mail: {err}")
+        for kind in ("calendar", "contacts"):
+            sec = entry.get(kind)
+            if not sec:
+                continue
+            for c in sec.get("collections", []):
+                mark = "MISMATCH" if c["mismatch"] else "ok"
+                lines.append(
+                    f"  {kind} {c['name'][:30]:<30} graph {c['graph_count']:>5} "
+                    f"fail {c['failed']:>4} expect {c['expected']:>5} "
+                    f"dav {c['dav_count']:>5}  {mark}")
+                if c["failed"]:
+                    problem(f"{kind} {c['name']}: {c['failed']} failed", c["failed"])
+                if c["mismatch"]:
+                    problem(f"{kind} {c['name']}: expected {c['expected']}, "
+                            f"DAV has {c['dav_count']}")
+            for sk in sec.get("skipped", []):
+                lines.append(f"  - {kind} skipped by design: {sk}")
+            for fb in sec.get("fallbacks", []):
+                lines.append(f"  - {kind} fallback: {fb}")
+            for err in sec.get("errors", []):
+                problem(f"{kind}: {err}")
+    if problems:
+        lines.append(f"VERIFY FAILED: {problems} skipped/failed/mismatched item(s) listed above")
+    else:
+        lines.append("All counts match; nothing skipped, nothing failed.")
+    return lines, problems

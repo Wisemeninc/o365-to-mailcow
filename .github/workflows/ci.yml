@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (locked runtime deps + dev tools)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --require-hashes -r requirements.txt
+          pip install --no-deps -e .
+          pip install "pytest>=8" "responses>=0.25" "vobject>=0.9.7" "ruff>=0.6" \
+            "bandit>=1.7" "pip-audit>=2.7"
+      - name: Lint (ruff)
+        run: ruff check src tests
+      - name: Security lint (bandit, medium and up)
+        run: bandit -r src -ll
+      - name: Dependency audit (pip-audit on the lock file)
+        run: pip-audit --strict --require-hashes -r requirements.txt
+      - name: No subprocess anywhere
+        run: "! grep -rnE 'import subprocess|os\\.system|shell=True' src"
+      - name: Tests
+        run: pytest
+
+  docker:
+    runs-on: ubuntu-24.04
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t o365-to-mailcow:ci .
+      - name: Help runs as non-root and lists the commands
+        run: |
+          docker run --rm o365-to-mailcow:ci --help | tee help.txt
+          for c in plan migrate verify cleanup; do grep -q "$c" help.txt; done
+          test "$(docker run --rm --entrypoint id o365-to-mailcow:ci -u)" = "10001"
