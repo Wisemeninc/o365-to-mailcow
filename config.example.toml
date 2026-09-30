@@ -56,6 +56,9 @@ imap_port = 993
 # Default quota (MiB) for mailboxes created by `o365mig provision` (per-mailbox override:
 # "quota_mib" in a mailboxes table entry, or the 4th CSV column).
 provision_quota_mib = 3072
+# Set mailcow's "enforce TLS" flags on mailboxes created by `provision` (rejects mail from
+# senders and to recipients without TLS; leave false unless you know you want that).
+provision_tls_enforce = false
 # Log level for stderr and state_dir/logs (DEBUG, INFO, WARNING, ERROR); -v forces DEBUG.
 log_level = "INFO"
 # Extra source folders to skip, by display path ("Inbox/Newsletters") or name ("RSS Feeds").

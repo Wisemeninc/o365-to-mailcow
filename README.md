@@ -143,9 +143,12 @@ may call mailcow's `get/domain` and `add/mailbox` endpoints. Rules:
   `source,destination,name,quota_mib`, TOML entries accept `name` and `quota_mib`; the
   defaults are the local part of the address and `provision_quota_mib` (3072).
 - Each mailbox gets a generated 32-character password with **"change password at first
-  login"** set and TLS enforced. The passwords are written once to
-  `state/provisioned-<timestamp>.csv` (mode 0600) and never logged. Distribute them, then
-  delete the file. Users can enable two-factor authentication themselves afterwards.
+  login"** set (TLS enforcement only with `provision_tls_enforce = true`, because it
+  rejects mail from senders without TLS). The passwords are written to
+  `state/provisioned-<timestamp>.csv` (mode 0600) *before* each mailbox is created and
+  the row is updated afterwards (`pending` → `created`, or `failed`), so an interrupted
+  run never loses a password it already set. The file is never logged. Distribute the
+  passwords, then delete the file. Users can enable two-factor authentication themselves.
 - `--dry-run` shows what would be created and creates nothing.
 
 ```sh
@@ -213,6 +216,13 @@ Open `http://127.0.0.1:8080/#token=<token>` on the Docker host. Without Docker,
   `state/settings.toml` (mode 0600) and take precedence over `config.toml` and `.env`;
   secrets are never shown again, only "set"/"not set". "Test connections" tries a
   Microsoft sign-in, a Graph user listing (`User.Read.All`) and a mailcow API call.
+  Two rules protect the credentials: a saved mailcow host is only ever used with the API
+  key saved *with* it (changing the host means entering the key again), and saved tenant
+  or client ids only with the client secret saved with them; the page can never pair a
+  new host with a key from `.env` or the config file. Every change is logged with the
+  field names. `o365mig web --lock-settings` makes the panel read-only for hardened
+  setups; `--allow-host NAME` accepts an extra `Host` header value (loopback and the bind
+  address are always accepted; anything else is refused to defeat DNS rebinding).
 - **Token.** Every API call needs the token from that URL. It is new at every start, or
   fixed with `O365MIG_WEB_TOKEN` in `.env` (at least 16 characters, for example from
   `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`). It travels in the URL
@@ -230,9 +240,10 @@ Open `http://127.0.0.1:8080/#token=<token>` on the Docker host. Without Docker,
   it; without it only the listing fails, with a message saying so.
 - **Mailbox list.** The page saves `state/mailboxes.csv` (mode 0600, the same
   `source,destination,name,quota_mib` format as `--mailboxes`) and every command it starts
-  runs with `--mailboxes` pointing at that file. The config's own `mailboxes = [...]` still
-  applies on top, so leave it empty when you use the page (a destination listed twice is
-  refused).
+  runs with `--mailboxes` pointing at that file **and `--mailboxes-only`**, so a job
+  started from the page acts on the saved selection alone, never on the config's own
+  `mailboxes = [...]`. The confirmation names the number of saved mailboxes, and a job is
+  refused if the saved selection changed after the page loaded it.
 - **One command at a time.** Commands run inside the web container and take the same
   state lock as `docker compose run`, so a page-started run and a CLI run never overlap.
   Stopping the web container stops a running command; start it again to resume, exactly as
@@ -331,6 +342,19 @@ against the real services. Treat the first run as the test that matters:
 retries a refused login, but a wrong API key or a mailbox with the protocols disabled can
 still produce a few failures per run. If the container's address gets banned, unban it in
 **System > Configuration > Options > Fail2ban parameters** or whitelist it there first.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| "Test connections": `microsoft ✓` but `graph_users ✗ … HTTP 403 … Authorization_RequestDenied` | The app registration lacks the mailbox-listing permission. Entra admin center → your app → **API permissions** → **Add a permission** → **Microsoft Graph** → **Application permissions** → `User.Read.All` → Add → **Grant admin consent for \<tenant\>**. Wait a minute or two, test again. Only the web page's listing needs it; the migration does not. |
+| "Test connections": `microsoft ✗ … AADSTS7000215` (invalid client secret) | The secret *Value* was not copied, or the secret expired. Create a new one under **Certificates & secrets** and enter it in the Connections panel together with the tenant and client ids. |
+| "Test connections": `microsoft ✗ … AADSTS700016` (application not found) | Wrong tenant id or client id: both come from the app's **Overview** page. |
+| "Test connections": `mailcow ✗ … HTTP 401` | API key wrong, API not activated, or this host's IP is not in mailcow's allowed API networks (System → Configuration → Access → API). Enter the key together with the host. |
+| `Load from Microsoft 365` shows no shared mailboxes | Shared mailboxes are users without a licence; they are listed as kind `shared`. If they are missing entirely they have no `mail` attribute or are guests. |
+| A job fails immediately with `missing required configuration` | Save the Connections panel first (or fill `config.toml`/`.env`); status shows `configured: false` until then. |
+| Phones or mail programs cannot log in to a *provisioned* mailbox | The initial password must be changed at first login in the mailcow UI (`force_pw_update`); mail programs cannot do that. |
+| The container's IP gets banned by mailcow | See **fail2ban** under "First live run"; unban or whitelist it under System → Configuration → Options → Fail2ban parameters. |
 
 ## State, security and operations
 
