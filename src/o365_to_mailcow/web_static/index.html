@@ -1,0 +1,2528 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>o365-to-mailcow</title>
+  <link rel="icon" href="data:,">
+  <style nonce="__CSP_NONCE__">
+    :root {
+      color-scheme: light dark;
+      --bg: #f5f6f8;
+      --fg: #1d232b;
+      --muted: #59667a;
+      --border: #c4ccd7;
+      --panel: #ffffff;
+      --accent: #1f5fae;
+      --accent-fg: #ffffff;
+      --danger: #ba1f2f;
+      --ok: #14643a;
+      --warn: #8a5800;
+      --bad-bg: #fff1f1;
+      --row-sel: #e8f1ff;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #12161d;
+        --fg: #e7ebf1;
+        --muted: #a4b0c1;
+        --border: #3a4557;
+        --panel: #1a212c;
+        --accent: #4f98e6;
+        --accent-fg: #0b121a;
+        --danger: #ff7d8b;
+        --ok: #7fdda8;
+        --warn: #f2bb5d;
+        --bad-bg: #2c1b1f;
+        --row-sel: #223145;
+      }
+    }
+
+    body {
+      margin: 0;
+      padding: 12px 16px 20px;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.45;
+      box-sizing: border-box;
+    }
+
+    *,
+    *::before,
+    *::after {
+      box-sizing: inherit;
+    }
+
+    header,
+    #banner,
+    #token-section,
+    #app {
+      max-width: 1400px;
+      margin: 0 auto 12px;
+    }
+
+    header,
+    #token-section,
+    #app > section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin: 0;
+    }
+
+    h1 {
+      font-size: 1rem;
+      margin-right: 8px;
+    }
+
+    h2 {
+      margin-bottom: 8px;
+      font-size: 1.1rem;
+    }
+
+    h3 {
+      margin: 10px 0 6px;
+      font-size: 1rem;
+    }
+
+    #app {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 12px;
+    }
+
+    #app > section {
+      min-width: 0;
+    }
+
+    label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    input,
+    select,
+    button,
+    summary {
+      font: inherit;
+    }
+
+    input[type="text"],
+    input[type="search"],
+    input[type="password"],
+    input[type="number"],
+    select {
+      background: var(--panel);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 6px;
+      min-height: 30px;
+      min-width: 0;
+    }
+
+    button {
+      border: 1px solid transparent;
+      border-radius: 6px;
+      background: var(--accent);
+      color: var(--accent-fg);
+      padding: 5px 10px;
+      cursor: pointer;
+      min-height: 30px;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    button.danger {
+      background: var(--danger);
+      border-color: var(--danger);
+      color: var(--accent-fg);
+    }
+
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    summary:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    #banner {
+      background: var(--bad-bg);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--danger);
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
+
+    #banner-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    #banner-list li {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+
+    #banner-list li:last-child {
+      margin-bottom: 0;
+    }
+
+    #banner-list button {
+      font-size: 12px;
+      padding: 2px 8px;
+      min-height: 24px;
+    }
+
+    #tenant-hint,
+    #sel-saved,
+    #sel-count {
+      margin-top: 4px;
+    }
+
+    pre,
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    pre#job-output {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px;
+      max-height: 50vh;
+      min-height: 6rem;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 12.5px;
+      margin: 6px 0;
+      background: var(--bg);
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .msg {
+      color: var(--muted);
+      min-height: 1.3em;
+      margin-top: 4px;
+    }
+
+    .msg.error {
+      color: var(--danger);
+    }
+
+    .msg.ok {
+      color: var(--ok);
+    }
+
+    .warn-text {
+      color: var(--warn);
+    }
+
+    .pill {
+      display: inline-block;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 1px 8px;
+      font-size: 12.5px;
+    }
+
+    .pill.running {
+      border-color: var(--warn);
+      color: var(--warn);
+    }
+
+    .table-wrap {
+      overflow-x: auto;
+      max-width: 100%;
+    }
+
+    table.grid {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13.5px;
+    }
+
+    table.grid th,
+    table.grid td {
+      border: 1px solid var(--border);
+      padding: 4px 6px;
+      vertical-align: top;
+    }
+
+    table.grid th {
+      background: var(--panel);
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    td.num {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .mark-yes {
+      color: var(--ok);
+    }
+
+    .mark-no {
+      color: var(--danger);
+    }
+
+    .mark-unknown {
+      color: var(--muted);
+    }
+
+    .exit-ok {
+      color: var(--ok);
+      font-weight: 700;
+    }
+
+    .exit-bad {
+      color: var(--danger);
+      font-weight: 700;
+    }
+
+    .kv {
+      display: inline-block;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      margin: 1px 4px 1px 0;
+      padding: 0 4px;
+      font-size: 12.5px;
+    }
+
+    ul.plain {
+      list-style: none;
+      margin: 0;
+      padding-left: 0;
+    }
+
+    tr.is-selected td {
+      background: var(--row-sel);
+    }
+
+    input.in-dest {
+      width: 17rem;
+      max-width: 100%;
+    }
+
+    input.in-name {
+      width: 12rem;
+      max-width: 100%;
+    }
+
+    input.in-quota {
+      width: 6rem;
+      max-width: 100%;
+    }
+
+    #f-search {
+      width: 18rem;
+      max-width: 100%;
+    }
+
+    #opt-mailbox {
+      width: 16rem;
+      max-width: 100%;
+    }
+
+    .section-block {
+      margin-bottom: 4px;
+    }
+
+    [hidden] {
+      display: none !important;
+    }
+
+    @media (max-width: 600px) {
+      body {
+        padding-left: 12px;
+        padding-right: 12px;
+      }
+
+      .controls > input:not([type="checkbox"]),
+      .controls > select {
+        flex: 1 1 100%;
+      }
+
+      .controls > button {
+        flex: 1 1 auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header class="controls">
+    <h1>o365-to-mailcow <span id="hdr-version" class="muted">-</span></h1>
+    <span>mailcow: <span id="hdr-host">&ndash;</span></span>
+    <span>auth: <span id="hdr-auth">&ndash;</span></span>
+    <span id="hdr-job" class="pill">idle</span>
+  </header>
+
+  <section id="banner" role="alert" hidden>
+    <ul id="banner-list"></ul>
+    <button id="banner-dismiss-all" type="button" hidden>Dismiss all</button>
+  </section>
+
+  <section id="token-section" hidden>
+    <h2>Access token</h2>
+    <form id="token-form" class="controls">
+      <label for="token-input">Paste the token printed by <code>o365mig web</code></label>
+      <input id="token-input" type="password" autocomplete="off" spellcheck="false" required>
+      <button type="submit">Use token</button>
+    </form>
+    <p id="token-msg" class="msg"></p>
+  </section>
+
+  <main id="app" hidden>
+    <section>
+      <h2>Tenant mailboxes</h2>
+      <div class="controls section-block">
+        <button id="btn-load" type="button">Load from Microsoft 365</button>
+        <button id="btn-refresh" type="button">Refresh</button>
+      </div>
+      <p id="tenant-status" class="msg"></p>
+
+      <div class="controls section-block">
+        <label for="f-search">Search</label>
+        <input id="f-search" type="search" placeholder="Search name, address, UPN, alias">
+        <label for="f-kind">Kind</label>
+        <select id="f-kind">
+          <option value="all">All</option>
+          <option value="user">Users</option>
+          <option value="shared">Shared</option>
+        </select>
+        <label for="f-enabled">
+          <input id="f-enabled" type="checkbox">
+          Enabled only
+        </label>
+        <label for="f-selected">
+          <input id="f-selected" type="checkbox">
+          Selected only
+        </label>
+        <span id="tenant-count" class="muted"></span>
+      </div>
+
+      <div class="controls section-block">
+        <label for="bulk-domain">Destination domain</label>
+        <input id="bulk-domain" type="text" placeholder="example.com" autocomplete="off" spellcheck="false">
+        <button id="btn-apply-domain" type="button">Apply to selected</button>
+        <button id="btn-check" type="button">Check in mailcow</button>
+      </div>
+      <p id="bulk-msg" class="msg"></p>
+      <p id="tenant-hint" class="muted">Load the tenant list to edit the selection.</p>
+
+      <div id="tenant-wrap" class="table-wrap" hidden>
+        <table id="tenant-table" class="grid">
+          <thead>
+            <tr>
+              <th><input type="checkbox" id="chk-all" aria-label="Select all visible rows"></th>
+              <th>Display name</th>
+              <th>Primary address</th>
+              <th>Kind</th>
+              <th>Enabled</th>
+              <th>Aliases</th>
+              <th>In mailcow</th>
+              <th>Destination</th>
+              <th>Name</th>
+              <th>Quota MiB</th>
+            </tr>
+          </thead>
+          <tbody id="tenant-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Selection</h2>
+      <div class="controls section-block">
+        <span id="sel-saved" class="muted"></span>
+        <button id="btn-save" type="button" disabled>Save selection</button>
+        <span id="sel-count" class="muted"></span>
+        <span id="sel-dirty" class="warn-text" hidden>Unsaved changes</span>
+      </div>
+      <p id="save-msg" class="msg"></p>
+
+      <section id="notfound-section" hidden>
+        <h3>Saved but not found in tenant</h3>
+        <ul id="notfound-list" class="plain"></ul>
+      </section>
+    </section>
+
+    <section>
+      <h2>Run</h2>
+      <div id="run-buttons" class="controls section-block">
+        <button type="button" class="run" data-command="plan" data-dry="1">Plan (dry run)</button>
+        <button type="button" class="run" data-command="provision" data-dry="1">Provision &mdash; dry run</button>
+        <button type="button" class="run danger" data-command="provision" data-dry="0">Provision</button>
+        <button type="button" class="run" data-command="migrate" data-dry="1">Migrate &mdash; dry run</button>
+        <button type="button" class="run danger" data-command="migrate" data-dry="0">Migrate</button>
+        <button type="button" class="run" data-command="verify" data-dry="0">Verify</button>
+        <button type="button" class="run danger" data-command="cleanup" data-dry="0">Cleanup</button>
+      </div>
+
+      <div class="controls section-block">
+        <label for="opt-only">Only</label>
+        <select id="opt-only">
+          <option value="">All</option>
+          <option value="mail">Mail</option>
+          <option value="calendar">Calendar</option>
+          <option value="contacts">Contacts</option>
+        </select>
+
+        <label for="opt-mailbox">Mailbox (optional)</label>
+        <input id="opt-mailbox" type="text" placeholder="source or destination address">
+
+        <label for="opt-sample">Verify sample</label>
+        <input id="opt-sample" type="number" min="0" max="1000" step="1" value="0">
+      </div>
+
+      <p id="run-hint" class="warn-text" hidden>Save the selection first.</p>
+      <p id="run-msg" class="msg"></p>
+
+      <div id="job-view" hidden>
+        <h3 id="job-title"></h3>
+        <p id="job-state"></p>
+        <pre id="job-output" tabindex="0"></pre>
+        <div class="controls">
+          <button id="btn-full-output" type="button">Open full output</button>
+          <span id="full-output-slot"></span>
+          <button id="btn-resume" type="button" hidden>Resume watching</button>
+        </div>
+      </div>
+
+      <h3>Recent jobs</h3>
+      <p id="jobs-empty" class="muted">No jobs yet.</p>
+      <div class="table-wrap">
+        <table id="jobs-table" class="grid" hidden>
+          <thead>
+            <tr>
+              <th>Started</th>
+              <th>Command</th>
+              <th>Result</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="jobs-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2>Last report</h2>
+      <div class="controls section-block">
+        <button id="btn-report-reload" type="button">Reload report</button>
+      </div>
+      <p id="report-empty" class="muted">No report yet.</p>
+      <div id="report-meta" hidden></div>
+      <div class="table-wrap">
+        <table id="report-table" class="grid" hidden>
+          <thead>
+            <tr>
+              <th>Mailbox</th>
+              <th>Destination</th>
+              <th>Status</th>
+              <th>Errors</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody id="report-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script nonce="__CSP_NONCE__">
+    (() => {
+      "use strict";
+      // ==== foundation ====
+      const state = {
+        token: "",
+        authFailed: false,
+        status: null,
+        statusGen: 0,
+        savedRows: [],
+        selectionPath: "",
+        tenantLoaded: false,
+        rows: [],
+        existsCache: new Map(),
+        keepNotFound: new Map(),
+        dirty: false,
+        starting: false,
+        job: null,
+        jobGen: 0,
+      };
+
+      const TOKEN_KEY = "o365mig_token";
+
+      const $ = (id) => {
+        const node = document.getElementById(id);
+        if (!node) {
+          throw new Error("missing element #" + id);
+        }
+        return node;
+      };
+
+      const clean = (s) => String(s).replace(/[\u0000-\u0008\u000b-\u001f\u007f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, "");
+
+      const el = (tag, props = {}, children = []) => {
+        const node = document.createElement(tag);
+        for (const [name, value] of Object.entries(props)) {
+          if (value === undefined || value === null) {
+            continue;
+          }
+          if (name === "text") {
+            node.textContent = clean(String(value));
+            continue;
+          }
+          if (name === "ariaLabel") {
+            node.setAttribute("aria-label", String(value));
+            continue;
+          }
+          if (name === "data") {
+            if (!isObject(value)) {
+              throw new Error("el: unsupported prop " + name);
+            }
+            for (const [key, dataValue] of Object.entries(value)) {
+              node.dataset[key] = String(dataValue);
+            }
+            continue;
+          }
+          if (
+            name === "className" ||
+            name === "type" ||
+            name === "value" ||
+            name === "checked" ||
+            name === "disabled" ||
+            name === "hidden" ||
+            name === "min" ||
+            name === "max" ||
+            name === "step" ||
+            name === "placeholder" ||
+            name === "href" ||
+            name === "download" ||
+            name === "htmlFor" ||
+            name === "colSpan" ||
+            name === "open"
+          ) {
+            node[name] = value;
+            continue;
+          }
+          if (name === "title") {
+            node.title = clean(String(value));
+            continue;
+          }
+          throw new Error("el: unsupported prop " + name);
+        }
+
+        const list = Array.isArray(children) ? children : [children];
+        for (const child of list) {
+          if (child === null || child === undefined || child === false) {
+            continue;
+          }
+          if (child instanceof Node) {
+            node.appendChild(child);
+            continue;
+          }
+          if (typeof child === "string" || typeof child === "number") {
+            node.appendChild(document.createTextNode(String(child)));
+            continue;
+          }
+          throw new Error("el: unsupported child");
+        }
+        return node;
+      };
+
+      const clear = (node) => {
+        node.replaceChildren();
+      };
+
+      const fmtTime = (iso) => {
+        if (!isStr(iso) || iso.length === 0) {
+          return "–";
+        }
+        if (Number.isNaN(Date.parse(iso))) {
+          return iso;
+        }
+        return new Date(iso).toLocaleString();
+      };
+
+      const fmtDuration = (ms) => {
+        if (!isNum(ms) || ms < 0) {
+          return "–";
+        }
+        const totalSeconds = Math.round(ms / 1000);
+        if (totalSeconds < 60) {
+          return String(totalSeconds) + "s";
+        }
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+        const mm = String(minutes).padStart(2, "0");
+        const ss = String(seconds).padStart(2, "0");
+        if (hours > 0) {
+          return String(hours) + "h " + mm + "m " + ss + "s";
+        }
+        return String(minutes) + "m " + ss + "s";
+      };
+
+      const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+      const isStr = (v) => typeof v === "string";
+      const isBool = (v) => typeof v === "boolean";
+      const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+      const isInt = (v) => Number.isInteger(v);
+      const badResponse = (route) => new Error("unexpected response from " + route);
+
+      const readStoredToken = () => {
+        try {
+          const saved = sessionStorage.getItem(TOKEN_KEY);
+          return isStr(saved) ? saved : "";
+        } catch (_err) {
+          return state.token;
+        }
+      };
+
+      const storeToken = (t) => {
+        try {
+          sessionStorage.setItem(TOKEN_KEY, t);
+        } catch (_err) {
+          state.token = t;
+        }
+      };
+
+      const clearStoredToken = () => {
+        try {
+          sessionStorage.removeItem(TOKEN_KEY);
+        } catch (_err) {
+          // Storage may be unavailable; then there is nothing persisted to clear.
+        }
+      };
+
+      const tokenFromHash = () => {
+        const hasHash = location.hash.length > 0;
+        const token = new URLSearchParams(location.hash.slice(1)).get("token");
+        if (hasHash) {
+          history.replaceState(null, "", location.pathname + location.search);
+        }
+        return token;
+      };
+
+      const handleUnauthorized = () => {
+        if (state.authFailed) {
+          return;
+        }
+        state.authFailed = true;
+        clearStoredToken();
+        state.token = "";
+        state.statusGen += 1;
+        state.jobGen += 1;
+        if (state.job) {
+          state.job.polling = false;
+        }
+        $("token-section").hidden = false;
+        $("app").hidden = true;
+        showError("The token was rejected. Paste the current token.");
+        updateRunButtons();
+      };
+
+      const api = async (method, path, opts = {}) => {
+        const timeoutMs = opts.timeoutMs === undefined ? 30000 : opts.timeoutMs;
+        const as = opts.as === undefined ? "json" : opts.as;
+        const allow404 = opts.allow404 === true;
+        const controller = new AbortController();
+        const timer = setTimeout(() => {
+          controller.abort();
+        }, timeoutMs);
+
+        try {
+          const headers = {
+            Authorization: "Bearer " + state.token,
+            Accept: as === "text" ? "text/plain" : "application/json",
+          };
+          const req = {
+            method,
+            headers,
+            signal: controller.signal,
+            cache: "no-store",
+            credentials: "same-origin",
+            redirect: "error",
+          };
+          if (opts.body !== undefined) {
+            headers["Content-Type"] = "application/json";
+            req.body = JSON.stringify(opts.body);
+          }
+
+          let response;
+          try {
+            response = await fetch(path, req);
+          } catch (err) {
+            if (err && err.name === "AbortError") {
+              throw new Error(method + " " + path + ": no answer within " + timeoutMs / 1000 + " s");
+            }
+            throw new Error(method + " " + path + ": network error");
+          }
+
+          if (response.status === 401) {
+            handleUnauthorized();
+            const err = new Error("unauthorized (" + method + " " + path + ", HTTP 401)");
+            err.unauthorized = true;
+            throw err;
+          }
+
+          if (allow404 && response.status === 404) {
+            await response.text();
+            return null;
+          }
+
+          if (!response.ok) {
+            const raw = await response.text();
+            let message = "HTTP " + response.status;
+            if (raw) {
+              try {
+                const parsed = JSON.parse(raw);
+                if (isObject(parsed) && isStr(parsed.error)) {
+                  message = parsed.error;
+                }
+              } catch (_err) {
+                // A non-JSON error body is fine; keep the generic HTTP status message.
+              }
+            }
+            const err = new Error(message + " (" + method + " " + path + ", HTTP " + response.status + ")");
+            err.status = response.status;
+            throw err;
+          }
+
+          if (as === "none") {
+            await response.text();
+            return undefined;
+          }
+
+          if (as === "text") {
+            return await response.text();
+          }
+
+          const text = await response.text();
+          try {
+            return JSON.parse(text);
+          } catch (_err) {
+            throw badResponse(path);
+          }
+        } catch (err) {
+          if (err && err.name === "AbortError") {
+            throw new Error(method + " " + path + ": no answer within " + timeoutMs / 1000 + " s");
+          }
+          throw err;
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+
+      const syncBanner = () => {
+        const list = $("banner-list");
+        const banner = $("banner");
+        const dismissAll = $("banner-dismiss-all");
+        const count = list.childElementCount;
+        banner.hidden = count === 0;
+        dismissAll.hidden = count < 2;
+      };
+
+      const showError = (message) => {
+        const text = clean(String(message));
+        const list = $("banner-list");
+        const last = list.lastElementChild;
+        if (last) {
+          const span = last.querySelector("span");
+          if (span && span.textContent === text) {
+            return;
+          }
+        }
+
+        const msg = el("span", { text });
+        const dismiss = el("button", { type: "button", text: "Dismiss" });
+        const item = el("li", {}, [msg, dismiss]);
+        dismiss.addEventListener("click", () => {
+          item.remove();
+          syncBanner();
+        });
+        list.appendChild(item);
+        while (list.childElementCount > 20) {
+          if (list.firstElementChild) {
+            list.firstElementChild.remove();
+          }
+        }
+        syncBanner();
+      };
+
+      const reportError = (err) => {
+        if (err && err.unauthorized) {
+          return;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        showError(message);
+      };
+
+      const setMsg = (node, text, kind) => {
+        node.textContent = text;
+        node.className = "msg" + (kind === "error" ? " error" : kind === "ok" ? " ok" : "");
+      };
+
+      const loadStatus = async () => {
+        const data = await api("GET", "/api/status");
+        if (!isObject(data)) {
+          throw badResponse("/api/status");
+        }
+        if (
+          !isStr(data.version) ||
+          !isStr(data.auth_mode) ||
+          !isStr(data.mailcow_host) ||
+          !isStr(data.state_dir) ||
+          !isStr(data.selection_path)
+        ) {
+          throw badResponse("/api/status");
+        }
+
+        if (data.running_job !== undefined && data.running_job !== null) {
+          if (
+            !isObject(data.running_job) ||
+            !(isStr(data.running_job.id) || isNum(data.running_job.id)) ||
+            !isStr(data.running_job.command)
+          ) {
+            throw badResponse("/api/status");
+          }
+        }
+
+        state.status = data;
+        $("hdr-version").textContent = "v" + data.version;
+        $("hdr-host").textContent = data.mailcow_host;
+        $("hdr-auth").textContent = data.auth_mode;
+
+        if (data.running_job !== undefined && data.running_job !== null) {
+          const id = String(data.running_job.id);
+          if (!(state.job && state.job.id === id && state.job.polling)) {
+            attachJob(id, data.running_job.command);
+          }
+        }
+
+        renderHeaderJob();
+        updateRunButtons();
+      };
+
+      const renderHeaderJob = () => {
+        const pill = $("hdr-job");
+        let text = "idle";
+        let running = false;
+
+        if (state.job && state.job.running) {
+          const cmd = isStr(state.job.command) && state.job.command ? state.job.command : "job";
+          text = "running: " + cmd + " #" + state.job.id;
+          running = true;
+        } else if (state.status && state.status.running_job) {
+          const runningJob = state.status.running_job;
+          const cmd = isStr(runningJob.command) && runningJob.command ? runningJob.command : "job";
+          text = "running: " + cmd + " #" + String(runningJob.id);
+          running = true;
+        }
+
+        pill.textContent = text;
+        pill.className = running ? "pill running" : "pill";
+      };
+
+      const scheduleStatusPoll = () => {
+        const gen = ++state.statusGen;
+
+        const scheduleNext = () => {
+          setTimeout(() => {
+            if (gen !== state.statusGen || state.authFailed) {
+              return;
+            }
+            if (isJobRunning()) {
+              scheduleNext();
+              return;
+            }
+            loadStatus().catch(reportError).finally(() => {
+              if (gen !== state.statusGen || state.authFailed) {
+                return;
+              }
+              scheduleNext();
+            });
+          }, 15000);
+        };
+
+        scheduleNext();
+      };
+
+      const showTokenForm = () => {
+        $("token-section").hidden = false;
+        $("app").hidden = true;
+        $("token-input").focus();
+      };
+
+      const startApp = async () => {
+        state.authFailed = false;
+        $("token-section").hidden = true;
+        $("app").hidden = false;
+
+        await loadStatus().catch(reportError);
+        await Promise.all([
+          loadSelection().catch(reportError),
+          loadJobs().catch(reportError),
+          loadReport().catch(reportError),
+        ]);
+
+        if (state.job && state.job.running && !state.job.polling) {
+          attachJob(state.job.id, state.job.command);
+        }
+
+        scheduleStatusPoll();
+        updateRunButtons();
+      };
+
+      $("banner-dismiss-all").addEventListener("click", () => {
+        clear($("banner-list"));
+        syncBanner();
+      });
+
+      $("token-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        const input = $("token-input");
+        const value = input.value.trim();
+        if (!value) {
+          setMsg($("token-msg"), "Paste the token first.", "error");
+          return;
+        }
+        state.token = value;
+        storeToken(value);
+        input.value = "";
+        setMsg($("token-msg"), "", "");
+        startApp().catch(reportError);
+      });
+
+      const boot = () => {
+        const fromHash = tokenFromHash();
+        if (isStr(fromHash) && fromHash) {
+          state.token = fromHash;
+          storeToken(fromHash);
+        } else {
+          state.token = readStoredToken() || state.token;
+        }
+
+        if (state.token) {
+          startApp().catch(reportError);
+          return;
+        }
+        showTokenForm();
+      };
+      // ==== tenant and selection ====
+      const validateTenant = (data) => {
+        const route = "/api/tenant/mailboxes";
+        if (!isObject(data) || !Array.isArray(data.mailboxes)) {
+          throw badResponse(route);
+        }
+
+        const fetchedAt = isStr(data.fetched_at) ? data.fetched_at : "";
+        const list = [];
+        let skipped = 0;
+
+        for (const entry of data.mailboxes) {
+          if (!isObject(entry)) {
+            skipped += 1;
+            continue;
+          }
+
+          const id = isStr(entry.id) ? entry.id.trim() : "";
+          const mail = isStr(entry.mail) ? entry.mail.trim() : "";
+          if (!id || !mail) {
+            skipped += 1;
+            continue;
+          }
+
+          const displayName = isStr(entry.display_name) ? clean(entry.display_name) : "";
+          const upn = isStr(entry.upn) ? entry.upn : "";
+          const aliases = Array.isArray(entry.aliases) ? entry.aliases.filter((v) => isStr(v)) : [];
+          const kind = entry.kind === "shared" || entry.kind === "user" ? entry.kind : "user";
+          const enabled = entry.enabled === true;
+
+          const keys = new Set();
+          const addKey = (value) => {
+            const k = value.trim().toLowerCase();
+            if (k) {
+              keys.add(k);
+            }
+          };
+          addKey(mail);
+          addKey(upn);
+          for (const alias of aliases) {
+            addKey(alias);
+          }
+
+          const search = [displayName, mail, upn, aliases.join(" ")].join(" ").toLowerCase();
+          list.push({ id, mail, displayName, upn, aliases, kind, enabled, keys, search });
+        }
+
+        return { fetchedAt, list, skipped };
+      };
+
+      const updateMark = (row) => {
+        const key = row.dest.value.trim().toLowerCase();
+        const v = key ? state.existsCache.get(key) : undefined;
+        if (v === true) {
+          row.mark.textContent = "✓";
+          row.mark.className = "mark-yes";
+          row.mark.title = "exists in mailcow";
+          return;
+        }
+        if (v === false) {
+          row.mark.textContent = "✗";
+          row.mark.className = "mark-no";
+          row.mark.title = "not found in mailcow";
+          return;
+        }
+        row.mark.textContent = "?";
+        row.mark.className = "mark-unknown";
+        row.mark.title = "not checked yet";
+      };
+
+      const savedInit = (mb, saved) => {
+        const dest = isStr(saved.destination) && saved.destination.trim() ? saved.destination : mb.mail;
+        const name = saved.name === null ? mb.displayName : isStr(saved.name) ? saved.name : mb.displayName;
+        const quota = saved.quota_mib === null
+          ? ""
+          : isInt(saved.quota_mib) && saved.quota_mib > 0
+            ? String(saved.quota_mib)
+            : "";
+        return { checked: true, dest, name, quota };
+      };
+
+      const buildRow = (mb, init) => {
+        const chk = el("input", { type: "checkbox", checked: init.checked, ariaLabel: "Select " + mb.mail });
+        const mark = el("td", {});
+
+        const dest = el("input", {
+          type: "text",
+          className: "in-dest",
+          ariaLabel: "Destination for " + mb.mail,
+          value: init.dest,
+        });
+        dest.spellcheck = false;
+        dest.autocomplete = "off";
+
+        const name = el("input", {
+          type: "text",
+          className: "in-name",
+          ariaLabel: "Name for " + mb.mail,
+          value: init.name,
+        });
+        const quota = el("input", {
+          type: "number",
+          className: "in-quota",
+          ariaLabel: "Quota MiB for " + mb.mail,
+          min: 1,
+          step: 1,
+          placeholder: "default",
+          value: init.quota,
+        });
+
+        const aliasesFull = mb.aliases.join(", ");
+        const aliasesShort = aliasesFull.length > 60 ? aliasesFull.slice(0, 59) + "…" : aliasesFull;
+
+        const tr = el("tr", {}, [
+          el("td", {}, chk),
+          el("td", { text: mb.displayName }),
+          el("td", { text: mb.mail }),
+          el("td", { text: mb.kind }),
+          el("td", { text: mb.enabled ? "yes" : "no" }),
+          el("td", { text: aliasesShort, title: aliasesFull }),
+          mark,
+          el("td", {}, dest),
+          el("td", {}, name),
+          el("td", {}, quota),
+        ]);
+
+        tr.classList.toggle("is-selected", chk.checked);
+
+        const row = {
+          id: mb.id,
+          mail: mb.mail,
+          displayName: mb.displayName,
+          keys: mb.keys,
+          search: mb.search,
+          kind: mb.kind,
+          enabled: mb.enabled,
+          tr,
+          chk,
+          dest,
+          name,
+          quota,
+          mark,
+        };
+
+        chk.addEventListener("change", () => {
+          row.tr.classList.toggle("is-selected", row.chk.checked);
+          setDirty(true);
+          updateCounts();
+          updateHeaderCheckbox();
+        });
+
+        dest.addEventListener("input", () => {
+          updateMark(row);
+          if (row.chk.checked) {
+            setDirty(true);
+          }
+        });
+
+        name.addEventListener("input", () => {
+          if (row.chk.checked) {
+            setDirty(true);
+          }
+        });
+
+        quota.addEventListener("input", () => {
+          if (row.chk.checked) {
+            setDirty(true);
+          }
+        });
+
+        updateMark(row);
+        return row;
+      };
+
+      const updateHeaderCheckbox = () => {
+        const hdr = $("chk-all");
+        let visible = 0;
+        let checked = 0;
+        for (const row of state.rows) {
+          if (row.tr.hidden) {
+            continue;
+          }
+          visible += 1;
+          if (row.chk.checked) {
+            checked += 1;
+          }
+        }
+
+        if (visible === 0 || checked === 0) {
+          hdr.checked = false;
+          hdr.indeterminate = false;
+          return;
+        }
+        if (checked === visible) {
+          hdr.checked = true;
+          hdr.indeterminate = false;
+          return;
+        }
+        hdr.checked = false;
+        hdr.indeterminate = true;
+      };
+
+      const applyFilters = () => {
+        const q = $("f-search").value.trim().toLowerCase();
+        const kind = $("f-kind").value;
+        const enabledOnly = $("f-enabled").checked;
+        const selectedOnly = $("f-selected").checked;
+        let shown = 0;
+
+        for (const row of state.rows) {
+          const okQuery = !q || row.search.includes(q);
+          const okKind = kind === "all" || row.kind === kind;
+          const okEnabled = !enabledOnly || row.enabled;
+          const okSelected = !selectedOnly || row.chk.checked;
+          const visible = okQuery && okKind && okEnabled && okSelected;
+          row.tr.hidden = !visible;
+          if (visible) {
+            shown += 1;
+          }
+        }
+
+        $("tenant-count").textContent = "Showing " + shown + " of " + state.rows.length;
+        updateHeaderCheckbox();
+      };
+
+      const loadTenant = async (refresh) => {
+        const btnLoad = $("btn-load");
+        const btnRefresh = $("btn-refresh");
+        btnLoad.disabled = true;
+        btnRefresh.disabled = true;
+        setMsg($("tenant-status"), "Loading…");
+
+        try {
+          const data = await api(
+            "GET",
+            "/api/tenant/mailboxes" + (refresh ? "?refresh=1" : ""),
+            { timeoutMs: 120000 },
+          );
+          const parsed = validateTenant(data);
+
+          const prevById = new Map();
+          for (const row of state.rows) {
+            prevById.set(row.id, {
+              checked: row.chk.checked,
+              dest: row.dest.value,
+              name: row.name.value,
+              quota: row.quota.value,
+            });
+          }
+
+          const savedBySource = new Map();
+          for (const saved of state.savedRows) {
+            if (!isObject(saved) || !isStr(saved.source)) {
+              continue;
+            }
+            const key = saved.source.trim().toLowerCase();
+            if (!key || savedBySource.has(key)) {
+              continue;
+            }
+            savedBySource.set(key, saved);
+          }
+
+          parsed.list.sort((a, b) => {
+            const byName = a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" });
+            if (byName !== 0) {
+              return byName;
+            }
+            return a.mail.localeCompare(b.mail, undefined, { sensitivity: "base" });
+          });
+
+          const frag = document.createDocumentFragment();
+          const nextRows = [];
+          for (const mb of parsed.list) {
+            const prev = prevById.get(mb.id);
+            let init;
+
+            if (prev) {
+              init = {
+                checked: prev.checked,
+                dest: prev.dest,
+                name: prev.name,
+                quota: prev.quota,
+              };
+            } else {
+              let saved = null;
+              for (const key of mb.keys) {
+                if (savedBySource.has(key)) {
+                  saved = savedBySource.get(key);
+                  break;
+                }
+              }
+
+              if (saved) {
+                init = savedInit(mb, saved);
+              } else {
+                init = {
+                  checked: false,
+                  dest: mb.mail,
+                  name: mb.displayName,
+                  quota: "",
+                };
+              }
+            }
+
+            const row = buildRow(mb, init);
+            nextRows.push(row);
+            frag.appendChild(row.tr);
+          }
+
+          $("tenant-body").replaceChildren(frag);
+          state.rows = nextRows;
+          state.tenantLoaded = true;
+          $("tenant-hint").hidden = true;
+          $("tenant-wrap").hidden = false;
+          $("btn-save").disabled = false;
+
+          renderNotFound();
+          applyFilters();
+          updateCounts();
+          updateRunButtons();
+
+          let text = "Loaded " + nextRows.length + " mailboxes (fetched " + fmtTime(parsed.fetchedAt) + ")";
+          if (parsed.skipped > 0) {
+            text += "; " + parsed.skipped + " entries without id/address skipped";
+          }
+          setMsg($("tenant-status"), text);
+        } catch (err) {
+          setMsg($("tenant-status"), err.message, "error");
+          reportError(err);
+        } finally {
+          btnLoad.disabled = false;
+          btnRefresh.disabled = false;
+        }
+      };
+
+      const isValidDomain = (d) => {
+        if (!isStr(d)) {
+          return false;
+        }
+        const domain = d.trim();
+        if (domain.length < 1 || domain.length > 253) {
+          return false;
+        }
+        const labels = domain.split(".");
+        if (labels.length < 2) {
+          return false;
+        }
+        const labelRe = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+        for (const label of labels) {
+          if (!labelRe.test(label)) {
+            return false;
+          }
+        }
+        return true;
+      };
+
+      const checkInMailcow = async () => {
+        const picked = new Map();
+        for (const row of state.rows) {
+          if (!row.chk.checked) {
+            continue;
+          }
+          const address = row.dest.value.trim();
+          if (!address) {
+            continue;
+          }
+          const key = address.toLowerCase();
+          if (!picked.has(key)) {
+            picked.set(key, address);
+          }
+        }
+
+        if (picked.size === 0) {
+          setMsg($("bulk-msg"), "Select rows first.", "error");
+          return;
+        }
+
+        const btn = $("btn-check");
+        btn.disabled = true;
+        setMsg($("bulk-msg"), "Checking…");
+
+        try {
+          let yes = 0;
+          let no = 0;
+          let unknown = 0;
+          const addresses = Array.from(picked.values());
+
+          for (let i = 0; i < addresses.length; i += 100) {
+            const chunk = addresses.slice(i, i + 100);
+            const resp = await api("POST", "/api/mailcow/check", { body: { addresses: chunk } });
+            if (!isObject(resp) || !isObject(resp.exists)) {
+              throw badResponse("/api/mailcow/check");
+            }
+
+            const boolByKey = new Map();
+            for (const [k, v] of Object.entries(resp.exists)) {
+              if (isBool(v)) {
+                const key = k.trim().toLowerCase();
+                if (key) {
+                  boolByKey.set(key, v);
+                }
+              }
+            }
+
+            for (const address of chunk) {
+              const key = address.toLowerCase();
+              if (!boolByKey.has(key)) {
+                unknown += 1;
+                state.existsCache.delete(key);
+                continue;
+              }
+              const exists = boolByKey.get(key);
+              state.existsCache.set(key, exists);
+              if (exists) {
+                yes += 1;
+              } else {
+                no += 1;
+              }
+            }
+          }
+
+          for (const row of state.rows) {
+            updateMark(row);
+          }
+
+          let text = yes + " exist, " + no + " missing";
+          if (unknown > 0) {
+            text += ", " + unknown + " unknown";
+          }
+          setMsg($("bulk-msg"), text, "ok");
+        } catch (err) {
+          setMsg($("bulk-msg"), err.message, "error");
+          reportError(err);
+        } finally {
+          btn.disabled = false;
+        }
+      };
+
+      let filterTimer = 0;
+      $("f-search").addEventListener("input", () => {
+        clearTimeout(filterTimer);
+        filterTimer = setTimeout(() => {
+          applyFilters();
+        }, 150);
+      });
+      $("f-kind").addEventListener("change", applyFilters);
+      $("f-enabled").addEventListener("change", applyFilters);
+      $("f-selected").addEventListener("change", applyFilters);
+
+      $("chk-all").addEventListener("change", () => {
+        const checked = $("chk-all").checked;
+        let changed = false;
+        for (const row of state.rows) {
+          if (row.tr.hidden || row.chk.checked === checked) {
+            continue;
+          }
+          row.chk.checked = checked;
+          row.tr.classList.toggle("is-selected", checked);
+          changed = true;
+        }
+        if (changed) {
+          setDirty(true);
+        }
+        updateCounts();
+        updateHeaderCheckbox();
+      });
+
+      $("btn-load").addEventListener("click", () => {
+        loadTenant(false);
+      });
+
+      $("btn-refresh").addEventListener("click", () => {
+        loadTenant(true);
+      });
+
+      $("btn-apply-domain").addEventListener("click", () => {
+        const domain = $("bulk-domain").value.trim().toLowerCase();
+        if (!isValidDomain(domain)) {
+          setMsg($("bulk-msg"), "Enter a domain like example.com", "error");
+          return;
+        }
+
+        const checkedRows = state.rows.filter((row) => row.chk.checked);
+        if (checkedRows.length === 0) {
+          setMsg($("bulk-msg"), "Select rows first.", "error");
+          return;
+        }
+
+        let changed = 0;
+        for (const row of checkedRows) {
+          const raw = row.dest.value.trim();
+          const at = raw.lastIndexOf("@");
+          let local = at >= 0 ? raw.slice(0, at) : raw;
+          if (!local) {
+            const mailAt = row.mail.lastIndexOf("@");
+            local = mailAt > 0 ? row.mail.slice(0, mailAt) : row.mail;
+          }
+          const next = local + "@" + domain;
+          if (row.dest.value !== next) {
+            row.dest.value = next;
+            changed += 1;
+          }
+          updateMark(row);
+        }
+
+        if (changed > 0) {
+          setDirty(true);
+        }
+        setMsg($("bulk-msg"), "Rewrote " + changed + " destinations", "ok");
+      });
+
+      $("btn-check").addEventListener("click", () => {
+        checkInMailcow();
+      });
+
+      const validateSelection = (data) => {
+        const route = "/api/selection";
+        if (!isObject(data) || !isStr(data.path) || !Array.isArray(data.rows)) {
+          throw badResponse(route);
+        }
+
+        const rows = [];
+        for (const entry of data.rows) {
+          if (!isObject(entry) || !isStr(entry.source) || !isStr(entry.destination)) {
+            throw badResponse(route);
+          }
+
+          const source = entry.source;
+          const destination = entry.destination;
+
+          let name = null;
+          if (entry.name !== undefined && entry.name !== null) {
+            if (!isStr(entry.name)) {
+              throw badResponse(route);
+            }
+            const t = entry.name.trim();
+            name = t ? t : null;
+          }
+
+          let quota = null;
+          if (entry.quota_mib !== undefined && entry.quota_mib !== null) {
+            if (!isInt(entry.quota_mib) || entry.quota_mib < 1) {
+              throw badResponse(route);
+            }
+            quota = entry.quota_mib;
+          }
+
+          rows.push({ source, destination, name, quota_mib: quota });
+        }
+
+        return { path: data.path, rows };
+      };
+
+      const loadSelection = async () => {
+        const data = await api("GET", "/api/selection");
+        const parsed = validateSelection(data);
+        state.savedRows = parsed.rows;
+        state.selectionPath = parsed.path;
+        renderSaved();
+        if (state.tenantLoaded) {
+          if (!state.dirty) {
+            const savedBySource = new Map();
+            for (const saved of state.savedRows) {
+              if (!isObject(saved) || !isStr(saved.source)) {
+                continue;
+              }
+              const key = saved.source.trim().toLowerCase();
+              if (!key || savedBySource.has(key)) {
+                continue;
+              }
+              savedBySource.set(key, saved);
+            }
+
+            for (const row of state.rows) {
+              let saved = null;
+              for (const key of row.keys) {
+                if (savedBySource.has(key)) {
+                  saved = savedBySource.get(key);
+                  break;
+                }
+              }
+
+              if (saved) {
+                const init = savedInit(row, saved);
+                row.chk.checked = true;
+                row.dest.value = init.dest;
+                row.name.value = init.name;
+                row.quota.value = init.quota;
+                updateMark(row);
+              } else {
+                row.chk.checked = false;
+              }
+              row.tr.classList.toggle("is-selected", row.chk.checked);
+            }
+            applyFilters();
+          }
+          renderNotFound();
+        }
+        updateCounts();
+        updateRunButtons();
+      };
+
+      const renderSaved = () => {
+        const count = state.savedRows.length;
+        const suffix = state.selectionPath ? " in " + state.selectionPath : "";
+        $("sel-saved").textContent = "Saved selection: " + count + " mailbox(es)" + suffix;
+      };
+
+      const notFoundRows = () => {
+        const keys = new Set();
+        for (const row of state.rows) {
+          if (row.keys instanceof Set) {
+            for (const key of row.keys) {
+              keys.add(key);
+            }
+          }
+        }
+        return state.savedRows.filter((row) => {
+          const lower = row.source.trim().toLowerCase();
+          return !keys.has(lower);
+        });
+      };
+
+      const renderNotFound = () => {
+        const list = $("notfound-list");
+        clear(list);
+        const missing = notFoundRows();
+        for (const row of missing) {
+          const lower = row.source.trim().toLowerCase();
+          const checked = state.keepNotFound.get(lower) ?? true;
+          const checkbox = el("input", {
+            type: "checkbox",
+            checked,
+            ariaLabel: "Keep " + row.source,
+          });
+          checkbox.addEventListener("change", () => {
+            state.keepNotFound.set(lower, checkbox.checked);
+            setDirty(true);
+            updateCounts();
+          });
+
+          const label = el("label", {}, [checkbox, "keep ", row.source + " \u2192 " + row.destination]);
+          list.appendChild(el("li", {}, label));
+        }
+        $("notfound-section").hidden = missing.length === 0;
+      };
+
+      const keptNotFound = () => {
+        return notFoundRows().filter((row) => {
+          const lower = row.source.trim().toLowerCase();
+          return state.keepNotFound.get(lower) !== false;
+        });
+      };
+
+      const selectedCount = () => {
+        if (!state.tenantLoaded) {
+          return state.savedRows.length;
+        }
+        let picked = 0;
+        for (const row of state.rows) {
+          if (row.chk.checked) {
+            picked += 1;
+          }
+        }
+        return picked + keptNotFound().length;
+      };
+
+      const updateCounts = () => {
+        const count = selectedCount();
+        if (state.tenantLoaded) {
+          $("sel-count").textContent = "Selected: " + count;
+          return;
+        }
+        $("sel-count").textContent = "Selected: " + count + " (saved; load the tenant list to edit)";
+      };
+
+      const buildSelection = () => {
+        const rows = [];
+        const problems = [];
+        const byDest = new Set();
+        const destRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+        for (const row of state.rows) {
+          if (!row.chk.checked) {
+            continue;
+          }
+
+          const source = row.mail;
+          const destination = row.dest.value.trim();
+          const nameText = row.name.value.trim();
+          const name = nameText ? nameText : null;
+          const quotaText = row.quota.value.trim();
+
+          let quota = null;
+          if (quotaText) {
+            if (/^\d+$/.test(quotaText) && Number(quotaText) >= 1) {
+              quota = Number(quotaText);
+            } else {
+              problems.push(source + ": quota must be a whole number \u2265 1");
+            }
+          }
+
+          if (!destRe.test(destination)) {
+            problems.push(source + ": destination \"" + destination + "\" is not an address");
+          }
+
+          rows.push({ source, destination, name, quota_mib: quota });
+
+          const lower = destination.toLowerCase();
+          if (byDest.has(lower)) {
+            problems.push("duplicate destination " + destination);
+          } else {
+            byDest.add(lower);
+          }
+        }
+
+        for (const row of keptNotFound()) {
+          const copy = {
+            source: row.source,
+            destination: row.destination,
+            name: row.name === undefined ? null : row.name,
+            quota_mib: row.quota_mib === undefined ? null : row.quota_mib,
+          };
+          rows.push(copy);
+          const lower = copy.destination.toLowerCase();
+          if (byDest.has(lower)) {
+            problems.push("duplicate destination " + copy.destination);
+          } else {
+            byDest.add(lower);
+          }
+        }
+
+        return { rows, problems };
+      };
+
+      const saveSelection = async () => {
+        if (!state.tenantLoaded) {
+          return;
+        }
+
+        const built = buildSelection();
+        if (built.problems.length > 0) {
+          const first = built.problems.slice(0, 5).join("; ");
+          const rest = built.problems.length - 5;
+          const tail = rest > 0 ? "; and " + rest + " more" : "";
+          setMsg($("save-msg"), "Not saved: " + first + tail, "error");
+          return;
+        }
+
+        const btn = $("btn-save");
+        btn.disabled = true;
+        setMsg($("save-msg"), "Saving…");
+
+        try {
+          await api("PUT", "/api/selection", { body: { rows: built.rows }, as: "none" });
+          state.savedRows = built.rows;
+          renderSaved();
+          renderNotFound();
+          setDirty(false);
+          updateCounts();
+          setMsg($("save-msg"), "Saved " + built.rows.length + " mailbox(es) at " + new Date().toLocaleTimeString(), "ok");
+        } catch (err) {
+          setMsg($("save-msg"), "Not saved: " + err.message, "error");
+          reportError(err);
+        } finally {
+          btn.disabled = false;
+        }
+      };
+
+      const onBeforeUnload = (event) => {
+        event.preventDefault();
+        event.returnValue = "";
+      };
+
+      const setDirty = (flag) => {
+        state.dirty = flag;
+        $("sel-dirty").hidden = !flag;
+        if (flag) {
+          window.addEventListener("beforeunload", onBeforeUnload);
+        } else {
+          window.removeEventListener("beforeunload", onBeforeUnload);
+        }
+        updateRunButtons();
+      };
+
+      $("btn-save").addEventListener("click", () => {
+        saveSelection();
+      });
+
+      // ==== run and jobs ====
+      const isJobRunning = () => state.starting || Boolean(state.job && state.job.running);
+
+      const updateRunButtons = () => {
+        const off = state.dirty || isJobRunning() || state.authFailed;
+        const buttons = $("run-buttons").querySelectorAll("button[data-command]");
+        for (const btn of buttons) {
+          btn.disabled = off;
+        }
+        for (const btn of $("jobs-body").querySelectorAll("button.view-job")) {
+          btn.disabled = isJobRunning();
+        }
+        $("run-hint").hidden = !state.dirty;
+        renderHeaderJob();
+      };
+
+      const validateJob = (d, route, detail = false) => {
+        if (!isObject(d)) {
+          throw badResponse(route);
+        }
+        if (!(isStr(d.id) || isNum(d.id)) || !isStr(d.command)) {
+          throw badResponse(route);
+        }
+        if (d.args !== undefined) {
+          if (!Array.isArray(d.args) || d.args.some((v) => !isStr(v))) {
+            throw badResponse(route);
+          }
+        }
+        if (d.started !== undefined && d.started !== null && !isStr(d.started)) {
+          throw badResponse(route);
+        }
+        if (d.finished !== undefined && d.finished !== null && !isStr(d.finished)) {
+          throw badResponse(route);
+        }
+        if (d.exit_code !== undefined && d.exit_code !== null && !isInt(d.exit_code)) {
+          throw badResponse(route);
+        }
+        if (detail) {
+          if (!Array.isArray(d.output_tail) || d.output_tail.some((v) => !isStr(v)) || !isBool(d.running)) {
+            throw badResponse(route);
+          }
+        }
+        return d;
+      };
+
+      const renderJob = (d) => {
+        const id = String(d.id);
+        const args = Array.isArray(d.args) ? d.args : [];
+        const title = $("job-title");
+        clear(title);
+        title.appendChild(document.createTextNode("Job #" + id + " — " + d.command));
+        if (args.length > 0) {
+          title.appendChild(el("span", { className: "muted", text: " (" + args.join(" ") + ")" }));
+        }
+
+        const pre = $("job-output");
+        const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
+        pre.textContent = d.output_tail.map(clean).join("\n");
+        if (atBottom) {
+          pre.scrollTop = pre.scrollHeight;
+        }
+
+        const stateNode = $("job-state");
+        clear(stateNode);
+        if (d.running) {
+          const parsed = d.started === undefined || d.started === null ? Number.NaN : Date.parse(d.started);
+          const startMs = Number.isFinite(parsed) ? parsed : state.job.localStart;
+          stateNode.appendChild(document.createTextNode("running for " + fmtDuration(Date.now() - startMs)));
+          return;
+        }
+
+        const parsedStart = d.started === undefined || d.started === null ? Number.NaN : Date.parse(d.started);
+        const parsedFinish = d.finished === undefined || d.finished === null ? Number.NaN : Date.parse(d.finished);
+        const duration = Number.isFinite(parsedStart) && Number.isFinite(parsedFinish)
+          ? fmtDuration(parsedFinish - parsedStart)
+          : fmtDuration(Date.now() - state.job.localStart);
+        const exitUnknown = d.exit_code === undefined || d.exit_code === null;
+        const span = el("span", {
+          className: d.exit_code === 0 ? "exit-ok" : "exit-bad",
+          text: "exit code " + (exitUnknown ? "unknown" : String(d.exit_code)),
+        });
+        stateNode.appendChild(document.createTextNode("finished: "));
+        stateNode.appendChild(span);
+        stateNode.appendChild(document.createTextNode(" in " + duration));
+      };
+
+      const finishJob = () => {
+        if (!state.job) {
+          return;
+        }
+        const sawRunning = state.job.sawRunning;
+        state.job.running = false;
+        state.job.polling = false;
+        updateRunButtons();
+        if (sawRunning) {
+          loadJobs().catch(reportError);
+          loadReport().catch(reportError);
+          loadStatus().catch(reportError);
+        }
+      };
+
+      const pollJob = async (gen) => {
+        if (gen !== state.jobGen || !state.job) {
+          return;
+        }
+        const route = "/api/jobs/" + encodeURIComponent(state.job.id);
+        try {
+          const d = validateJob(await api("GET", route), route, true);
+          if (gen !== state.jobGen || !state.job) {
+            return;
+          }
+          state.job.failures = 0;
+          state.job.command = d.command;
+          state.job.running = d.running;
+          renderHeaderJob();
+          if (d.running) {
+            state.job.sawRunning = true;
+          }
+          renderJob(d);
+          if (d.running) {
+            setTimeout(() => {
+              pollJob(gen);
+            }, 2000);
+          } else {
+            finishJob();
+          }
+        } catch (err) {
+          if (gen !== state.jobGen || !state.job) {
+            return;
+          }
+          if (err && err.unauthorized) {
+            state.job.polling = false;
+            return;
+          }
+          state.job.failures += 1;
+          if (state.job.failures >= 5) {
+            state.job.polling = false;
+            showError("Lost contact with job #" + state.job.id + ": " + err.message);
+            $("btn-resume").hidden = false;
+            updateRunButtons();
+            return;
+          }
+          setTimeout(() => {
+            pollJob(gen);
+          }, 2000);
+        }
+      };
+
+      const attachJob = (id, command = "") => {
+        const gen = ++state.jobGen;
+        state.job = {
+          id,
+          command,
+          running: true,
+          polling: true,
+          sawRunning: false,
+          failures: 0,
+          localStart: Date.now(),
+        };
+        $("job-view").hidden = false;
+        $("job-title").textContent = "Job #" + id;
+        $("job-state").textContent = "loading…";
+        $("job-output").textContent = "";
+        clear($("full-output-slot"));
+        $("btn-resume").hidden = true;
+        updateRunButtons();
+        pollJob(gen);
+      };
+
+      const startJob = async (command, dryRun) => {
+        if (state.dirty) {
+          setMsg($("run-msg"), "Save the selection first.", "error");
+          return;
+        }
+        if (isJobRunning()) {
+          setMsg($("run-msg"), "A job is already running.", "error");
+          return;
+        }
+
+        const only = $("opt-only").value || null;
+        const mailboxRaw = $("opt-mailbox").value.trim();
+        const mailbox = mailboxRaw || null;
+
+        let sample = 0;
+        if (command === "verify") {
+          const sampleText = $("opt-sample").value.trim();
+          if (sampleText === "") {
+            sample = 0;
+          } else if (!/^\d+$/.test(sampleText) || Number(sampleText) > 1000) {
+            setMsg($("run-msg"), "Verify sample must be a whole number from 0 to 1000.", "error");
+            return;
+          } else {
+            sample = Number(sampleText);
+          }
+        }
+
+        if (!dryRun && (command === "provision" || command === "migrate" || command === "cleanup")) {
+          const n = state.savedRows.length;
+          const what = mailbox
+            ? "1 mailbox (" + mailbox + ")"
+            : n === 0
+              ? "the mailboxes from the config file (the saved selection is empty)"
+              : n === 1
+                ? "the 1 selected mailbox"
+                : "the " + String(n) + " selected mailboxes";
+          const scope = only ? " (only " + only + ")" : "";
+          let text = "";
+          if (command === "provision") {
+            text = "Provision " + what + " in mailcow for real? This creates mailboxes.";
+          } else if (command === "migrate") {
+            text = "Migrate " + what + scope + " for real? This writes to mailcow.";
+          } else {
+            text = "Clean up " + what + " for real? This deletes the o365-migration app passwords.";
+          }
+          if (!window.confirm(text)) {
+            return;
+          }
+        }
+
+        state.starting = true;
+        updateRunButtons();
+        setMsg($("run-msg"), "Starting " + command + "…");
+
+        try {
+          const r = await api("POST", "/api/jobs", {
+            body: {
+              command,
+              dry_run: dryRun,
+              only,
+              mailbox,
+              sample,
+            },
+          });
+          if (!isObject(r) || !(isStr(r.id) || isNum(r.id))) {
+            throw badResponse("/api/jobs");
+          }
+          const id = String(r.id);
+          setMsg(
+            $("run-msg"),
+            "Started " + command + (dryRun ? " (dry run)" : "") + " as job #" + id + ".",
+            "ok",
+          );
+          state.starting = false;
+          attachJob(id, command);
+        } catch (err) {
+          if (err && err.status === 409) {
+            setMsg($("run-msg"), "A job is already running.", "error");
+            showError("A job is already running.");
+            loadStatus().catch(reportError);
+          } else {
+            setMsg($("run-msg"), err.message, "error");
+            reportError(err);
+          }
+        } finally {
+          state.starting = false;
+          updateRunButtons();
+        }
+      };
+
+      const openFullOutput = async () => {
+        if (!state.job) {
+          return;
+        }
+        const id = state.job.id;
+        const win = window.open("", "_blank");
+        if (win) {
+          win.opener = null;
+        }
+        try {
+          const text = await api("GET", "/api/jobs/" + encodeURIComponent(id) + "/output", {
+            as: "text",
+            timeoutMs: 120000,
+          });
+          const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+          if (win && !win.closed) {
+            win.location.href = url;
+          } else {
+            $("full-output-slot").replaceChildren(
+              el("a", {
+                href: url,
+                download: "job-" + id + "-output.txt",
+                text: "Download full output",
+              }),
+            );
+          }
+          setTimeout(() => {
+            URL.revokeObjectURL(url);
+          }, 60000);
+        } catch (err) {
+          if (win && !win.closed) {
+            win.close();
+          }
+          reportError(err);
+        }
+      };
+
+      const loadJobs = async () => {
+        const list = await api("GET", "/api/jobs");
+        if (!Array.isArray(list)) {
+          throw badResponse("/api/jobs");
+        }
+        for (const job of list) {
+          validateJob(job, "/api/jobs");
+        }
+
+        const body = $("jobs-body");
+        clear(body);
+        const top = list.slice(0, 10);
+        for (const j of top) {
+          const id = String(j.id);
+          const args = Array.isArray(j.args) ? j.args : [];
+          const running = (j.finished === null || j.finished === undefined) &&
+            (j.exit_code === null || j.exit_code === undefined);
+
+          const resultCell = el("td", { text: "running" });
+          if (!running) {
+            const codeText = j.exit_code === null || j.exit_code === undefined ? "unknown" : String(j.exit_code);
+            clear(resultCell);
+            resultCell.appendChild(
+              el("span", {
+                className: j.exit_code === 0 ? "exit-ok" : "exit-bad",
+                text: "exit " + codeText,
+              }),
+            );
+          }
+
+          const view = el("button", {
+            type: "button",
+            className: "view-job",
+            disabled: isJobRunning(),
+            text: "View",
+            ariaLabel: "View job #" + id,
+          });
+          view.addEventListener("click", () => {
+            attachJob(id, j.command);
+          });
+
+          const commandCell = el("td", { text: j.command });
+          if (args.length > 0) {
+            commandCell.appendChild(el("div", { className: "muted", text: args.join(" ") }));
+          }
+
+          body.appendChild(
+            el("tr", {}, [
+              el("td", { text: fmtTime(j.started) }),
+              commandCell,
+              resultCell,
+              el("td", {}, view),
+            ]),
+          );
+        }
+
+        $("jobs-empty").hidden = list.length > 0;
+        $("jobs-table").hidden = list.length === 0;
+      };
+
+      for (const btn of $("run-buttons").querySelectorAll("button[data-command]")) {
+        btn.addEventListener("click", () => {
+          startJob(btn.dataset.command, btn.dataset.dry === "1");
+        });
+      }
+
+      $("btn-resume").addEventListener("click", () => {
+        if (state.job) {
+          attachJob(state.job.id, state.job.command);
+        }
+      });
+
+      $("btn-full-output").addEventListener("click", () => {
+        openFullOutput();
+      });
+
+      // ==== report ====
+      const REPORT_EMPTY_DEFAULT = "No report yet.";
+      const REPORT_EMPTY_NO_MAILBOXES = "The last report lists no mailboxes.";
+
+      const scalarText = (v) => {
+        if (isStr(v)) {
+          return v;
+        }
+        if (isNum(v)) {
+          return String(v);
+        }
+        if (isBool(v)) {
+          return v ? "yes" : "no";
+        }
+        if (v === null || v === undefined) {
+          return "–";
+        }
+        return null;
+      };
+
+      const makeKvChip = (key, value, extraClass = "") => {
+        const raw = String(value);
+        const long = raw.length > 200;
+        const shown = long ? raw.slice(0, 200) + "…" : raw;
+        const cls = extraClass ? "kv " + extraClass : "kv";
+        const props = {
+          className: cls,
+          text: key + ": " + shown,
+        };
+        if (long) {
+          props.title = raw;
+        }
+        return el("span", props);
+      };
+
+      const renderArrayField = (name, items) => {
+        const block = el("div", {});
+        const count = items.length;
+
+        if (count > 0 && items.every((item) => isObject(item))) {
+          block.appendChild(makeKvChip(name, String(count) + " items"));
+
+          const numericKeys = [];
+          const seenNumeric = new Set();
+          for (const item of items) {
+            for (const [key, value] of Object.entries(item)) {
+              if (isNum(value) && !seenNumeric.has(key)) {
+                seenNumeric.add(key);
+                numericKeys.push(key);
+              }
+            }
+          }
+
+          for (const key of numericKeys) {
+            let total = 0;
+            let hasAny = false;
+            for (const item of items) {
+              const value = item[key];
+              if (isNum(value)) {
+                total += value;
+                hasAny = true;
+              }
+            }
+            if (hasAny) {
+              block.appendChild(makeKvChip(name + "." + key + " Σ", String(total)));
+            }
+          }
+
+          const columns = [];
+          const seenColumns = new Set();
+          for (const item of items) {
+            for (const [key, value] of Object.entries(item)) {
+              if (seenColumns.has(key)) {
+                continue;
+              }
+              if (scalarText(value) !== null) {
+                if (columns.length >= 12) {
+                  continue;
+                }
+                seenColumns.add(key);
+                columns.push(key);
+              }
+            }
+          }
+
+          const fallbackColumn = columns.length === 0;
+          if (fallbackColumn) {
+            columns.push("value");
+          }
+
+          const theadRow = el("tr", {});
+          for (const col of columns) {
+            theadRow.appendChild(el("th", { text: col }));
+          }
+
+          const tbody = el("tbody", {});
+          const rowLimit = Math.min(items.length, 500);
+          for (let i = 0; i < rowLimit; i += 1) {
+            const item = items[i];
+            const tr = el("tr", {});
+            for (const col of columns) {
+              let text = "";
+              let numeric = false;
+              if (!fallbackColumn) {
+                const value = item[col];
+                const scalar = scalarText(value);
+                text = scalar === null ? "" : scalar;
+                numeric = isNum(value);
+              }
+              tr.appendChild(el("td", { className: numeric ? "num" : "", text }));
+            }
+            tbody.appendChild(tr);
+          }
+
+          if (items.length > rowLimit) {
+            tbody.appendChild(
+              el("tr", {}, el("td", { colSpan: columns.length, text: "… " + String(items.length - rowLimit) + " more" })),
+            );
+          }
+
+          const table = el("table", { className: "grid" }, [
+            el("thead", {}, theadRow),
+            tbody,
+          ]);
+          const details = el("details", {}, [
+            el("summary", { text: name + " table" }),
+            el("div", { className: "table-wrap" }, table),
+          ]);
+          block.appendChild(details);
+          return block;
+        }
+
+        block.appendChild(makeKvChip(name, String(count)));
+        if (count > 0) {
+          const list = el("ul", { className: "plain" });
+          const limit = Math.min(count, 500);
+          for (let i = 0; i < limit; i += 1) {
+            const item = items[i];
+            let text = scalarText(item);
+            if (text === null) {
+              try {
+                const json = JSON.stringify(item);
+                text = json === undefined ? String(item) : json;
+              } catch (_err) {
+                text = String(item);
+              }
+            }
+            list.appendChild(el("li", { text }));
+          }
+          if (count > limit) {
+            list.appendChild(el("li", { text: "… " + String(count - limit) + " more" }));
+          }
+          block.appendChild(el("details", {}, [el("summary", { text: "show" }), list]));
+        }
+        return block;
+      };
+
+      const renderSections = (entry) => {
+        const out = document.createDocumentFragment();
+        const excluded = new Set(["destination", "status", "errors"]);
+        const ordered = [];
+
+        for (const key of ["mail", "calendar", "contacts"]) {
+          if (Object.prototype.hasOwnProperty.call(entry, key)) {
+            ordered.push(key);
+            excluded.add(key);
+          }
+        }
+
+        const extras = Object.keys(entry)
+          .filter((key) => !excluded.has(key))
+          .sort((a, b) => a.localeCompare(b));
+
+        for (const key of [...ordered, ...extras]) {
+          const value = entry[key];
+          const block = el("div", { className: "section-block" });
+          const topScalar = scalarText(value);
+
+          if (topScalar !== null) {
+            block.appendChild(makeKvChip(key, topScalar));
+            out.appendChild(block);
+            continue;
+          }
+
+          if (Array.isArray(value)) {
+            block.appendChild(renderArrayField(key, value));
+            out.appendChild(block);
+            continue;
+          }
+
+          if (!isObject(value)) {
+            continue;
+          }
+
+          block.appendChild(el("strong", { text: key }));
+          for (const [name, field] of Object.entries(value)) {
+            if (isStr(field) || isNum(field) || isBool(field)) {
+              block.appendChild(makeKvChip(name, scalarText(field)));
+              continue;
+            }
+            if (Array.isArray(field)) {
+              block.appendChild(renderArrayField(name, field));
+              continue;
+            }
+            if (isObject(field)) {
+              for (const [subName, subValue] of Object.entries(field)) {
+                if (isNum(subValue)) {
+                  block.appendChild(makeKvChip(name + "." + subName, String(subValue)));
+                }
+              }
+            }
+          }
+          out.appendChild(block);
+        }
+
+        return out;
+      };
+
+      const loadReport = async () => {
+        const data = await api("GET", "/api/reports/latest", { allow404: true });
+        const empty = $("report-empty");
+        const meta = $("report-meta");
+        const table = $("report-table");
+        const body = $("report-body");
+
+        if (data === null) {
+          empty.textContent = REPORT_EMPTY_DEFAULT;
+          empty.hidden = false;
+          clear(meta);
+          meta.hidden = true;
+          clear(body);
+          table.hidden = true;
+          return;
+        }
+
+        if (!isObject(data) || !isObject(data.mailboxes)) {
+          throw badResponse("/api/reports/latest");
+        }
+
+        empty.hidden = true;
+
+        clear(meta);
+        const commandText = isStr(data.command) && data.command ? data.command : "?";
+        meta.appendChild(makeKvChip("command", commandText + (data.dry_run === true ? " (dry run)" : "")));
+        meta.appendChild(makeKvChip("started", fmtTime(data.started)));
+        meta.appendChild(makeKvChip("finished", fmtTime(data.finished)));
+
+        let exitText = "–";
+        let exitClass = "";
+        if (isInt(data.exit_code)) {
+          exitText = String(data.exit_code);
+          exitClass = data.exit_code === 0 ? "exit-ok" : "exit-bad";
+        }
+        meta.appendChild(makeKvChip("exit code", exitText, exitClass));
+
+        if (isNum(data.duration_s)) {
+          meta.appendChild(makeKvChip("duration", fmtDuration(data.duration_s * 1000)));
+        }
+        meta.hidden = false;
+
+        clear(body);
+        const mailboxes = Object.entries(data.mailboxes).sort((a, b) => a[0].localeCompare(b[0]));
+
+        for (const [source, entry] of mailboxes) {
+          if (!isObject(entry)) {
+            body.appendChild(
+              el("tr", {}, [
+                el("td", { text: source }),
+                el("td", { text: "" }),
+                el("td", { text: "invalid entry" }),
+                el("td", { className: "num", text: "" }),
+                el("td", { text: "" }),
+              ]),
+            );
+            continue;
+          }
+
+          const status = scalarText(entry.status);
+          const errors = Array.isArray(entry.errors) ? entry.errors.filter((v) => isStr(v)) : [];
+
+          const errorCell = el("td", { className: "num", text: String(errors.length) });
+          if (errors.length > 0) {
+            errorCell.appendChild(
+              el("details", {}, [
+                el("summary", { text: "show" }),
+                el("ul", { className: "plain" }, errors.map((message) => el("li", { text: message }))),
+              ]),
+            );
+          }
+
+          const detailsCell = el("td", {});
+          detailsCell.appendChild(renderSections(entry));
+
+          body.appendChild(
+            el("tr", {}, [
+              el("td", { text: source }),
+              el("td", { text: isStr(entry.destination) ? entry.destination : "" }),
+              el("td", { text: status === null ? "" : status }),
+              errorCell,
+              detailsCell,
+            ]),
+          );
+        }
+
+        if (mailboxes.length > 0) {
+          table.hidden = false;
+          empty.hidden = true;
+        } else {
+          table.hidden = true;
+          empty.textContent = REPORT_EMPTY_NO_MAILBOXES;
+          empty.hidden = false;
+        }
+      };
+
+      $("btn-report-reload").addEventListener("click", () => {
+        loadReport().catch(reportError);
+      });
+
+      // ==== boot ====
+      boot();
+    })();
+  </script>
+</body>
+</html>
