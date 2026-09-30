@@ -1,0 +1,15 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('user@example.com')/contacts/$entity",
+  "@odata.etag": "W/\"CQAAABYAAAB7eV7hQf0PS6R2T0+2VGjQAAAAAAEF\"",
+  "id": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAEMAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL7aAAA=",
+  "createdDateTime": "2026-09-01T09:30:00Z",
+  "lastModifiedDateTime": "2026-09-01T09:30:01Z",
+  "emailAddresses": [
+    {
+      "name": "Primary",
+      "address": "email.only@example.com"
+    }
+  ],
+  "businessPhones": [],
+  "homePhones": []
+}

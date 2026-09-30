@@ -1,0 +1,70 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('user@example.com')/contacts/$entity",
+  "@odata.etag": "W/\"CQAAABYAAABf1mNyd2hRT6QY7M2r4f2mAAAAAABC\"",
+  "id": "AAMkAGI2YTZiMzE4LWE2YzMtNDRkYy1hODk3LTNlN2Q1OTcwY2Q0YwBGAAAAAACxQ2QnQf1wS4IuB84X5k6vBwD3Qf1tXnslR7C7LdX0Q5JkAAAAAAEOAAD3Qf1tXnslR7C7LdX0Q5JkAAAgq8sWAAA=",
+  "createdDateTime": "2026-09-12T08:45:12Z",
+  "lastModifiedDateTime": "2026-09-20T10:34:56.9876543Z",
+  "changeKey": "CQAAABYAAABf1mNyd2hRT6QY7M2r4f2mAAAAAABC",
+  "categories": [
+    "VIP",
+    "Engineering"
+  ],
+  "parentFolderId": "AAMkAGI2YTZiMzE4LWE2YzMtNDRkYy1hODk3LTNlN2Q1OTcwY2Q0YwAuAAAAAAB9rW6q8xWlQIKv4G9P2g4ZAQAAAA==",
+  "birthday": "1980-05-17T00:00:00Z",
+  "fileAs": "Lovelace, Ada",
+  "displayName": "Ada Lovelace",
+  "givenName": "Ada",
+  "middleName": "Byron",
+  "surname": "Lovelace",
+  "title": "Countess",
+  "generation": "III",
+  "nickName": "Enchantress",
+  "companyName": "Analytical Engines Inc",
+  "department": "Research",
+  "jobTitle": "Mathematician",
+  "businessHomePage": "https://example.com/ada",
+  "personalNotes": "Met at conference.",
+  "mobilePhone": "+1 555 0102",
+  "emailAddresses": [
+    {
+      "name": "Work",
+      "address": "ADA@example.com"
+    },
+    {
+      "name": "Alt",
+      "address": "ada.lovelace@example.org"
+    },
+    {
+      "name": "Duplicate",
+      "address": "ada@EXAMPLE.com"
+    }
+  ],
+  "businessPhones": [
+    "+1 555 0100",
+    ""
+  ],
+  "homePhones": [
+    "+1 555 0101"
+  ],
+  "homeAddress": {
+    "street": "1 Home St",
+    "city": "London",
+    "state": "LN",
+    "postalCode": "H0M3",
+    "countryOrRegion": "UK"
+  },
+  "businessAddress": {
+    "street": "2 Work Rd",
+    "city": "London",
+    "state": "LN",
+    "postalCode": "W0R9",
+    "countryOrRegion": "UK"
+  },
+  "otherAddress": {
+    "street": "3 Other Ave",
+    "city": "Oxford",
+    "state": "OX",
+    "postalCode": "OX1",
+    "countryOrRegion": "UK"
+  }
+}

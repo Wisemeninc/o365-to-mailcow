@@ -1,0 +1,69 @@
+{
+  "@odata.etag": "W/\"DwAAABYAAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL01\"",
+  "id": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL701AAA=",
+  "createdDateTime": "2026-02-01T10:15:30.1234567Z",
+  "lastModifiedDateTime": "2026-02-10T08:00:00.7654321Z",
+  "changeKey": "D/OPX+0PLUeUH2NIdmPBNgAAHbi01",
+  "categories": [
+    "Blue category",
+    "Finance"
+  ],
+  "transactionId": null,
+  "originalStartTimeZone": "W. Europe Standard Time",
+  "originalEndTimeZone": "W. Europe Standard Time",
+  "iCalUId": "040000008200E00074C5B7101A82E008000000007001A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+  "uid": "040000008200E00074C5B7101A82E008000000007001A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+  "reminderMinutesBeforeStart": 15,
+  "isReminderOn": true,
+  "hasAttachments": false,
+  "subject": "Quarterly review",
+  "bodyPreview": "Agenda: numbers, plans; risks",
+  "importance": "normal",
+  "sensitivity": "private",
+  "isAllDay": false,
+  "isCancelled": false,
+  "isOrganizer": true,
+  "responseRequested": true,
+  "seriesMasterId": null,
+  "showAs": "busy",
+  "type": "singleInstance",
+  "webLink": "https://outlook.office365.com/owa/?itemid=AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL701AAA=&exvsurl=1&path=/calendar/item",
+  "onlineMeetingUrl": null,
+  "isOnlineMeeting": true,
+  "onlineMeetingProvider": "teamsForBusiness",
+  "allowNewTimeProposals": true,
+  "isDraft": false,
+  "hideAttendees": false,
+  "responseStatus": {
+    "response": "organizer",
+    "time": "0001-01-01T00:00:00Z"
+  },
+  "body": {
+    "contentType": "text",
+    "content": "Agenda: numbers, plans; risks\nBring laptop."
+  },
+  "start": {
+    "dateTime": "2026-03-30T07:00:00.0000000",
+    "timeZone": "UTC"
+  },
+  "end": {
+    "dateTime": "2026-03-30T08:00:00.0000000",
+    "timeZone": "UTC"
+  },
+  "location": {
+    "displayName": "Room 4.12, HQ",
+    "locationType": "default"
+  },
+  "locations": [],
+  "recurrence": null,
+  "attendees": [],
+  "organizer": {
+    "emailAddress": {
+      "name": "Peter Example",
+      "address": "peter@example.com"
+    }
+  },
+  "onlineMeeting": {
+    "joinUrl": "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc%40thread.v2/0"
+  }
+}

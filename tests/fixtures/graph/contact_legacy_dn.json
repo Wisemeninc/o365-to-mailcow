@@ -1,0 +1,21 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('user@example.com')/contacts/$entity",
+  "@odata.etag": "W/\"CQAAABYAAABM1fVf8r9fS4Q4O6d7m7R0AAAAAAEE\"",
+  "id": "AAMkAGU0YjIyY2QxLWFmZTQtNDAwZi05YTRjLTAzMzM4N2Q5NmY4OQBGAAAAAAD8X8Qv8m4LS4RL7g8P5HcYBwD3x9dYw87qQJxSax8UQkY5AAAAAAEJAAD3x9dYw87qQJxSax8UQkY5AAAcS8fVAAA=",
+  "createdDateTime": "2026-08-05T12:00:00Z",
+  "lastModifiedDateTime": "2026-08-05T12:34:56Z",
+  "displayName": "Legacy User",
+  "emailAddresses": [
+    {
+      "name": "Legacy",
+      "address": "/o=ExchangeLabs/ou=Exchange Administrative Group/cn=Recipients/cn=abcdef123456"
+    },
+    {
+      "name": "SMTP",
+      "address": "legacy.user@example.net"
+    }
+  ],
+  "birthday": "1604-05-17T11:59:00Z",
+  "businessPhones": [],
+  "homePhones": []
+}

@@ -1,0 +1,578 @@
+{
+  "master": {
+    "@odata.etag": "W/\"DwAAABYAAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL03\"",
+    "id": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL703AAA=",
+    "createdDateTime": "2026-02-01T10:15:30.1234567Z",
+    "lastModifiedDateTime": "2026-02-10T08:00:00.7654321Z",
+    "changeKey": "D/OPX+0PLUeUH2NIdmPBNgAAHbi03",
+    "categories": [],
+    "transactionId": null,
+    "originalStartTimeZone": "W. Europe Standard Time",
+    "originalEndTimeZone": "W. Europe Standard Time",
+    "iCalUId": "040000008200E00074C5B7101A82E008000000007003A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+    "uid": "040000008200E00074C5B7101A82E008000000007003A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+    "reminderMinutesBeforeStart": 15,
+    "isReminderOn": false,
+    "hasAttachments": false,
+    "subject": "Team sync",
+    "bodyPreview": "",
+    "importance": "normal",
+    "sensitivity": "normal",
+    "isAllDay": false,
+    "isCancelled": false,
+    "isOrganizer": true,
+    "responseRequested": true,
+    "seriesMasterId": null,
+    "showAs": "busy",
+    "type": "seriesMaster",
+    "webLink": "https://outlook.office365.com/owa/?itemid=AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL703AAA=&exvsurl=1&path=/calendar/item",
+    "onlineMeetingUrl": null,
+    "isOnlineMeeting": false,
+    "onlineMeetingProvider": "unknown",
+    "allowNewTimeProposals": true,
+    "isDraft": false,
+    "hideAttendees": false,
+    "responseStatus": {
+      "response": "organizer",
+      "time": "0001-01-01T00:00:00Z"
+    },
+    "body": {
+      "contentType": "text",
+      "content": ""
+    },
+    "start": {
+      "dateTime": "2026-03-16T08:00:00.0000000",
+      "timeZone": "UTC"
+    },
+    "end": {
+      "dateTime": "2026-03-16T08:30:00.0000000",
+      "timeZone": "UTC"
+    },
+    "location": {
+      "displayName": "",
+      "locationType": "default",
+      "uniqueIdType": "unknown",
+      "address": {},
+      "coordinates": {}
+    },
+    "locations": [],
+    "recurrence": {
+      "pattern": {
+        "type": "weekly",
+        "interval": 1,
+        "month": 0,
+        "dayOfMonth": 0,
+        "daysOfWeek": [
+          "monday"
+        ],
+        "firstDayOfWeek": "sunday",
+        "index": "first"
+      },
+      "range": {
+        "type": "endDate",
+        "startDate": "2026-03-16",
+        "endDate": "2026-04-27",
+        "recurrenceTimeZone": "W. Europe Standard Time",
+        "numberOfOccurrences": 0
+      }
+    },
+    "attendees": [
+      {
+        "type": "required",
+        "status": {
+          "response": "accepted",
+          "time": "2026-02-02T09:00:00Z"
+        },
+        "emailAddress": {
+          "name": "Anna Berg",
+          "address": "anna@example.com"
+        }
+      }
+    ],
+    "organizer": {
+      "emailAddress": {
+        "name": "Peter Example",
+        "address": "peter@example.com"
+      }
+    },
+    "onlineMeeting": null
+  },
+  "instances": [
+    {
+      "@odata.etag": "W/\"DwAAABYAAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL30\"",
+      "id": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL730AAA=",
+      "createdDateTime": "2026-02-01T10:15:30.1234567Z",
+      "lastModifiedDateTime": "2026-02-10T08:00:00.7654321Z",
+      "changeKey": "D/OPX+0PLUeUH2NIdmPBNgAAHbi30",
+      "categories": [],
+      "transactionId": null,
+      "originalStartTimeZone": "W. Europe Standard Time",
+      "originalEndTimeZone": "W. Europe Standard Time",
+      "iCalUId": "040000008200E00074C5B7101A82E008000000007003A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "uid": "040000008200E00074C5B7101A82E008000000007030A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "reminderMinutesBeforeStart": 15,
+      "isReminderOn": false,
+      "hasAttachments": false,
+      "subject": "Team sync",
+      "bodyPreview": "",
+      "importance": "normal",
+      "sensitivity": "normal",
+      "isAllDay": false,
+      "isCancelled": false,
+      "isOrganizer": true,
+      "responseRequested": true,
+      "seriesMasterId": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL703AAA=",
+      "showAs": "busy",
+      "type": "occurrence",
+      "webLink": "https://outlook.office365.com/owa/?itemid=AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL730AAA=&exvsurl=1&path=/calendar/item",
+      "onlineMeetingUrl": null,
+      "isOnlineMeeting": false,
+      "onlineMeetingProvider": "unknown",
+      "allowNewTimeProposals": true,
+      "isDraft": false,
+      "hideAttendees": false,
+      "responseStatus": {
+        "response": "organizer",
+        "time": "0001-01-01T00:00:00Z"
+      },
+      "body": {
+        "contentType": "text",
+        "content": ""
+      },
+      "start": {
+        "dateTime": "2026-03-16T08:00:00.0000000",
+        "timeZone": "UTC"
+      },
+      "end": {
+        "dateTime": "2026-03-16T08:30:00.0000000",
+        "timeZone": "UTC"
+      },
+      "location": {
+        "displayName": "",
+        "locationType": "default",
+        "uniqueIdType": "unknown",
+        "address": {},
+        "coordinates": {}
+      },
+      "locations": [],
+      "recurrence": null,
+      "attendees": [
+        {
+          "type": "required",
+          "status": {
+            "response": "accepted",
+            "time": "2026-02-02T09:00:00Z"
+          },
+          "emailAddress": {
+            "name": "Anna Berg",
+            "address": "anna@example.com"
+          }
+        }
+      ],
+      "organizer": {
+        "emailAddress": {
+          "name": "Peter Example",
+          "address": "peter@example.com"
+        }
+      },
+      "onlineMeeting": null,
+      "originalStart": "2026-03-16T08:00:00Z"
+    },
+    {
+      "@odata.etag": "W/\"DwAAABYAAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL31\"",
+      "id": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL731AAA=",
+      "createdDateTime": "2026-02-01T10:15:30.1234567Z",
+      "lastModifiedDateTime": "2026-02-10T08:00:00.7654321Z",
+      "changeKey": "D/OPX+0PLUeUH2NIdmPBNgAAHbi31",
+      "categories": [],
+      "transactionId": null,
+      "originalStartTimeZone": "W. Europe Standard Time",
+      "originalEndTimeZone": "W. Europe Standard Time",
+      "iCalUId": "040000008200E00074C5B7101A82E008000000007003A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "uid": "040000008200E00074C5B7101A82E008000000007031A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "reminderMinutesBeforeStart": 15,
+      "isReminderOn": false,
+      "hasAttachments": false,
+      "subject": "Team sync",
+      "bodyPreview": "",
+      "importance": "normal",
+      "sensitivity": "normal",
+      "isAllDay": false,
+      "isCancelled": false,
+      "isOrganizer": true,
+      "responseRequested": true,
+      "seriesMasterId": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL703AAA=",
+      "showAs": "busy",
+      "type": "occurrence",
+      "webLink": "https://outlook.office365.com/owa/?itemid=AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL731AAA=&exvsurl=1&path=/calendar/item",
+      "onlineMeetingUrl": null,
+      "isOnlineMeeting": false,
+      "onlineMeetingProvider": "unknown",
+      "allowNewTimeProposals": true,
+      "isDraft": false,
+      "hideAttendees": false,
+      "responseStatus": {
+        "response": "organizer",
+        "time": "0001-01-01T00:00:00Z"
+      },
+      "body": {
+        "contentType": "text",
+        "content": ""
+      },
+      "start": {
+        "dateTime": "2026-03-23T08:00:00.0000000",
+        "timeZone": "UTC"
+      },
+      "end": {
+        "dateTime": "2026-03-23T08:30:00.0000000",
+        "timeZone": "UTC"
+      },
+      "location": {
+        "displayName": "",
+        "locationType": "default",
+        "uniqueIdType": "unknown",
+        "address": {},
+        "coordinates": {}
+      },
+      "locations": [],
+      "recurrence": null,
+      "attendees": [
+        {
+          "type": "required",
+          "status": {
+            "response": "accepted",
+            "time": "2026-02-02T09:00:00Z"
+          },
+          "emailAddress": {
+            "name": "Anna Berg",
+            "address": "anna@example.com"
+          }
+        }
+      ],
+      "organizer": {
+        "emailAddress": {
+          "name": "Peter Example",
+          "address": "peter@example.com"
+        }
+      },
+      "onlineMeeting": null,
+      "originalStart": "2026-03-23T08:00:00Z"
+    },
+    {
+      "@odata.etag": "W/\"DwAAABYAAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL32\"",
+      "id": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL732AAA=",
+      "createdDateTime": "2026-02-01T10:15:30.1234567Z",
+      "lastModifiedDateTime": "2026-02-10T08:00:00.7654321Z",
+      "changeKey": "D/OPX+0PLUeUH2NIdmPBNgAAHbi32",
+      "categories": [],
+      "transactionId": null,
+      "originalStartTimeZone": "W. Europe Standard Time",
+      "originalEndTimeZone": "W. Europe Standard Time",
+      "iCalUId": "040000008200E00074C5B7101A82E008000000007003A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "uid": "040000008200E00074C5B7101A82E008000000007032A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "reminderMinutesBeforeStart": 15,
+      "isReminderOn": false,
+      "hasAttachments": false,
+      "subject": "Team sync",
+      "bodyPreview": "",
+      "importance": "normal",
+      "sensitivity": "normal",
+      "isAllDay": false,
+      "isCancelled": false,
+      "isOrganizer": true,
+      "responseRequested": true,
+      "seriesMasterId": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL703AAA=",
+      "showAs": "busy",
+      "type": "occurrence",
+      "webLink": "https://outlook.office365.com/owa/?itemid=AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL732AAA=&exvsurl=1&path=/calendar/item",
+      "onlineMeetingUrl": null,
+      "isOnlineMeeting": false,
+      "onlineMeetingProvider": "unknown",
+      "allowNewTimeProposals": true,
+      "isDraft": false,
+      "hideAttendees": false,
+      "responseStatus": {
+        "response": "organizer",
+        "time": "0001-01-01T00:00:00Z"
+      },
+      "body": {
+        "contentType": "text",
+        "content": ""
+      },
+      "start": {
+        "dateTime": "2026-03-30T07:00:00.0000000",
+        "timeZone": "UTC"
+      },
+      "end": {
+        "dateTime": "2026-03-30T07:30:00.0000000",
+        "timeZone": "UTC"
+      },
+      "location": {
+        "displayName": "",
+        "locationType": "default",
+        "uniqueIdType": "unknown",
+        "address": {},
+        "coordinates": {}
+      },
+      "locations": [],
+      "recurrence": null,
+      "attendees": [
+        {
+          "type": "required",
+          "status": {
+            "response": "accepted",
+            "time": "2026-02-02T09:00:00Z"
+          },
+          "emailAddress": {
+            "name": "Anna Berg",
+            "address": "anna@example.com"
+          }
+        }
+      ],
+      "organizer": {
+        "emailAddress": {
+          "name": "Peter Example",
+          "address": "peter@example.com"
+        }
+      },
+      "onlineMeeting": null,
+      "originalStart": "2026-03-30T07:00:00Z"
+    },
+    {
+      "@odata.etag": "W/\"DwAAABYAAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL33\"",
+      "id": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL733AAA=",
+      "createdDateTime": "2026-02-01T10:15:30.1234567Z",
+      "lastModifiedDateTime": "2026-02-10T08:00:00.7654321Z",
+      "changeKey": "D/OPX+0PLUeUH2NIdmPBNgAAHbi33",
+      "categories": [],
+      "transactionId": null,
+      "originalStartTimeZone": "W. Europe Standard Time",
+      "originalEndTimeZone": "W. Europe Standard Time",
+      "iCalUId": "040000008200E00074C5B7101A82E008000000007003A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "uid": "040000008200E00074C5B7101A82E008000000007033A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "reminderMinutesBeforeStart": 15,
+      "isReminderOn": false,
+      "hasAttachments": false,
+      "subject": "Team sync (moved, extended)",
+      "bodyPreview": "",
+      "importance": "normal",
+      "sensitivity": "normal",
+      "isAllDay": false,
+      "isCancelled": false,
+      "isOrganizer": true,
+      "responseRequested": true,
+      "seriesMasterId": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL703AAA=",
+      "showAs": "busy",
+      "type": "exception",
+      "webLink": "https://outlook.office365.com/owa/?itemid=AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL733AAA=&exvsurl=1&path=/calendar/item",
+      "onlineMeetingUrl": null,
+      "isOnlineMeeting": false,
+      "onlineMeetingProvider": "unknown",
+      "allowNewTimeProposals": true,
+      "isDraft": false,
+      "hideAttendees": false,
+      "responseStatus": {
+        "response": "organizer",
+        "time": "0001-01-01T00:00:00Z"
+      },
+      "body": {
+        "contentType": "text",
+        "content": ""
+      },
+      "start": {
+        "dateTime": "2026-04-06T08:00:00.0000000",
+        "timeZone": "UTC"
+      },
+      "end": {
+        "dateTime": "2026-04-06T09:00:00.0000000",
+        "timeZone": "UTC"
+      },
+      "location": {
+        "displayName": "Room 2.01"
+      },
+      "locations": [],
+      "recurrence": null,
+      "attendees": [
+        {
+          "type": "required",
+          "status": {
+            "response": "accepted",
+            "time": "2026-02-02T09:00:00Z"
+          },
+          "emailAddress": {
+            "name": "Anna Berg",
+            "address": "anna@example.com"
+          }
+        }
+      ],
+      "organizer": {
+        "emailAddress": {
+          "name": "Peter Example",
+          "address": "peter@example.com"
+        }
+      },
+      "onlineMeeting": null,
+      "originalStart": "2026-04-06T07:00:00Z"
+    },
+    {
+      "@odata.etag": "W/\"DwAAABYAAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL35\"",
+      "id": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL735AAA=",
+      "createdDateTime": "2026-02-01T10:15:30.1234567Z",
+      "lastModifiedDateTime": "2026-02-10T08:00:00.7654321Z",
+      "changeKey": "D/OPX+0PLUeUH2NIdmPBNgAAHbi35",
+      "categories": [],
+      "transactionId": null,
+      "originalStartTimeZone": "W. Europe Standard Time",
+      "originalEndTimeZone": "W. Europe Standard Time",
+      "iCalUId": "040000008200E00074C5B7101A82E008000000007003A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "uid": "040000008200E00074C5B7101A82E008000000007035A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "reminderMinutesBeforeStart": 15,
+      "isReminderOn": false,
+      "hasAttachments": false,
+      "subject": "Team sync",
+      "bodyPreview": "",
+      "importance": "normal",
+      "sensitivity": "normal",
+      "isAllDay": false,
+      "isCancelled": false,
+      "isOrganizer": true,
+      "responseRequested": true,
+      "seriesMasterId": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL703AAA=",
+      "showAs": "busy",
+      "type": "occurrence",
+      "webLink": "https://outlook.office365.com/owa/?itemid=AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL735AAA=&exvsurl=1&path=/calendar/item",
+      "onlineMeetingUrl": null,
+      "isOnlineMeeting": false,
+      "onlineMeetingProvider": "unknown",
+      "allowNewTimeProposals": true,
+      "isDraft": false,
+      "hideAttendees": false,
+      "responseStatus": {
+        "response": "organizer",
+        "time": "0001-01-01T00:00:00Z"
+      },
+      "body": {
+        "contentType": "text",
+        "content": ""
+      },
+      "start": {
+        "dateTime": "2026-04-20T07:00:00.0000000",
+        "timeZone": "UTC"
+      },
+      "end": {
+        "dateTime": "2026-04-20T07:30:00.0000000",
+        "timeZone": "UTC"
+      },
+      "location": {
+        "displayName": "",
+        "locationType": "default",
+        "uniqueIdType": "unknown",
+        "address": {},
+        "coordinates": {}
+      },
+      "locations": [],
+      "recurrence": null,
+      "attendees": [
+        {
+          "type": "required",
+          "status": {
+            "response": "accepted",
+            "time": "2026-02-02T09:00:00Z"
+          },
+          "emailAddress": {
+            "name": "Anna Berg",
+            "address": "anna@example.com"
+          }
+        }
+      ],
+      "organizer": {
+        "emailAddress": {
+          "name": "Peter Example",
+          "address": "peter@example.com"
+        }
+      },
+      "onlineMeeting": null,
+      "originalStart": "2026-04-20T07:00:00Z"
+    },
+    {
+      "@odata.etag": "W/\"DwAAABYAAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL36\"",
+      "id": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL736AAA=",
+      "createdDateTime": "2026-02-01T10:15:30.1234567Z",
+      "lastModifiedDateTime": "2026-02-10T08:00:00.7654321Z",
+      "changeKey": "D/OPX+0PLUeUH2NIdmPBNgAAHbi36",
+      "categories": [],
+      "transactionId": null,
+      "originalStartTimeZone": "W. Europe Standard Time",
+      "originalEndTimeZone": "W. Europe Standard Time",
+      "iCalUId": "040000008200E00074C5B7101A82E008000000007003A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "uid": "040000008200E00074C5B7101A82E008000000007036A1B2C3D4E5F6010000000000000000100000009F3C0E7B8A5D2B4C8E1F6A2B3C4D5E6F",
+      "reminderMinutesBeforeStart": 15,
+      "isReminderOn": false,
+      "hasAttachments": false,
+      "subject": "Team sync",
+      "bodyPreview": "",
+      "importance": "normal",
+      "sensitivity": "normal",
+      "isAllDay": false,
+      "isCancelled": false,
+      "isOrganizer": true,
+      "responseRequested": true,
+      "seriesMasterId": "AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL703AAA=",
+      "showAs": "busy",
+      "type": "occurrence",
+      "webLink": "https://outlook.office365.com/owa/?itemid=AAMkAGQ2M2Y3N2E1LTA4MjEtNDQyNC04MjQzLWFmMzJkNDUxN2I2NgBGAAAAAAC3Q2QnQf1wS4IuB84X5k6vBwD7zj9f7Q8tR5QfY0h2Y8E2AAAAAAENAAD7zj9f7Q8tR5QfY0h2Y8E2AAAduL736AAA=&exvsurl=1&path=/calendar/item",
+      "onlineMeetingUrl": null,
+      "isOnlineMeeting": false,
+      "onlineMeetingProvider": "unknown",
+      "allowNewTimeProposals": true,
+      "isDraft": false,
+      "hideAttendees": false,
+      "responseStatus": {
+        "response": "organizer",
+        "time": "0001-01-01T00:00:00Z"
+      },
+      "body": {
+        "contentType": "text",
+        "content": ""
+      },
+      "start": {
+        "dateTime": "2026-04-27T07:00:00.0000000",
+        "timeZone": "UTC"
+      },
+      "end": {
+        "dateTime": "2026-04-27T07:30:00.0000000",
+        "timeZone": "UTC"
+      },
+      "location": {
+        "displayName": "",
+        "locationType": "default",
+        "uniqueIdType": "unknown",
+        "address": {},
+        "coordinates": {}
+      },
+      "locations": [],
+      "recurrence": null,
+      "attendees": [
+        {
+          "type": "required",
+          "status": {
+            "response": "accepted",
+            "time": "2026-02-02T09:00:00Z"
+          },
+          "emailAddress": {
+            "name": "Anna Berg",
+            "address": "anna@example.com"
+          }
+        }
+      ],
+      "organizer": {
+        "emailAddress": {
+          "name": "Peter Example",
+          "address": "peter@example.com"
+        }
+      },
+      "onlineMeeting": null,
+      "originalStart": "2026-04-27T07:00:00Z"
+    }
+  ]
+}
