@@ -2204,9 +2204,13 @@
           attachJob(id, command);
         } catch (err) {
           if (err && err.status === 409) {
-            setMsg($("run-msg"), "A job is already running.", "error");
-            showError("A job is already running.");
+            // the server says why: a job is running, or the saved selection is not the
+            // one this page confirmed (reload the selection and try again)
+            const why = err.message ? err.message : "A job is already running.";
+            setMsg($("run-msg"), why, "error");
+            showError(why);
             loadStatus().catch(reportError);
+            loadSelection().catch(reportError);
           } else {
             setMsg($("run-msg"), err.message, "error");
             reportError(err);

@@ -695,6 +695,9 @@ class WebApp:
             # list), and only on the selection the operator confirmed
             digest = body.get("selection_digest")
             if command != "cleanup" and digest != self._selection_digest():
+                if digest is None:
+                    raise HttpError(409, "this page is older than the server: reload the page "
+                                         "(F5) and start the job again")
                 raise HttpError(409, "the saved selection changed since the page loaded it; "
                                      "reload the selection and start the job again")
             argv += ["--mailboxes", str(self.selection_path), "--mailboxes-only"]
