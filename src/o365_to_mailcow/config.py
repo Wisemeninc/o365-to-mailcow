@@ -62,6 +62,7 @@ class Config:
     calendar_exceptions_from_days: int = 730
     calendar_exceptions_to_days: int = 1095
     contacts_photos: bool = False
+    calendar_attendees: str = "keep"  # "keep" (with SCHEDULE-AGENT=CLIENT) | "strip"
     verify_tls: bool = True  # exists only so tests can point at a local server; default True
     imap_port: int = 993
     log_level: str = "INFO"
@@ -145,9 +146,8 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         if isinstance(entry, str):
             mailboxes.append(MailboxMapping(entry.lower(), entry.lower()))
         elif isinstance(entry, dict) and "source" in entry:
-            mailboxes.append(
-                MailboxMapping(entry["source"].lower(), entry.get("destination", entry["source"]).lower())
-            )
+            dest = entry.get("destination", entry["source"])
+            mailboxes.append(MailboxMapping(entry["source"].lower(), dest.lower()))
         else:
             raise ConfigError(f"invalid run.mailboxes entry: {entry!r}")
     if not mailboxes:
@@ -156,6 +156,8 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
     if missing:
         raise ConfigError("missing required configuration: " + ", ".join(missing))
 
+    if str(run.get("calendar_attendees", "keep")).lower() not in ("keep", "strip"):
+        raise ConfigError("run.calendar_attendees must be 'keep' or 'strip'")
     if "/" in mailcow_host or ":" in mailcow_host:
         raise ConfigError("mailcow.host must be a bare hostname, e.g. mail.example.net")
 
@@ -174,6 +176,7 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         calendar_exceptions_from_days=int(run.get("calendar_exceptions_from_days", 730)),
         calendar_exceptions_to_days=int(run.get("calendar_exceptions_to_days", 1095)),
         contacts_photos=bool(run.get("contacts_photos", False)),
+        calendar_attendees=str(run.get("calendar_attendees", "keep")).lower(),
         verify_tls=bool(run.get("verify_tls", True)),
         imap_port=int(run.get("imap_port", 993)),
         log_level=str(run.get("log_level", "INFO")).upper(),

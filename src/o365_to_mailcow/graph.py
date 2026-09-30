@@ -132,7 +132,8 @@ class GraphClient:
                     )
                 except requests.RequestException as exc:
                     if attempt >= self._max_retries:
-                        raise GraphError(0, f"network error: {exc.__class__.__name__}", path) from exc
+                        name = exc.__class__.__name__
+                        raise GraphError(0, f"network error: {name}", path) from exc
                     self._sleep(self._retry_after_network(attempt))
                     continue
                 if resp.status_code < 400:

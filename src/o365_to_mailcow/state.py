@@ -18,9 +18,13 @@ STATUS_SKIPPED = "skipped"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
-    mailbox TEXT NOT NULL, graph_id TEXT NOT NULL, folder TEXT NOT NULL,
-    message_id TEXT, status TEXT NOT NULL, error TEXT, updated_at REAL NOT NULL,
-    PRIMARY KEY (mailbox, graph_id));
+    mailbox TEXT NOT NULL, folder_id TEXT NOT NULL, graph_id TEXT NOT NULL,
+    folder TEXT NOT NULL, message_id TEXT, status TEXT NOT NULL, error TEXT,
+    dest_uid INTEGER, uidvalidity INTEGER, updated_at REAL NOT NULL,
+    PRIMARY KEY (mailbox, folder_id, graph_id));
+CREATE TABLE IF NOT EXISTS app_passwords (
+    mailbox TEXT NOT NULL, mailcow_id TEXT NOT NULL, created_at REAL NOT NULL,
+    PRIMARY KEY (mailbox, mailcow_id));
 CREATE TABLE IF NOT EXISTS folder_delta (
     mailbox TEXT NOT NULL, folder_id TEXT NOT NULL, delta_link TEXT NOT NULL,
     updated_at REAL NOT NULL, PRIMARY KEY (mailbox, folder_id));
@@ -40,6 +44,8 @@ class State:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        if not self._path.exists():
+            self._path.touch(mode=0o600)
         self._conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
@@ -53,17 +59,52 @@ class State:
 
     # -- messages ----------------------------------------------------------------------
 
-    def message_status(self, mailbox: str, graph_id: str) -> str | None:
+    def message_status(self, mailbox: str, folder_id: str, graph_id: str) -> str | None:
         row = self._exec(
-            "SELECT status FROM messages WHERE mailbox=? AND graph_id=?", (mailbox, graph_id)
+            "SELECT status FROM messages WHERE mailbox=? AND folder_id=? AND graph_id=?",
+            (mailbox, folder_id, graph_id),
         ).fetchone()
         return row[0] if row else None
 
-    def mark_message(self, mailbox: str, graph_id: str, folder: str, message_id: str | None,
-                     status: str, error: str | None = None) -> None:
+    def mark_message(self, mailbox: str, folder_id: str, graph_id: str, folder: str,
+                     message_id: str | None, status: str, error: str | None = None,
+                     dest_uid: int | None = None, uidvalidity: int | None = None) -> None:
         self._exec(
-            "INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?,?)",
-            (mailbox, graph_id, folder, message_id, status, _trim(error), time.time()),
+            "INSERT OR REPLACE INTO messages VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (mailbox, folder_id, graph_id, folder, message_id, status, _trim(error),
+             dest_uid, uidvalidity, time.time()),
+        )
+
+    def folder_uidvalidity(self, mailbox: str, folder_id: str) -> int | None:
+        row = self._exec(
+            "SELECT uidvalidity FROM messages WHERE mailbox=? AND folder_id=? "
+            "AND uidvalidity IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
+            (mailbox, folder_id),
+        ).fetchone()
+        return row[0] if row else None
+
+    def done_message_ids(self, mailbox: str, folder_id: str) -> set[str]:
+        return {
+            r[0] for r in self._exec(
+                "SELECT graph_id FROM messages WHERE mailbox=? AND folder_id=? AND status=?",
+                (mailbox, folder_id, STATUS_DONE),
+            )
+        }
+
+    # -- app passwords -----------------------------------------------------------------
+
+    def record_app_password(self, mailbox: str, mailcow_id: str) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO app_passwords VALUES (?,?,?)",
+            (mailbox, mailcow_id, time.time()),
+        )
+
+    def app_passwords(self) -> list[tuple[str, str]]:
+        return [(r[0], r[1]) for r in self._exec("SELECT mailbox, mailcow_id FROM app_passwords")]
+
+    def forget_app_password(self, mailbox: str, mailcow_id: str) -> None:
+        self._exec(
+            "DELETE FROM app_passwords WHERE mailbox=? AND mailcow_id=?", (mailbox, mailcow_id)
         )
 
     def message_counts(self, mailbox: str) -> dict[str, dict[str, int]]:
@@ -93,7 +134,8 @@ class State:
 
     def event_last_modified(self, mailbox: str, calendar: str, uid: str) -> str | None:
         row = self._exec(
-            "SELECT last_modified FROM events WHERE mailbox=? AND calendar=? AND uid=? AND status=?",
+            "SELECT last_modified FROM events "
+            "WHERE mailbox=? AND calendar=? AND uid=? AND status=?",
             (mailbox, calendar, uid, STATUS_DONE),
         ).fetchone()
         return row[0] if row else None
@@ -108,7 +150,8 @@ class State:
     def event_counts(self, mailbox: str) -> dict[str, dict[str, int]]:
         out: dict[str, dict[str, int]] = {}
         for cal, status, n in self._exec(
-            "SELECT calendar, status, COUNT(*) FROM events WHERE mailbox=? GROUP BY calendar, status",
+            "SELECT calendar, status, COUNT(*) FROM events "
+            "WHERE mailbox=? GROUP BY calendar, status",
             (mailbox,),
         ):
             out.setdefault(cal, {})[status] = n
