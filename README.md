@@ -235,6 +235,31 @@ by hand; they depend on your SOGo and tenant configuration:
 
 Then run `plan` for everyone, `migrate` a few mailboxes, `verify`, and only then the rest.
 
+## First live run (pilot protocol)
+
+The test suite checks this tool against its own model of Graph, mailcow and SOGo, not
+against the real services. Treat the first run as the test that matters:
+
+1. **Back up mailcow** (or snapshot the VM). Use a throwaway destination mailbox.
+2. **Seed one pilot mailbox in Microsoft 365** with awkward content: a large attachment
+   (over 25 MB), a `.msg` attached inside a message, a folder whose name has non-ASCII
+   characters and a `/`, a weekly series with one moved and one cancelled occurrence, an
+   event created in a non-UTC time zone, a private event, a meeting organised by someone
+   else, a contact with a photo, and a few thousand filler messages so paging happens.
+3. **`plan`** and compare folder names and counts with what Outlook shows.
+4. **`migrate`**, kill it part-way (Ctrl-C), run it again: nothing duplicated, nothing
+   missing. Run it a third time: it must make zero writes.
+5. **`verify`** (with `--sample 20`), then look by eye: dates and flags in a mail client,
+   the series and time zones in SOGo and on a phone over CalDAV, the contact on the phone.
+6. **`cleanup`**, then confirm in the mailcow UI that no `o365-migration-*` app password
+   remains, and check `docker compose logs netfilter-mailcow` for the container's IP.
+7. Only then one real, low-stakes mailbox; only then batches.
+
+**fail2ban:** mailcow's netfilter bans an IP after repeated failed logins. The tool never
+retries a refused login, but a wrong API key or a mailbox with the protocols disabled can
+still produce a few failures per run. If the container's address gets banned, unban it in
+**System > Configuration > Options > Fail2ban parameters** or whitelist it there first.
+
 ## State, security and operations
 
 - `state/state.db` (mode 0600) is the idempotency ledger: identifiers, statuses, error
