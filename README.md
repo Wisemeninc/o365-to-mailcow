@@ -138,7 +138,9 @@ those. It is a separate command, never part of `migrate`, and it is the only com
 may call mailcow's `get/domain` and `add/mailbox` endpoints. Rules:
 
 - The mailbox's **domain must already exist in mailcow** (adding a domain is a DNS
-  decision; the tool refuses and tells you).
+  decision; the tool refuses and tells you). After adding a domain, use the UI's
+  **"Add domain and restart SOGo"** or **E-Mail → Restart SOGo**: until SOGo restarts it
+  cannot serve calendars and contacts for the new domain (DAV answers 403).
 - Display name and quota come from the mailbox list: CSV rows are
   `source,destination,name,quota_mib,aliases`, TOML entries accept `name`, `quota_mib` and
   `aliases = [...]`; the defaults are the local part of the address and
@@ -357,6 +359,8 @@ still produce a few failures per run. If the container's address gets banned, un
 | Symptom | Cause and fix |
 |---|---|
 | "Test connections": `microsoft ✓` but `graph_users ✗ … HTTP 403 … Authorization_RequestDenied` | The app registration lacks the mailbox-listing permission. Entra admin center → your app → **API permissions** → **Add a permission** → **Microsoft Graph** → **Application permissions** → `User.Read.All` → Add → **Grant admin consent for \<tenant\>**. Wait a minute or two, test again. Only the web page's listing needs it; the migration does not. |
+| `migrate` writes all the mail but calendars and contacts fail with `SOGo calendar home check failed: DAV HTTP 403` | The destination domain was added to mailcow after SOGo last started, so SOGo has no user source for it yet. mailcow UI → **E-Mail → Restart SOGo** (or `docker compose restart sogo-mailcow` on the mailcow host), then run `migrate` again: mail is skipped as done, calendars and contacts are written. |
+| A second `migrate` shows `0 appended, 0 already done` for a mailbox with hundreds of messages | Normal: after the first pass a folder is checked through a Graph delta link and only *changes* are listed; the summary now says how many folders were checked that way. A dry run shows the `already done` total. |
 | "Test connections": `microsoft ✗ … AADSTS7000215` (invalid client secret) | The secret *Value* was not copied, or the secret expired. Create a new one under **Certificates & secrets** and enter it in the Connections panel together with the tenant and client ids. |
 | "Test connections": `microsoft ✗ … AADSTS700016` (application not found) | Wrong tenant id or client id: both come from the app's **Overview** page. |
 | "Test connections": `mailcow ✗ … HTTP 401` | API key wrong, API not activated, or this host's IP is not in mailcow's allowed API networks (System → Configuration → Access → API). Enter the key together with the host. |

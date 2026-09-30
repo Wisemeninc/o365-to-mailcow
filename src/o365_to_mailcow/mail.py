@@ -121,6 +121,7 @@ class FolderResult:
     would_append: int = 0
     uidvalidity_changed: bool = False
     delta_reset: bool = False
+    delta_pass: bool = False  # listed through a stored delta link (changes only)
     error: str | None = None
 
 
@@ -618,6 +619,11 @@ class MailMigrator:
             fr.error = str(exc)
             self._stop(result, fp, exc)
             return
+        if stored_link and not fr.delta_reset:
+            # a delta pass only touches what changed; the plan total would otherwise make
+            # a quiet second run look like "0 of N"
+            self._progress.adjust_total(self._key, len(messages) - fp.total)
+            fr.delta_pass = True
         todo.sort(key=internal_date)  # oldest first, so destination UIDs follow date order
         self._append_all(dest, fp, fr, result, pool, todo, uidvalidity)
 
@@ -793,9 +799,21 @@ class MailMigrator:
                     imap_count, _ = dest.folder_status(fp.dest_name)
                 except ImapError as exc:
                     imap_count, note = 0, f"STATUS failed: {exc}"
-                expected = fp.total - skipped - failed
+                # Graph's totalItemCount also counts items /messages never returns (non-mail
+                # item classes); the comparison uses what a listing actually yields
+                try:
+                    graph_total = sum(1 for _ in self._graph.iter_pages(
+                        self._user_path(f"mailFolders/{fp.folder_id}/messages"),
+                        params={"$select": "id", "$top": PAGE_SIZE}, headers=PREFER_IMMUTABLE))
+                except GraphError as exc:
+                    graph_total = fp.total
+                    note = (note + "; " if note else "") + f"Graph listing failed: {exc}"
+                if graph_total != fp.total:
+                    extra = f"folder reports {fp.total} items, {graph_total} are messages"
+                    note = (note + "; " if note else "") + extra
+                expected = graph_total - skipped - failed
                 out.folders.append(FolderVerify(
-                    dest_name=fp.dest_name, graph_total=fp.total, done=done, failed=failed,
+                    dest_name=fp.dest_name, graph_total=graph_total, done=done, failed=failed,
                     skipped=skipped, imap_count=imap_count, expected=expected,
                     mismatch=imap_count != expected, note=note,
                 ))

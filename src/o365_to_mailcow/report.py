@@ -120,6 +120,9 @@ class NullProgress:
     def start(self, key: str, total: int) -> None:
         """Register ``total`` more items for ``key``."""
 
+    def adjust_total(self, key: str, delta: int) -> None:
+        """Correct the total once the real amount of work is known."""
+
     def advance(self, key: str, n: int = 1) -> None:
         """Record ``n`` processed items."""
 
@@ -144,6 +147,12 @@ class Progress(NullProgress):
             scope = self._scopes.setdefault(
                 key, {"done": 0, "total": 0, "started": self._clock(), "finished": 0})
             scope["total"] += total
+
+    def adjust_total(self, key: str, delta: int) -> None:
+        with self._lock:
+            scope = self._scopes.get(key)
+            if scope is not None:
+                scope["total"] = max(0, scope["total"] + delta)
 
     def advance(self, key: str, n: int = 1) -> None:
         with self._lock:

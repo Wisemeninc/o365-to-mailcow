@@ -431,11 +431,19 @@ def _run_migrators(r: Runner, m: MailboxMapping, password: str | None) -> None:
         failed += res.failed + len(res.errors)
         verb = "would append" if dry else "appended"
         n = res.total("would_append") if dry else res.total("appended")
+        delta_folders = sum(1 for f in res.folders if f.delta_pass)
         summary.append(
             f"mail: {verb} {n}, already done {res.total('already_done')}, "
             f"found by Message-ID {res.total('dedup_hits')}, failed {res.total('failed')}, "
             f"skipped too large {res.total('skipped_too_large')}, "
-            f"removed at source (not applied) {res.total('removed_in_source')}")
+            f"removed at source (not applied) {res.total('removed_in_source')}"
+            + (f"; {delta_folders} folder(s) checked for changes since the last run only"
+               if delta_folders else ""))
+        for e in res.errors:
+            summary.append(f"  error: {clean(e)}")
+        for f in res.folders:
+            if f.error:
+                summary.append(f"  error: {clean(f.dest_name)}: {clean(f.error)}")
     dav = r.dav(m, password) if password else None
     for kind, cls in (("calendar", CalendarMigrator), ("contacts", ContactsMigrator)):
         if kind not in r.opts.kinds:
