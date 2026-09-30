@@ -262,7 +262,7 @@ def test_non_boolean_and_out_of_range_values_rejected(tmp_path):
     with pytest.raises(ConfigError, match="true or false"):
         config.load_config(bad_bool, env=ENV)
     too_many = _write(tmp_path, 'mailboxes = ["a@example.net"]\nparallel_mailboxes = 50\n')
-    with pytest.raises(ConfigError, match="between 1 and 4"):
+    with pytest.raises(ConfigError, match="between 1 and 8"):
         config.load_config(too_many, env=ENV)
 
 

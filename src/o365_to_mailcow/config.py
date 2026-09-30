@@ -15,6 +15,7 @@ import socket
 import stat
 import tomllib
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -76,6 +77,20 @@ def _bool(section: dict, key: str, default: bool) -> bool:
     return value
 
 
+def _date(section: dict, key: str) -> date | None:
+    value = section.get(key)
+    if value is None or value == "":
+        return None
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            pass
+    raise ConfigError(f"run.{key} must be a date like 2020-01-01, got {value!r}")
+
+
 def _int(section: dict, key: str, default: int, lo: int, hi: int) -> int:
     value = section.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
@@ -113,6 +128,8 @@ class Config:
     contacts_photos: bool = False
     calendar_attendees: str = "keep"  # "keep" (with SCHEDULE-AGENT=CLIENT) | "strip"
     imap_port: int = 993
+    mail_since: date | None = None      # copy only mail received on/after this date
+    prefetch_budget_mib: int = 128      # per-mailbox memory budget for downloads in flight
     provision_quota_mib: int = 3072  # default quota for mailboxes created by `provision`
     provision_tls_enforce: bool = False  # mailcow tls_enforce_in/out on created mailboxes
     log_level: str = "INFO"
@@ -335,7 +352,9 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         mailcow_ca_file=ca_file,
         state_dir=state_dir,
         mailboxes=tuple(mailboxes),
-        parallel_mailboxes=_int(run, "parallel_mailboxes", 2, 1, 4),
+        parallel_mailboxes=_int(run, "parallel_mailboxes", 2, 1, 8),
+        mail_since=_date(run, "mail_since"),
+        prefetch_budget_mib=_int(run, "prefetch_budget_mib", 128, 8, 2048),
         max_message_bytes=_int(run, "max_message_bytes", 150 * 1024 * 1024,
                                1024, 1024 * 1024 * 1024),
         calendar_exceptions_from_days=_int(run, "calendar_exceptions_from_days", 730, 0, 36500),

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import fcntl
 import logging
 import os
@@ -18,6 +19,7 @@ import threading
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import date
 from importlib import resources
 from pathlib import Path
 from typing import Any, TextIO
@@ -63,6 +65,13 @@ def _port(text: str) -> int:
     return int(text)
 
 
+def _iso_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"not a date (YYYY-MM-DD): {value!r}") from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     s = argparse.SUPPRESS  # so options work before and after the command
@@ -72,6 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="CSV of source[,destination] addresses (adds to config)")
     common.add_argument("--mailboxes-only", action="store_true", default=s,
                         help="use only the --mailboxes CSV, ignoring run.mailboxes in the config")
+    common.add_argument("--mail-since", metavar="YYYY-MM-DD", type=_iso_date, default=s,
+                        help="copy only mail received on or after this date (overrides "
+                             "run.mail_since; calendars and contacts are unaffected)")
     common.add_argument("--only", choices=KINDS, default=s,
                         help="restrict to one kind of data")
     common.add_argument("--mailbox", metavar="ADDRESS", default=s,
@@ -119,6 +131,7 @@ class Options:
     keep_app_passwords: bool
     verbose: int
     sample: int
+    mail_since: date | None = None
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> Options:
@@ -126,6 +139,7 @@ class Options:
             command=ns.command, config=getattr(ns, "config", None),
             mailboxes_csv=getattr(ns, "mailboxes", None), only=getattr(ns, "only", None),
             mailboxes_only=getattr(ns, "mailboxes_only", False),
+            mail_since=getattr(ns, "mail_since", None),
             mailbox=getattr(ns, "mailbox", None), dry_run=getattr(ns, "dry_run", False),
             keep_app_passwords=getattr(ns, "keep_app_passwords", False),
             verbose=getattr(ns, "verbose", 0) or 0, sample=getattr(ns, "sample", 0) or 0,
@@ -767,6 +781,8 @@ def main(argv: Iterable[str] | None = None, *, stdout: TextIO | None = None,
         cfg = load_config(opts.config, opts.mailboxes_csv, mailboxes_only=opts.mailboxes_only,
                           require_mailboxes=opts.command != "web",
                           require_credentials=opts.command != "web")
+        if opts.mail_since is not None:
+            cfg = dataclasses.replace(cfg, mail_since=opts.mail_since)
         mailboxes = select_mailboxes(cfg, opts.mailbox)
         cfg.state_dir.mkdir(parents=True, exist_ok=True)
     except (ConfigError, OSError) as exc:

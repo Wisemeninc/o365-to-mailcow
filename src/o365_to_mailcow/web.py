@@ -89,7 +89,9 @@ MAX_PARTIAL_CHARS = 65_536
 TAIL_LINES = 200
 MAX_JOBS_KEPT = 20
 JOB_COMMANDS = ("plan", "provision", "migrate", "verify", "cleanup")
-JOB_OPTIONS = frozenset({"command", "dry_run", "only", "mailbox", "sample", "selection_digest"})
+JOB_OPTIONS = frozenset({"command", "dry_run", "only", "mailbox", "sample", "selection_digest",
+                         "mail_since"})
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ALLOWED_METHODS = "GET, POST, PUT"
 NONCE_PLACEHOLDER = "__CSP_NONCE__"
 SELECTION_FILE = "mailboxes.csv"
@@ -716,6 +718,16 @@ class WebApp:
             raise HttpError(400, f"only must be null or one of {', '.join(cli.KINDS)}")
         mailbox = body.get("mailbox")
         mailbox = normalise_address(mailbox, "mailbox") if mailbox not in (None, "") else None
+        mail_since = body.get("mail_since")
+        if mail_since not in (None, ""):
+            if not isinstance(mail_since, str) or not _ISO_DATE.match(mail_since):
+                raise HttpError(400, "mail_since must be a date like 2020-01-01")
+            try:
+                datetime.strptime(mail_since, "%Y-%m-%d")  # noqa: DTZ007 - date only
+            except ValueError as exc:
+                raise HttpError(400, "mail_since is not a real date") from exc
+        else:
+            mail_since = None
         sample = body.get("sample", 0)
         sample = 0 if sample is None else sample
         if isinstance(sample, bool) or not isinstance(sample, int) or not 0 <= sample <= MAX_SAMPLE:
@@ -755,6 +767,8 @@ class WebApp:
             argv.append(f"--mailbox={mailbox}")  # '=' form: never parsed as an option
         if command == "verify" and sample:
             argv += ["--sample", str(sample)]
+        if mail_since and command in ("plan", "migrate", "verify"):
+            argv += ["--mail-since", mail_since]
         return command, argv
 
     def _running(self) -> Job | None:  # caller holds the lock

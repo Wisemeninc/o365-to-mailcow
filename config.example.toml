@@ -39,8 +39,15 @@ mailboxes = [
 # with # are ignored), added to the list above; name, quota and the semicolon-separated
 # aliases are used by `provision` only. The --mailboxes option does the same from the command line.
 # mailboxes_csv = "/config/mailboxes.csv"
-# How many mailboxes are migrated at the same time (each gets its own 4-request Graph cap).
+# How many mailboxes are migrated at the same time (1-8; each gets its own 4-request Graph cap).
+# Memory per mailbox is about prefetch_budget_mib + the largest message; the compose file caps
+# the container at 4 GiB, which fits 8 mailboxes at the defaults.
 parallel_mailboxes = 2
+# Memory budget (MiB) for downloads queued per mailbox (8-2048).
+prefetch_budget_mib = 128
+# Copy only mail received on or after this date (calendars and contacts are unaffected).
+# Also available per run as --mail-since or the "Mail since" field on the web page.
+# mail_since = "2020-01-01"
 # Messages larger than this many bytes are skipped and reported (default 150 MiB).
 max_message_bytes = 157286400
 # Recurring-event exceptions are read from this many days in the past ...

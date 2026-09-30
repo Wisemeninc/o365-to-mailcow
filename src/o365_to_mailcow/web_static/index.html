@@ -530,6 +530,8 @@
 
         <label for="opt-sample">Verify sample</label>
         <input id="opt-sample" type="number" min="0" max="1000" step="1" value="0">
+        <label for="opt-since">Mail since</label>
+        <input id="opt-since" type="date" title="copy only mail received on or after this date (calendars and contacts are not affected); leave empty for everything">
       </div>
 
       <p id="run-hint" class="warn-text" hidden>Save the selection first.</p>
@@ -2192,7 +2194,8 @@
               : n === 1
                 ? "the 1 saved mailbox"
                 : "the " + String(n) + " saved mailboxes";
-          const scope = only ? " (only " + only + ")" : "";
+          const since = $("opt-since").value;
+          const scope = (only ? " (only " + only + ")" : "") + (since ? " (mail since " + since + ")" : "");
           let text = "";
           if (command === "provision") {
             text = "Provision " + what + " in mailcow for real? This creates mailboxes.";
@@ -2221,6 +2224,7 @@
               mailbox,
               sample,
               selection_digest: state.selectionDigest,
+              mail_since: $("opt-since").value || null,
             },
           });
           if (!isObject(r) || !(isStr(r.id) || isNum(r.id))) {

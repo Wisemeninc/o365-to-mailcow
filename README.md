@@ -187,9 +187,17 @@ docker compose up -d web                    # the web UI (see below) does all of
 | `cleanup` | Deletes every app password named `o365-migration-*` for the configured mailboxes plus any recorded in state | app password delete |
 | `web` | Serves the local web UI: connections, tenant list, selection, and all of the commands above with live output | what the started commands write |
 
-Mailboxes are migrated `parallel_mailboxes` at a time (default 2, at most 4; each holds up to
-about 5 × `max_message_bytes` in memory, and the compose file caps the container at 3 GiB).
-Inside a mailbox, up to four Graph downloads run at once and one IMAP connection appends.
+Mailboxes are migrated `parallel_mailboxes` at a time (default 2, at most 8). Inside a
+mailbox, up to four Graph downloads run at once (Microsoft's per-mailbox limit; this sets the
+rate at roughly 150–250 messages a minute per mailbox) and one IMAP connection appends.
+Memory per mailbox is bounded by `prefetch_budget_mib` (default 128) plus one message, and the
+compose file caps the container at 4 GiB, which fits 8 mailboxes at the defaults.
+
+**Date cutoff.** `mail_since = "2020-01-01"` in the config, `--mail-since 2020-01-01` on the
+command line, or the "Mail since" field on the web page copies only mail received on or after
+that date (calendars and contacts are unaffected). It is applied in the Graph listing, in
+later delta passes and in `verify`, so counts stay comparable. Changing the date later makes
+the next run list every folder again under the new date; mail already copied stays.
 
 Options (before or after the command):
 
@@ -203,6 +211,9 @@ Options (before or after the command):
   them with the destination copy. Exchange re-renders the MIME of some items (mail it
   stores natively, not as received bytes); those show up as "re-rendered", not as
   mismatches, when Message-ID, Date, From, Subject and size class agree
+- `--mail-since YYYY-MM-DD` copy only mail received on or after this date (`plan`,
+  `migrate`, `verify`)
+- `--mailboxes-only` use only the `--mailboxes` CSV, ignoring `run.mailboxes` in the config
 - `-v` debug logging
 
 Exit codes: **0** everything succeeded, **1** something failed (or, for `verify`, anything

@@ -52,7 +52,8 @@ FOLDER_SIZE_PROPERTY = "Long 0x0E08"
 FOLDER_EXPAND = f"singleValueExtendedProperties($filter=id eq '{FOLDER_SIZE_PROPERTY}')"
 PAGE_SIZE = 100
 DOWNLOAD_WORKERS = 4
-PREFETCH_WINDOW = 4  # bounded by count; each item is at most max_message_bytes
+PREFETCH_WINDOW = 4  # at most this many downloads queued; also bounded by a byte budget
+MIME_OVERHEAD = 1.4  # MAPI size -> rough MIME size (base64 attachments)
 MAX_KEYWORDS = 20
 MAX_KEYWORD_LEN = 50  # Dovecot's default mail_max_keyword_length
 
@@ -117,6 +118,7 @@ class FolderResult:
     skipped_too_large: int = 0
     removed_in_source: int = 0
     vanished_in_source: int = 0
+    before_cutoff: int = 0  # older than mail_since (delta passes count these; listings filter)
     reappended_after_uidvalidity: int = 0
     would_append: int = 0
     uidvalidity_changed: bool = False
@@ -443,10 +445,30 @@ class MailMigrator:
 
     # -- listing -----------------------------------------------------------------------
 
+    def _cutoff_filter(self) -> dict[str, str]:
+        """Graph ``$filter`` for ``mail_since`` (server-side), or nothing."""
+        since = self._cfg.mail_since
+        if since is None:
+            return {}
+        return {"$filter": f"receivedDateTime ge {since.isoformat()}T00:00:00Z"}
+
+    def _before_cutoff(self, msg: dict) -> bool:
+        since = self._cfg.mail_since
+        if since is None:
+            return False
+        raw = msg.get("receivedDateTime")
+        if not raw:
+            return False  # undated (drafts): keep
+        try:
+            return dtparser.isoparse(raw).date() < since
+        except (ValueError, OverflowError):
+            return False
+
     def _list_messages(self, folder_id: str) -> Iterator[dict]:
         return self._graph.iter_pages(
             self._user_path(f"mailFolders/{folder_id}/messages"),
-            params={"$select": MESSAGE_SELECT, "$top": PAGE_SIZE, "$expand": MESSAGE_EXPAND},
+            params={"$select": MESSAGE_SELECT, "$top": PAGE_SIZE, "$expand": MESSAGE_EXPAND,
+                    **self._cutoff_filter()},
             headers=PREFER_IMMUTABLE,
         )
 
@@ -478,14 +500,19 @@ class MailMigrator:
                 fr.already_done += 1
                 continue
             try:
-                out.append(self._graph.get(
+                msg = self._graph.get(
                     self._user_path(f"messages/{item['id']}"),
                     params={"$select": MESSAGE_SELECT, "$expand": MESSAGE_EXPAND},
-                    headers=PREFER_IMMUTABLE))
+                    headers=PREFER_IMMUTABLE)
             except GraphError as exc:
                 if exc.status != 404:
                     raise
                 fr.vanished_in_source += 1  # listed by delta, gone before we fetched it
+                continue
+            if self._before_cutoff(msg):  # delta has no $filter: apply mail_since here
+                fr.before_cutoff += 1
+                continue
+            out.append(msg)
         return out, new_link
 
     def _download(self, graph_id: str) -> bytes:
@@ -544,6 +571,7 @@ class MailMigrator:
             result.skipped_folders = [f"{f.source_path} ({f.skip_reason})"
                                       for f in plan.folders if f.skip]
             self._progress.start(self._key, plan.total_messages)
+            self._apply_cutoff_change()
             with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS,
                                     thread_name_prefix="dl") as pool:
                 for fp in plan.folders:
@@ -556,6 +584,17 @@ class MailMigrator:
                         break
         finally:
             dest.close()
+
+    def _apply_cutoff_change(self) -> None:
+        """A different ``mail_since`` than last time means the delta links no longer describe
+        what was copied; drop them so every folder is listed again under the new date."""
+        current = self._cfg.mail_since.isoformat() if self._cfg.mail_since else ""
+        stored = self._state.get_kv(self._src, "mail_since")
+        if stored is not None and stored != current:
+            n = self._state.clear_all_deltas(self._src)
+            log.info("%s: mail_since changed (%r -> %r); %d folder(s) will be listed fully",
+                     self._src, stored, current, n)
+        self._state.set_kv(self._src, "mail_since", current)
 
     def _stop(self, result: MailResult, fp: FolderPlan, exc: Exception) -> None:
         result.stopped = True
@@ -619,11 +658,11 @@ class MailMigrator:
             fr.error = str(exc)
             self._stop(result, fp, exc)
             return
-        if stored_link and not fr.delta_reset:
-            # a delta pass only touches what changed; the plan total would otherwise make
-            # a quiet second run look like "0 of N"
+        if (stored_link and not fr.delta_reset) or self._cfg.mail_since is not None:
+            # a delta pass only touches what changed, and a cutoff lists only newer mail; the
+            # plan total (all items) would otherwise make the run look like "0 of N"
             self._progress.adjust_total(self._key, len(messages) - fp.total)
-            fr.delta_pass = True
+            fr.delta_pass = bool(stored_link and not fr.delta_reset)
         todo.sort(key=internal_date)  # oldest first, so destination UIDs follow date order
         self._append_all(dest, fp, fr, result, pool, todo, uidvalidity)
 
@@ -720,18 +759,33 @@ class MailMigrator:
                     uidvalidity: int) -> None:
         src, fid, name = self._src, fp.folder_id, fp.dest_name
         queue = iter(todo)
-        pending: deque[tuple[dict, Future[bytes]]] = deque()
+        pending: deque[tuple[dict, Future[bytes], int]] = deque()
+        budget = self._cfg.prefetch_budget_mib * 1024 * 1024
+        queued_bytes = 0
+        held: list[dict | None] = [None]  # a message whose estimated size exceeds the budget
+
+        def estimate(m: dict) -> int:
+            size = message_size(m)
+            return int(size * MIME_OVERHEAD) if size else 256 * 1024
 
         def refill() -> None:
+            nonlocal queued_bytes
             while len(pending) < PREFETCH_WINDOW:
-                nxt = next(queue, None)
+                nxt = held[0] or next(queue, None)
+                held[0] = None
                 if nxt is None:
                     return
-                pending.append((nxt, pool.submit(self._download, nxt["id"])))
+                est = estimate(nxt)
+                if pending and queued_bytes + est > budget:
+                    held[0] = nxt  # wait until the queue drains; never exceed the budget
+                    return
+                queued_bytes += est
+                pending.append((nxt, pool.submit(self._download, nxt["id"]), est))
 
         refill()
         while pending:
-            msg, fut = pending.popleft()
+            msg, fut, est = pending.popleft()
+            queued_bytes -= est
             refill()
             gid, mid = msg["id"], valid_message_id(msg.get("internetMessageId"))
             try:
@@ -758,7 +812,7 @@ class MailMigrator:
                 if not is_quota_error(exc):  # one refused message must not halt a mailbox
                     self._progress.advance(self._key)
                     continue
-                for _, other in pending:  # ISC-99: out of space, stop this mailbox
+                for _, other, _e in pending:  # ISC-99: out of space, stop this mailbox
                     other.cancel()
                 self._stop(result, fp, exc)
                 return
@@ -766,7 +820,7 @@ class MailMigrator:
                 self._state.mark_message(src, fid, gid, name, mid, STATUS_FAILED,
                                          error=str(exc))
                 fr.failed += 1
-                for _, other in pending:
+                for _, other, _e in pending:
                     other.cancel()
                 self._stop(result, fp, exc)
                 return
@@ -804,12 +858,15 @@ class MailMigrator:
                 try:
                     graph_total = sum(1 for _ in self._graph.iter_pages(
                         self._user_path(f"mailFolders/{fp.folder_id}/messages"),
-                        params={"$select": "id", "$top": 999}, headers=PREFER_IMMUTABLE))
+                        params={"$select": "id", "$top": 999, **self._cutoff_filter()},
+                        headers=PREFER_IMMUTABLE))
                 except GraphError as exc:
                     graph_total = fp.total
                     note = (note + "; " if note else "") + f"Graph listing failed: {exc}"
                 if graph_total != fp.total:
-                    extra = f"folder reports {fp.total} items, {graph_total} are messages"
+                    extra = (f"folder reports {fp.total} items, {graph_total} are messages"
+                             + (f" since {self._cfg.mail_since}" if self._cfg.mail_since
+                                else ""))
                     note = (note + "; " if note else "") + extra
                 expected = graph_total - skipped - failed
                 out.folders.append(FolderVerify(

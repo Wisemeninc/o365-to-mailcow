@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS folder_delta (
 CREATE TABLE IF NOT EXISTS folder_meta (
     mailbox TEXT NOT NULL, folder_id TEXT NOT NULL, dest_name TEXT NOT NULL,
     uidvalidity INTEGER, updated_at REAL NOT NULL, PRIMARY KEY (mailbox, folder_id));
+CREATE TABLE IF NOT EXISTS kv (
+    mailbox TEXT NOT NULL, key TEXT NOT NULL, value TEXT, PRIMARY KEY (mailbox, key));
 CREATE TABLE IF NOT EXISTS collections (
     mailbox TEXT NOT NULL, kind TEXT NOT NULL, source_id TEXT NOT NULL, slug TEXT NOT NULL,
     updated_at REAL NOT NULL, PRIMARY KEY (mailbox, kind, source_id));
@@ -183,6 +185,20 @@ class State:
             "INSERT OR REPLACE INTO folder_delta VALUES (?,?,?,?)",
             (mailbox, folder_id, delta_link, time.time()),
         )
+
+    def clear_all_deltas(self, mailbox: str) -> int:
+        """Forget every delta link of a mailbox (the next pass lists all folders fully)."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM folder_delta WHERE mailbox=?", (mailbox,))
+            return cur.rowcount
+
+    def get_kv(self, mailbox: str, key: str) -> str | None:
+        row = self._exec("SELECT value FROM kv WHERE mailbox=? AND key=?",
+                         (mailbox, key)).fetchone()
+        return row[0] if row else None
+
+    def set_kv(self, mailbox: str, key: str, value: str | None) -> None:
+        self._exec("INSERT OR REPLACE INTO kv VALUES (?,?,?)", (mailbox, key, value))
 
     def clear_delta(self, mailbox: str, folder_id: str) -> None:
         """Forget an expired delta link so the next pass lists the folder fully."""

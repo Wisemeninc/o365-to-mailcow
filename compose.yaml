@@ -19,8 +19,8 @@ x-o365mig: &o365mig
     - ./state:/state
     - ./config:/config:ro
   read_only: true
-  # bounded memory: at most 4 in-flight messages per mailbox x parallel mailboxes
-  mem_limit: 3g
+  # bounded memory: per mailbox about prefetch_budget_mib + max_message_bytes, x parallel_mailboxes
+  mem_limit: 4g
   pids_limit: 256
   tmpfs:
     - /tmp

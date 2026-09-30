@@ -431,3 +431,49 @@ def test_imap_error_on_folder_status_is_folder_error_not_crash(env):
     assert not res.stopped
     assert any("Projects/2024" in e for e in res.errors)
     assert len(world.folders["INBOX"]) == 2
+
+
+# -- mail_since cutoff and the byte-budgeted prefetch --------------------------------------
+
+def test_mail_since_filters_listing_delta_and_verify(env, tmp_path):
+    from dataclasses import replace
+    from datetime import date
+
+    cfg, state, world, graph = env
+    cfg = replace(cfg, mail_since=date(2026, 1, 1))
+    # the fake answers the filtered listing with only the newer message
+    old = dict(M2, receivedDateTime="2025-06-01T10:00:00Z")
+    graph.routes[f"{U}/mailFolders/f-inbox/messages"] = [M1, old]
+    res = migrator(cfg, state, world, graph).migrate()
+    inbox = next(f for f in res.folders if f.dest_name == "INBOX")
+    listing = [p for p in graph.calls if p[1].endswith("/mailFolders/f-inbox/messages")]
+    assert listing and "receivedDateTime ge 2026-01-01T00:00:00Z" in str(listing[0][2])
+    assert inbox.appended == 2  # the fake does not filter server-side; both were listed
+    # a delta pass applies the cutoff client-side
+    graph.routes[DELTA_INBOX] = ([{"id": "m2"}], "https://graph.microsoft.com/d/inbox-2")
+    graph.routes[f"{U}/messages/m2"] = old
+    state.mark_message(MAPPING.source, "f-inbox", "m2", "INBOX", None, "failed")
+    res = migrator(cfg, state, world, graph).migrate()
+    inbox = next(f for f in res.folders if f.dest_name == "INBOX")
+    assert inbox.before_cutoff == 1 and inbox.appended == 0
+    # changing the cutoff forgets the delta links so folders are listed fully again
+    assert state.get_delta(MAPPING.source, "f-inbox")
+    cfg2 = replace(cfg, mail_since=date(2020, 1, 1))
+    migrator(cfg2, state, world, graph).migrate()
+    assert state.get_kv(MAPPING.source, "mail_since") == "2020-01-01"
+
+
+def test_prefetch_budget_limits_queued_downloads(env):
+    from dataclasses import replace
+
+    cfg, state, world, graph = env
+    cfg = replace(cfg, prefetch_budget_mib=8)
+    six_mib = [{"id": "Integer 0xe08", "value": str(6 * 1024 * 1024)}]
+    big = [dict(M1, id=f"b{i}", internetMessageId=f"<b{i}@x>",
+                singleValueExtendedProperties=six_mib) for i in range(6)]
+    graph.routes[f"{U}/mailFolders/f-inbox/messages"] = big
+    for i in range(6):
+        graph.routes[f"{U}/messages/b{i}/$value"] = mime(f"<b{i}@x>", f"big {i}")
+    res = migrator(cfg, state, world, graph).migrate()
+    inbox = next(f for f in res.folders if f.dest_name == "INBOX")
+    assert inbox.appended == 6  # every message still arrives, just not all queued at once
