@@ -22,8 +22,8 @@ log = logging.getLogger(__name__)
 APP_PASSWORD_NAME = "o365-migration"  # noqa: S105 - a label prefix, not a secret
 PROTOCOLS = ["imap_access", "dav_access"]
 ALLOWED_PREFIXES = ("get/mailbox/", "get/app-passwd/", "add/app-passwd", "delete/app-passwd")
-# only the explicit `provision` command unlocks these (matched exactly in _path_allowed)
-PROVISION_PATHS = ("get/domain/<domain>", "add/mailbox", "add/alias", "get/alias/all")
+# only the explicit `provision` command unlocks add/mailbox, add/alias, get/alias/all and
+# get/domain/<domain>; see _path_allowed (exact matches)
 TIMEOUT = (10.0, 60.0)
 
 

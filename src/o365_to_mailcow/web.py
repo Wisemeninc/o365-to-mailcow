@@ -64,7 +64,7 @@ from urllib.parse import parse_qs
 from . import __version__, cli
 from . import config as config_mod
 from .auth import AuthError, TokenProvider
-from .config import Config, ConfigError, _read_mailboxes_csv
+from .config import Config, ConfigError, _read_mailboxes_csv, valid_address
 from .graph import GraphClient, GraphError
 from .mailcow import MailcowApi, MailcowError
 from .report import clean
@@ -193,7 +193,7 @@ def normalise_address(value: object, what: str) -> str:
     if not isinstance(value, str):
         raise HttpError(400, f"{what} must be a string")
     address = value.strip().lower()
-    if len(address) > 254 or not _ADDRESS.fullmatch(address):
+    if len(address) > 254 or not _ADDRESS.fullmatch(address) or not valid_address(address):
         raise HttpError(400, f"{what} is not a valid e-mail address: {clean(value)[:100]!r}")
     return address
 
@@ -301,16 +301,18 @@ class JobOutput:
                 self._partial = ""
 
     def _store(self, line: str) -> None:  # caller holds the lock
-        self._bytes += len(line)
-        while self._lines and self._bytes > self._max_bytes:
-            self._bytes -= len(self._lines.popleft())
-            self._dropped += 1
         line = self._redact(line.rstrip("\r"))  # redact first: truncation must not split
         if len(line) > MAX_LINE_CHARS:
             line = line[:MAX_LINE_CHARS] + " [line truncated]"
-        if len(self._lines) == self._lines.maxlen:
+        size = len(line.encode("utf-8"))
+        if len(self._lines) == self._lines.maxlen:  # deque would drop the oldest silently
+            self._bytes -= len(self._lines.popleft().encode("utf-8"))
+            self._dropped += 1
+        while self._lines and self._bytes + size > self._max_bytes:
+            self._bytes -= len(self._lines.popleft().encode("utf-8"))
             self._dropped += 1
         self._lines.append(line)
+        self._bytes += size
 
     def tail(self, n: int = TAIL_LINES) -> list[str]:
         with self._lock:
@@ -479,14 +481,22 @@ class WebApp:
             cur_ms, cur_mc = current.get("microsoft", {}), current.get("mailcow", {})
             ids_changed = (tenant_id, client_id) != (cur_ms.get("tenant_id"),
                                                      cur_ms.get("client_id"))
-            if client_secret is None and (ids_changed or not cur_ms.get("client_secret")):
-                if auth_mode == "app":
-                    raise HttpError(400, "enter the client secret together with the tenant "
-                                         "and client ids")
+            host_changed = bool(cur_mc.get("host")) and host != cur_mc.get("host")
+            # A change of the destination host re-pairs the *whole* connection: the
+            # Microsoft side must be proven again too, otherwise a token holder could keep
+            # the operator's Graph credential and point the migration at their own server.
+            if host_changed or ids_changed:
+                if auth_mode == "app" and client_secret is None:
+                    raise HttpError(400, "changing the mailcow host or the tenant/client ids "
+                                         "requires entering the client secret again")
+                self._discard_sign_ins()  # delegated: a human must sign in again
+            if client_secret is None and not cur_ms.get("client_secret") and auth_mode == "app":
+                raise HttpError(400, "enter the client secret together with the tenant and "
+                                     "client ids")
             if client_secret is None:
                 client_secret = cur_ms.get("client_secret") if not ids_changed else None
             if api_key is None:
-                if host != cur_mc.get("host") or not cur_mc.get("api_key"):
+                if host_changed or not cur_mc.get("api_key"):
                     raise HttpError(400, "enter the mailcow API key together with the host")
                 api_key = cur_mc.get("api_key")
 
@@ -518,6 +528,15 @@ class WebApp:
             self._reload()
         return self.settings()
 
+    def _discard_sign_ins(self) -> None:
+        """Delete every MSAL token cache in the state directory (web and job caches), so a
+        delegated sign-in cannot outlive a change of destination or tenant."""
+        for path in self.cfg.state_dir.glob("msal_cache*.bin"):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        with self._lock:
+            self._tokens = None
+
     def _reload(self) -> None:
         """Re-read the effective configuration after settings changed."""
         cfg = config_mod.load_config(self.config_path, require_mailboxes=False,
@@ -540,7 +559,8 @@ class WebApp:
             result["graph_users"] = {"ok": None, "message": "checked after sign-in"}
         else:
             try:
-                tokens = TokenProvider(self.cfg, out=self.out)
+                cache = self.cfg.state_dir / "msal_cache_web.bin"
+                tokens = TokenProvider(self.cfg, cache_path=cache, out=self.out)
                 tokens.get_token()
                 result["microsoft"] = {"ok": True, "message": "signed in (client credentials)"}
                 try:
@@ -646,7 +666,8 @@ class WebApp:
             destinations.add(entry["destination"])
             parsed.append(entry)
         self._write_selection(parsed)
-        return {"path": str(self.selection_path), "rows": parsed}
+        return {"path": str(self.selection_path), "rows": parsed,
+                "digest": self._selection_digest()}
 
     def _write_selection(self, rows: list[dict[str, Any]]) -> None:
         """Atomic replace of the CSV that ``--mailboxes`` reads, mode 0600."""
@@ -700,16 +721,30 @@ class WebApp:
         if isinstance(sample, bool) or not isinstance(sample, int) or not 0 <= sample <= MAX_SAMPLE:
             raise HttpError(400, f"sample must be an integer from 0 to {MAX_SAMPLE}")
         argv = ["--config", self.config_path] if self.config_path else []
-        if self.selection_path.is_file():
+        if command != "cleanup":
             # page-started jobs act on the saved selection alone (never the config's own
-            # list), and only on the selection the operator confirmed
+            # list), and only on the exact bytes the operator confirmed: those are copied
+            # to a per-job file so a concurrent save cannot change what the job reads
+            try:
+                data = self.selection_path.read_bytes()
+            except OSError as exc:
+                raise HttpError(409, "no saved selection: load the tenant list, tick "
+                                     "mailboxes and save the selection first") from exc
             digest = body.get("selection_digest")
-            if command != "cleanup" and digest != self._selection_digest():
+            if digest != hashlib.sha256(data).hexdigest():
                 if digest is None:
                     raise HttpError(409, "this page is older than the server: reload the page "
                                          "(F5) and start the job again")
                 raise HttpError(409, "the saved selection changed since the page loaded it; "
                                      "reload the selection and start the job again")
+            jobs_dir = self.cfg.state_dir / "jobs"
+            jobs_dir.mkdir(mode=0o700, exist_ok=True)
+            fd, snapshot = tempfile.mkstemp(prefix="selection-", suffix=".csv", dir=jobs_dir)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+            os.chmod(snapshot, 0o600)
+            argv += ["--mailboxes", snapshot, "--mailboxes-only"]
+        elif self.selection_path.is_file():
             argv += ["--mailboxes", str(self.selection_path), "--mailboxes-only"]
         argv.append(command)
         if dry_run:
@@ -877,6 +912,8 @@ class Handler(BaseHTTPRequestHandler):
         """DNS rebinding and cross-site defence on top of the token: the Host header must
         name this server (loopback, its bind address or a plain host name without a port
         mismatch), and a non-GET request that carries an Origin must come from it."""
+        if len(self.headers.get_all("Host") or []) > 1:
+            raise HttpError(400, "duplicate Host header")
         host = (self.headers.get("Host") or "").strip().lower()
         hostname = _host_only(host)
         allowed = self.server.allowed_hosts
@@ -884,9 +921,14 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(421, "unexpected Host header")
         origin = self.headers.get("Origin")
         if origin and self.command != "GET":
-            origin_host = _host_only(origin.split("://", 1)[-1].lower())
-            if origin_host not in allowed and not is_loopback(origin_host):
+            origin_authority = origin.split("://", 1)[-1].lower().rstrip("/")
+            origin_host = _host_only(origin_authority)
+            same_authority = host and origin_authority == host
+            if not same_authority and (origin_host not in allowed
+                                       and not is_loopback(origin_host)):
                 raise HttpError(403, "cross-origin request refused")
+            if origin_host and is_loopback(origin_host) and host and origin_authority != host:
+                raise HttpError(403, "cross-origin request refused (port differs)")
 
     def _api(self, path: str, query: dict[str, list[str]], body: bytes) -> Response:
         app, method = self.server.app, self.command

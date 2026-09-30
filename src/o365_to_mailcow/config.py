@@ -11,6 +11,7 @@ import csv
 import logging
 import os
 import re
+import socket
 import stat
 import tomllib
 from dataclasses import dataclass, field
@@ -47,8 +48,18 @@ _LOCAL_PART = re.compile(r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\.[A-Za-z0-9!#$%&'*+
 
 
 def valid_hostname(value: str) -> bool:
-    """RFC 1123 host name with a non-numeric top label: never an IPv4 literal."""
-    return bool(_HOSTNAME.match(value)) and not value.rsplit(".", 1)[-1].isdigit()
+    """RFC 1123 host name that is not an address literal in any spelling: no numeric or
+    hex labels (``0x7f.0.0.1``, ``127.0.0.0x1``), nothing ``inet_aton`` accepts."""
+    if not _HOSTNAME.match(value):
+        return False
+    labels = value.lower().split(".")
+    if any(label.isdigit() or label.startswith("0x") for label in labels):
+        return False
+    try:
+        socket.inet_aton(value)
+        return False
+    except OSError:
+        return True
 
 
 def valid_address(value: str) -> bool:
@@ -197,7 +208,14 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
     state_dir = Path(run.get("state_dir", "/state"))
 
     # values saved through the web UI override both the file and the environment
-    saved = read_settings(state_dir)
+    try:
+        saved = read_settings(state_dir)
+    except ConfigError:
+        if require_credentials:
+            raise
+        log.error("ignoring unreadable %s; save the Connections panel again to replace it",
+                  settings_path(state_dir))
+        saved = {}
     saved_ms, saved_mc = saved.get("microsoft", {}), saved.get("mailcow", {})
     for key in ("tenant_id", "client_id", "auth_mode", "client_secret"):
         if saved_ms.get(key):
@@ -231,9 +249,11 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
     else:
         api_key = env.get(ENV_API_KEY) or mc.get("api_key") or ""
     if not api_key:
-        missing.append(f"mailcow.api_key (or {ENV_API_KEY})")
+        missing.append("mailcow.api_key (in the web UI's Connections panel)" if saved_mc
+                       else f"mailcow.api_key (or {ENV_API_KEY})")
     if auth_mode == "app" and not client_secret:
-        missing.append(f"microsoft.client_secret (or {ENV_CLIENT_SECRET})")
+        missing.append("microsoft.client_secret (in the web UI's Connections panel)" if saved_ms
+                       else f"microsoft.client_secret (or {ENV_CLIENT_SECRET})")
     if auth_mode not in ("app", "delegated"):
         raise ConfigError(f"microsoft.auth_mode must be 'app' or 'delegated', got {auth_mode!r}")
 
@@ -278,6 +298,13 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
             raise ConfigError(f"source mailbox {m.source} is listed more than once")
         seen_dst.add(m.destination)
         seen_src.add(m.source)
+    # an alias may not collide with any row's destination or another row's aliases
+    seen_alias: set[str] = set()
+    for m in mailboxes:
+        for alias in m.aliases:
+            if alias in seen_dst or alias in seen_alias:
+                raise ConfigError(f"alias {alias} collides with another address in the list")
+            seen_alias.add(alias)
 
     if missing and require_credentials:
         raise ConfigError("missing required configuration: " + ", ".join(missing))

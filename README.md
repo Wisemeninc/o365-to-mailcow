@@ -247,16 +247,21 @@ services:
   secrets are never shown again, only "set"/"not set". "Test connections" tries a
   Microsoft sign-in, a Graph user listing (`User.Read.All`) and a mailcow API call.
   Two rules protect the credentials: a saved mailcow host is only ever used with the API
-  key saved *with* it (changing the host means entering the key again), and saved tenant
-  or client ids only with the client secret saved with them; the page can never pair a
-  new host with a key from `.env` or the config file. Every change is logged with the
+  key saved *with* it, and saved tenant or client ids only with the client secret saved
+  with them; the page can never pair a new host with a key from `.env` or the config
+  file. Changing the mailcow host or the tenant/client ids re-pairs the whole connection:
+  the client secret must be entered again in the same save (app mode) and any cached
+  delegated sign-in is discarded, so a page token alone can never redirect a migration
+  that uses your Microsoft credential. The "no IP address" rule on the host is defence in
+  depth only (wildcard DNS names exist); the pairing rule is the control. Every change is logged with the
   field names. `o365mig web --lock-settings` makes the panel read-only for hardened
   setups; `--allow-host NAME` accepts an extra `Host` header value (loopback and the bind
   address are always accepted; anything else is refused to defeat DNS rebinding).
 - **Token.** Every API call needs the token from that URL. It is new at every start, or
   fixed with `O365MIG_WEB_TOKEN` in `.env` (at least 16 characters, for example from
   `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`). It travels in the URL
-  fragment, which browsers never send to a server, but it is printed in the container log.
+  fragment, which browsers never send to a server. A generated token is printed in the
+  container log; a token set in `.env` is not.
   Anyone holding it can start migrations: treat it like the API key.
 - **Keep it on localhost.** The server speaks plain HTTP and the token is its only
   protection. The compose file publishes it on `127.0.0.1:8080` only (inside the container

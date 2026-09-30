@@ -804,7 +804,7 @@ class MailMigrator:
                 try:
                     graph_total = sum(1 for _ in self._graph.iter_pages(
                         self._user_path(f"mailFolders/{fp.folder_id}/messages"),
-                        params={"$select": "id", "$top": PAGE_SIZE}, headers=PREFER_IMMUTABLE))
+                        params={"$select": "id", "$top": 999}, headers=PREFER_IMMUTABLE))
                 except GraphError as exc:
                     graph_total = fp.total
                     note = (note + "; " if note else "") + f"Graph listing failed: {exc}"

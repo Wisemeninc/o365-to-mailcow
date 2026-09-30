@@ -1870,7 +1870,8 @@
           const srcDomain = source.split("@")[1] || "";
           const dstDomain = destination.toLowerCase().split("@")[1] || "";
           const aliases = [];
-          for (const alias of row.aliases) {
+          // the old primary address keeps working too when the destination was renamed
+          for (const alias of [source, ...row.aliases]) {
             const [local, domain] = alias.toLowerCase().split("@");
             if (!local || !domain) {
               continue;
@@ -1932,8 +1933,10 @@
         setMsg($("save-msg"), "Saving…");
 
         try {
-          await api("PUT", "/api/selection", { body: { rows: built.rows }, as: "none" });
+          const saved = await api("PUT", "/api/selection", { body: { rows: built.rows } });
+          // the server answers with what it wrote; jobs must name that exact version
           state.savedRows = built.rows;
+          state.selectionDigest = isObject(saved) && isStr(saved.digest) ? saved.digest : null;
           renderSaved();
           renderNotFound();
           setDirty(false);
@@ -2104,6 +2107,8 @@
           if (err && err.status === 404) {
             // the server no longer knows the job (it was restarted): stop at once
             state.job.polling = false;
+            state.job.running = false;
+            renderHeaderJob();
             showError("Job #" + state.job.id + " is no longer known to the server (it was restarted); the run's state is on disk and a new run resumes it.");
             $("btn-resume").hidden = false;
             updateRunButtons();
@@ -2147,6 +2152,10 @@
       const startJob = async (command, dryRun) => {
         if (state.dirty) {
           setMsg($("run-msg"), "Save the selection first.", "error");
+          return;
+        }
+        if (command !== "cleanup" && state.savedRows.length === 0) {
+          setMsg($("run-msg"), "The saved selection is empty: load the tenant list, tick mailboxes and save.", "error");
           return;
         }
         if (isJobRunning()) {

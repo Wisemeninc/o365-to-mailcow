@@ -244,7 +244,7 @@ class Runner:
     # -- shared resources --------------------------------------------------------------
 
     def say(self, line: str = "") -> None:
-        print(line, file=self.out, flush=True)
+        print(self.secret_filter.redact(line), file=self.out, flush=True)
 
     @property
     def tokens(self) -> TokenProvider:
@@ -439,10 +439,11 @@ def _run_migrators(r: Runner, m: MailboxMapping, password: str | None) -> None:
             f"removed at source (not applied) {res.total('removed_in_source')}"
             + (f"; {delta_folders} folder(s) checked for changes since the last run only"
                if delta_folders else ""))
+        # folder errors are also collected in res.errors (with the source path); print each once
         for e in res.errors:
             summary.append(f"  error: {clean(e)}")
         for f in res.folders:
-            if f.error:
+            if f.error and not any(f.error in e for e in res.errors):
                 summary.append(f"  error: {clean(f.dest_name)}: {clean(f.error)}")
     dav = r.dav(m, password) if password else None
     for kind, cls in (("calendar", CalendarMigrator), ("contacts", ContactsMigrator)):
@@ -541,109 +542,122 @@ def cmd_cleanup(r: Runner) -> int:
 
 
 def cmd_provision(r: Runner) -> int:
-    """Create the destination mailboxes that do not exist yet. Passwords are generated,
-    written once to a 0600 file in the state directory and never logged; users must change
-    them at first login. Domains are never created."""
+    """Create the destination mailboxes that do not exist yet, then their aliases. Passwords
+    are generated, written to a 0600 ledger in the state directory before each create and
+    never logged; users must change them at first login. Domains are never created."""
     api = r.api(allow_provision=True)
-    errors = 0
     domains_ok: dict[str, bool] = {}
     ledger: _PasswordLedger | None = None  # opened before the first create, never lost
-    for m in r.mailboxes:
-        try:
-            if api.mailbox_exists(m.destination):
-                r.say(f"{m.destination}: exists")
-                r.report.set(m.source, "provision", "exists")
-                continue
-            domain = m.destination.partition("@")[2]
-            if domain not in domains_ok:
-                domains_ok[domain] = api.domain_exists(domain)
-            if not domains_ok[domain]:
-                errors += 1
-                msg = f"domain {domain} does not exist in mailcow; add it in the UI first"
-                r.say(f"{m.destination}: {msg}")
-                r.report.error(m.source, msg)
-                continue
-            name = m.name or m.destination.partition("@")[0]
-            quota = m.quota_mib or r.cfg.provision_quota_mib
-            if r.opts.dry_run:
-                r.say(f"{m.destination}: would create ({name!r}, {quota} MiB)")
-                r.report.set(m.source, "provision", "would create")
-                continue
-            password = generate_password()
-            r.secret_filter.add(password)
-            if ledger is None:
-                ledger = _PasswordLedger(r.cfg.state_dir)
-            ledger.write(m.destination, password, "pending")  # on disk before the API call
+    ready: set[str] = set()  # destinations that exist, were created, or would be (dry run)
+    errors = 0
+    try:
+        for m in r.mailboxes:
             try:
-                api.create_mailbox(m.destination, name, quota, password,
-                                   tls_enforce=r.cfg.provision_tls_enforce)
-            except MailcowError:
-                # the call may have completed server-side (timeout after commit): keep the
-                # row when the mailbox now exists, otherwise mark it failed
                 if api.mailbox_exists(m.destination):
-                    ledger.write(m.destination, password, "created-unconfirmed")
-                else:
-                    ledger.write(m.destination, password, "failed")
-                raise
-            ledger.write(m.destination, password, "created")
-            r.say(f"{m.destination}: created ({name!r}, {quota} MiB)")
-            r.report.set(m.source, "provision", "created")
-        except MailcowError as exc:
-            errors += 1
-            log.error("%s: provisioning failed: %s", m.destination, exc)
-            r.report.error(m.source, f"provisioning failed: {exc}")
-    if ledger is not None:
-        ledger.close()
-        r.say(f"initial passwords written to {ledger.path} (mode 0600); users must change "
-              "them at first login. Delete the file once distributed.")
-    errors += _provision_aliases(r, api, domains_ok)
+                    r.say(f"{m.destination}: exists")
+                    r.report.set(m.source, "provision", "exists")
+                    ready.add(m.destination)
+                    continue
+                domain = m.destination.partition("@")[2]
+                if domain not in domains_ok:
+                    domains_ok[domain] = api.domain_exists(domain)
+                if not domains_ok[domain]:
+                    errors += 1
+                    msg = f"domain {domain} does not exist in mailcow; add it in the UI first"
+                    r.say(f"{m.destination}: {msg}")
+                    r.report.error(m.source, msg)
+                    continue
+                name = m.name or m.destination.partition("@")[0]
+                quota = m.quota_mib or r.cfg.provision_quota_mib
+                if r.opts.dry_run:
+                    r.say(f"{m.destination}: would create ({name!r}, {quota} MiB)")
+                    r.report.set(m.source, "provision", "would create")
+                    ready.add(m.destination)
+                    continue
+                password = generate_password()
+                r.secret_filter.add(password)
+                if ledger is None:
+                    ledger = _PasswordLedger(r.cfg.state_dir)
+                ledger.write(m.destination, password, "pending")  # on disk before the call
+                try:
+                    api.create_mailbox(m.destination, name, quota, password,
+                                       tls_enforce=r.cfg.provision_tls_enforce)
+                except MailcowError:
+                    # the call may have completed server-side (timeout after commit): keep
+                    # the row when the mailbox now exists, otherwise mark it failed
+                    if api.mailbox_exists(m.destination):
+                        ledger.write(m.destination, password, "created-unconfirmed")
+                        ready.add(m.destination)
+                    else:
+                        ledger.write(m.destination, password, "failed")
+                    raise
+                ledger.write(m.destination, password, "created")
+                ready.add(m.destination)
+                r.say(f"{m.destination}: created ({name!r}, {quota} MiB)")
+                r.report.set(m.source, "provision", "created")
+            except MailcowError as exc:
+                errors += 1
+                log.error("%s: provisioning failed: %s", m.destination, exc)
+                r.report.error(m.source, f"provisioning failed: {exc}")
+    finally:
+        if ledger is not None:
+            ledger.close()
+            r.say(f"initial passwords written to {ledger.path} (mode 0600); users must "
+                  "change them at first login. Delete the file once distributed.")
+    errors += _provision_aliases(r, api, domains_ok, ready)
     return 1 if errors else 0
 
 
-def _provision_aliases(r: Runner, api: MailcowApi, domains_ok: dict[str, bool]) -> int:
-    """Create each mailbox's extra addresses as mailcow aliases pointing at it. Aliases in
-    a domain mailcow does not host are listed and skipped; existing addresses (mailboxes
-    or aliases) are left alone."""
+def _provision_aliases(r: Runner, api: MailcowApi, domains_ok: dict[str, bool],
+                       ready: set[str]) -> int:
+    """Create each mailbox's extra addresses as mailcow aliases pointing at it. Only for
+    destinations that exist here (or were just created, or would be in a dry run); aliases
+    in a domain mailcow does not host and addresses that already exist are skipped."""
     wanted = [(alias, m) for m in r.mailboxes for alias in m.aliases]
     if not wanted:
         return 0
     errors = 0
     try:
-        existing = api.list_aliases()
+        existing = {k.lower(): v.lower() for k, v in api.list_aliases().items()}
     except MailcowError as exc:
         r.say(f"aliases: cannot list existing aliases: {exc}")
         r.report.error("aliases", f"cannot list aliases: {exc}")
         return 1
-    created = 0
+    created = would_create = 0
     for alias, m in wanted:
         domain = alias.partition("@")[2]
         try:
-            if alias in existing:
-                target = existing[alias]
-                if m.destination in target.split(","):
-                    r.say(f"  alias {alias}: exists -> {m.destination}")
-                else:
-                    r.say(f"  alias {alias}: exists but points at {target}; left unchanged")
-                continue
             if domain not in domains_ok:
                 domains_ok[domain] = api.domain_exists(domain)
             if not domains_ok[domain]:
                 r.say(f"  alias {alias}: skipped, domain {domain} is not hosted in mailcow")
                 continue
+            if alias in existing:
+                if m.destination in existing[alias].split(","):
+                    r.say(f"  alias {alias}: exists -> {m.destination}")
+                else:
+                    r.say(f"  alias {alias}: exists but points elsewhere; left unchanged")
+                continue
+            if m.destination not in ready:  # never forward to a mailbox that is not here
+                r.say(f"  alias {alias}: skipped, {m.destination} is not a mailbox here")
+                continue
             if api.mailbox_exists(alias):
                 r.say(f"  alias {alias}: skipped, a mailbox with that address exists")
                 continue
             if r.opts.dry_run:
+                would_create += 1
                 r.say(f"  alias {alias}: would create -> {m.destination}")
                 continue
             api.create_alias(alias, m.destination)
+            existing[alias] = m.destination
             created += 1
             r.say(f"  alias {alias}: created -> {m.destination}")
         except MailcowError as exc:
             errors += 1
             log.error("alias %s: %s", alias, exc)
             r.report.error(m.source, f"alias {alias}: {exc}")
-    r.report.set("aliases", "created", created)
+    r.report.set("aliases", "created" if not r.opts.dry_run else "would_create",
+                 created if not r.opts.dry_run else would_create)
     return errors
 
 
@@ -692,9 +706,10 @@ HANDLERS: dict[str, Callable[[Runner], int]] = {
 
 def cmd_web(cfg: Config, opts: Options, bind: str, port: int, err: TextIO,
             lock_settings: bool = False, allowed_hosts: list[str] | None = None) -> int:
-    allowed_hosts = allowed_hosts or []
     """Serve the web UI until Ctrl-C (security model: see ``web.py``). Takes no state lock:
     each job started from the page runs ``main`` and takes it then."""
+    allowed_hosts = [h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+                     for h in (allowed_hosts or [])]
     from . import web  # imported here because web imports this module
 
     token = os.environ.get(web.ENV_TOKEN) or secrets.token_urlsafe(32)

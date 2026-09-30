@@ -143,3 +143,15 @@ def test_example_config_documents_every_key_isc_8():
         idx = next(i for i, line in enumerate(lines)
                    if line.lstrip("# ").startswith(f"{key} ="))
         assert lines[idx - 1].lstrip().startswith("#"), f"{key} has no comment above it"
+
+
+def test_example_config_parses_and_loads(tmp_path):
+    import shutil
+
+    example = Path(__file__).resolve().parents[1] / "config.example.toml"
+    target = tmp_path / "config.toml"
+    shutil.copy(example, target)
+    os.chmod(target, 0o600)
+    cfg = load_config(str(target), env={"O365MIG_CLIENT_SECRET": "s3cret-value",
+                                        "O365MIG_MAILCOW_API_KEY": "api-key-value"})
+    assert cfg.mailboxes and any(m.aliases for m in cfg.mailboxes)

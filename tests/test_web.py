@@ -456,7 +456,9 @@ def test_selection_roundtrip_writes_a_0600_csv_the_cli_reads_isc_159(client, tmp
     ]
     r = client.put("/api/selection", {"path": "/ignored", "rows": rows})
     assert r.status == 200, r.body
-    assert r.json() == {"path": str(client.selection), "rows": expected}
+    body = r.json()
+    assert isinstance(body.pop("digest"), str)
+    assert body == {"path": str(client.selection), "rows": expected}
     assert client.get("/api/selection").json()["rows"] == expected
     assert stat.S_IMODE(client.selection.stat().st_mode) == 0o600
     assert client.selection.read_text(encoding="utf-8").startswith("#")
@@ -534,8 +536,11 @@ def test_job_runs_cli_main_and_captures_output_isc_160_161(client, monkeypatch):
     assert r.status == 202, r.body
     job_id = r.json()["id"]
     job = wait_job(client, job_id)
-    assert seen["argv"] == ["--config", str(client.conf), "--mailboxes", str(client.selection),
-                            "--mailboxes-only", "plan", "--dry-run"]
+    argv = seen["argv"]
+    snapshot = argv[argv.index("--mailboxes") + 1]  # a private copy of the confirmed bytes
+    assert Path(snapshot).read_bytes() == client.selection.read_bytes()
+    assert argv == ["--config", str(client.conf), "--mailboxes", snapshot,
+                    "--mailboxes-only", "plan", "--dry-run"]
     assert job["exit_code"] == 0 and job["running"] is False
     assert job["command"] == "plan" and job["args"] == seen["argv"]
     assert job["started"] <= job["finished"]
@@ -552,19 +557,28 @@ def test_job_runs_cli_main_and_captures_output_isc_160_161(client, monkeypatch):
     assert set(listing[0]) == {"id", "command", "args", "started", "finished", "exit_code"}
 
 
+def _saved(client) -> str:
+    """Save one row and return the digest a job must present."""
+    return client.put("/api/selection", {"rows": [GOOD]}).json()["digest"]
+
+
 def test_job_options_become_cli_arguments_isc_160(client, monkeypatch):
     argvs: list[list[str]] = []
     monkeypatch.setattr(cli, "main", lambda argv, **kw: argvs.append(list(argv)) or 1)
+    digest = _saved(client)
     r = client.post("/api/jobs", {"command": "verify", "dry_run": False, "only": "mail",
-                                  "mailbox": "Alice@Example.net", "sample": 5})
+                                  "mailbox": "Alice@Example.net", "sample": 5,
+                                  "selection_digest": digest})
     job = wait_job(client, r.json()["id"])
     assert job["exit_code"] == 1
-    # no selection saved yet: the config's own mailbox list applies
-    assert argvs[0] == ["--config", str(client.conf), "verify", "--only", "mail",
-                        "--mailbox=alice@example.net", "--sample", "5"]
-    r = client.post("/api/jobs", {"command": "migrate", "sample": 5})  # sample: verify only
+    assert argvs[0][:2] == ["--config", str(client.conf)]
+    assert argvs[0][2] == "--mailboxes" and argvs[0][4:] == [
+        "--mailboxes-only", "verify", "--only", "mail", "--mailbox=alice@example.net",
+        "--sample", "5"]
+    r = client.post("/api/jobs", {"command": "migrate", "sample": 5,  # sample: verify only
+                                  "selection_digest": digest})
     wait_job(client, r.json()["id"])
-    assert argvs[1] == ["--config", str(client.conf), "migrate"]
+    assert argvs[1][4:] == ["--mailboxes-only", "migrate"]
     listing = client.get("/api/jobs").json()
     assert [j["command"] for j in listing] == ["migrate", "verify"]  # newest first
 
@@ -596,11 +610,12 @@ def test_second_job_while_one_runs_is_409_isc_160(client, monkeypatch):
 
     monkeypatch.setattr(cli, "main", blocking_main)
     try:
-        first = client.post("/api/jobs", {"command": "migrate"})
+        digest = _saved(client)
+        first = client.post("/api/jobs", {"command": "migrate", "selection_digest": digest})
         assert first.status == 202
         job_id = first.json()["id"]
         assert entered.wait(5)
-        second = client.post("/api/jobs", {"command": "plan"})
+        second = client.post("/api/jobs", {"command": "plan", "selection_digest": digest})
         assert second.status == 409
         assert job_id in second.json()["error"]
         assert client.get("/api/status").json()["running_job"] == {"id": job_id,
@@ -612,17 +627,19 @@ def test_second_job_while_one_runs_is_409_isc_160(client, monkeypatch):
         release.set()
     assert wait_job(client, job_id)["exit_code"] == 1
     assert client.get("/api/status").json()["running_job"] is None
-    third = client.post("/api/jobs", {"command": "plan"})
+    third = client.post("/api/jobs", {"command": "plan", "selection_digest": digest})
     assert third.status == 202
     wait_job(client, third.json()["id"])
 
 
 def test_job_crash_and_argparse_exit_are_recorded(client, monkeypatch):
+    digest = _saved(client)
     def crashing_main(argv=None, *, stdout=None, stderr=None):
         raise RuntimeError(f"exploded with {API_KEY}")
 
     monkeypatch.setattr(cli, "main", crashing_main)
-    job = wait_job(client, client.post("/api/jobs", {"command": "plan"}).json()["id"])
+    job = wait_job(client, client.post("/api/jobs", {"command": "plan",
+                                                     "selection_digest": digest}).json()["id"])
     assert job["exit_code"] == 1
     assert job["output_tail"] == ["job failed: RuntimeError: exploded with ***"]
 
@@ -630,7 +647,8 @@ def test_job_crash_and_argparse_exit_are_recorded(client, monkeypatch):
         raise SystemExit(2)
 
     monkeypatch.setattr(cli, "main", exiting_main)
-    job = wait_job(client, client.post("/api/jobs", {"command": "plan"}).json()["id"])
+    job = wait_job(client, client.post("/api/jobs", {"command": "plan",
+                                                     "selection_digest": digest}).json()["id"])
     assert job["exit_code"] == 2
 
 
@@ -811,7 +829,7 @@ def test_host_change_requires_the_api_key_in_the_same_request(client, tmp_path):
     ids = {"microsoft": {"tenant_id": "t2", "client_id": "c2", "auth_mode": "app"},
            "mailcow": {"host": "mail.example.net"}}
     r = client.put("/api/settings", ids)
-    assert r.status == 400 and b"client secret together" in r.body
+    assert r.status == 400 and b"client secret again" in r.body
     # with the paired secrets the change is accepted
     moved["mailcow"]["api_key"] = "key-two-value"
     assert client.put("/api/settings", moved).status == 200
@@ -850,7 +868,7 @@ def test_host_header_and_origin_are_checked(client):
                     headers={"Origin": "https://evil.example"})
     assert r.status == 403
     r = client.post("/api/mailcow/check", {"addresses": []},
-                    headers={"Origin": "http://127.0.0.1:1234"})
+                    headers={"Origin": f"http://127.0.0.1:{client.port}"})
     assert r.status == 200
 
 
@@ -887,3 +905,72 @@ def test_job_output_is_byte_capped():
         out.write(f"line {i:04d} " + "x" * 40 + "\n")
     text = out.text()
     assert len(text) <= 1400 and "line 0199" in text and "line 0000" not in text
+
+
+# -- second review round -----------------------------------------------------------------
+
+def test_host_change_requires_the_client_secret_again_and_drops_sign_ins(client, tmp_path):
+    """Silas #1: a host change with a fresh key must not keep the Microsoft credential."""
+    state = tmp_path / "state"
+    base = {"microsoft": {"tenant_id": "t1", "client_id": "c1", "auth_mode": "app",
+                          "client_secret": "secret-one-value"},
+            "mailcow": {"host": "mail.example.net", "api_key": "key-one-value"}}
+    assert client.put("/api/settings", base).status == 200
+    (state / "msal_cache.bin").write_text("cached refresh token")
+    (state / "msal_cache_web.bin").write_text("cached refresh token")
+    moved = {"microsoft": {"tenant_id": "t1", "client_id": "c1", "auth_mode": "app"},
+             "mailcow": {"host": "sink.example.org", "api_key": "attacker-key-value"}}
+    r = client.put("/api/settings", moved)
+    assert r.status == 400 and b"client secret again" in r.body
+    assert "sink.example.org" not in (state / "settings.toml").read_text()
+    moved["microsoft"]["client_secret"] = "secret-two-value"
+    assert client.put("/api/settings", moved).status == 200
+    assert not (state / "msal_cache.bin").exists() and not (state / "msal_cache_web.bin").exists()
+
+
+def test_put_selection_returns_digest_and_job_accepts_it(client, monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_main(argv=None, *, stdout=None, stderr=None):
+        calls.append(list(argv))
+        return 0
+
+    monkeypatch.setattr(cli, "main", fake_main)
+    r = client.put("/api/selection", {"rows": [GOOD]})
+    assert r.status == 200 and isinstance(r.json()["digest"], str)
+    digest = r.json()["digest"]
+    r = client.post("/api/jobs", {"command": "plan", "dry_run": True, "only": None,
+                                  "mailbox": None, "sample": 0, "selection_digest": digest})
+    assert r.status == 202, r.body
+    wait_job(client, r.json()["id"])
+    argv = calls[0]
+    # the job read a private snapshot of the confirmed bytes, not the live file
+    snapshot = argv[argv.index("--mailboxes") + 1]
+    assert snapshot != str(client.selection) and "--mailboxes-only" in argv
+    assert oct(Path(snapshot).stat().st_mode & 0o777) == "0o600"
+
+
+def test_job_without_a_saved_selection_is_refused(client):
+    r = client.post("/api/jobs", {"command": "migrate", "dry_run": True, "only": None,
+                                  "mailbox": None, "sample": 0, "selection_digest": "x"})
+    assert r.status == 409 and b"no saved selection" in r.body
+
+
+def test_origin_on_another_localhost_port_is_refused(client):
+    port = client.port
+    ok = client.post("/api/mailcow/check", {"addresses": []},
+                     headers={"Origin": f"http://127.0.0.1:{port}"})
+    assert ok.status == 200
+    other = client.post("/api/mailcow/check", {"addresses": []},
+                        headers={"Origin": "http://127.0.0.1:1234"})
+    assert other.status == 403
+
+
+def test_job_output_bytes_are_counted_after_truncation():
+    out = web.JobOutput(lambda t: t, max_lines=10_000, max_bytes=200_000)
+    for _ in range(300):
+        out.write("x" * 60_000 + "\n")
+    for i in range(5):
+        out.write(f"summary line {i}\n")
+    text = out.text()
+    assert all(f"summary line {i}" in text for i in range(5))

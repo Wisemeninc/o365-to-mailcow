@@ -33,8 +33,7 @@ state_dir = "/state"
 # a Microsoft 365 source address to a different mailcow destination address.
 mailboxes = [
     "alice@example.net",
-    { source = "bob@contoso.com", destination = "bob@example.net",
-      name = "Bob Berg", quota_mib = 5120, aliases = ["b.berg@example.net"] },
+    { source = "bob@contoso.com", destination = "bob@example.net", name = "Bob Berg", quota_mib = 5120, aliases = ["b.berg@example.net"] },
 ]
 # Optional CSV of "source[,destination[,name[,quota_mib[,aliases]]]]" rows (lines starting
 # with # are ignored), added to the list above; name, quota and the semicolon-separated
