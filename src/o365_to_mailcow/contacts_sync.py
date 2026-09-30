@@ -32,6 +32,11 @@ from .state import STATUS_DONE, STATUS_FAILED, State
 
 log = logging.getLogger(__name__)
 
+# SOGo answers 403 for a user it cannot resolve; in mailcow that is what happens for a
+# domain added after SOGo last started (its user sources are generated at start-up).
+SOGO_403_HINT = (" (SOGo does not know this user: if the domain was added to mailcow "
+                 "recently, restart SOGo via E-Mail > Restart SOGo, then run again)")
+
 DEFAULT_SLUG = "personal"
 RESERVED_SLUGS = {"personal", "collected"}  # SOGo's built-in address books
 DEFAULT_ID = "default"
@@ -150,7 +155,8 @@ class ContactsMigrator:
             try:
                 home = self._require_dav().addressbook_home_exists()
             except DavError as exc:
-                result.errors.append(f"SOGo address book home check failed: {exc}")
+                result.errors.append(f"SOGo address book home check failed: {exc}"
+                                     + (SOGO_403_HINT if exc.status == 403 else ""))
                 return
             if not home:  # ISC-107
                 result.errors.append(
