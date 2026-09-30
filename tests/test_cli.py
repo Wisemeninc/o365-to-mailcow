@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import threading
 
 import pytest
 import responses
@@ -145,6 +146,7 @@ def config(tmp_path):
 @pytest.fixture
 def mailcow(world):
     """Recorded mailcow API: every call lands in responses.calls."""
+    lock = threading.Lock()  # mailbox threads hit the fake concurrently
     with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
         def get_mailbox(req):
             addr = req.url.rsplit("/", 1)[1]
@@ -153,21 +155,24 @@ def mailcow(world):
 
         def list_pw(req):
             addr = req.url.rsplit("/", 1)[1]
-            return 200, {}, json.dumps(world.app_passwords.get(addr, []))
+            with lock:
+                return 200, {}, json.dumps(world.app_passwords.get(addr, []))
 
         def add_pw(req):
             body = json.loads(req.body)
-            world.passwords.append(body["app_passwd"])
-            world.next_id += 1
-            world.app_passwords.setdefault(body["username"], []).append(
-                {"id": world.next_id, "name": body["app_name"]})
+            with lock:
+                world.passwords.append(body["app_passwd"])
+                world.next_id += 1
+                world.app_passwords.setdefault(body["username"], []).append(
+                    {"id": world.next_id, "name": body["app_name"]})
             return 200, {}, json.dumps([{"type": "success", "msg": "app_passwd_added",
                                          "log": ["app_passwd", "add", body]}])
 
         def delete_pw(req):
             ids = {str(i) for i in json.loads(req.body)["items"]}
-            for addr, items in world.app_passwords.items():
-                world.app_passwords[addr] = [p for p in items if str(p["id"]) not in ids]
+            with lock:
+                for addr, items in list(world.app_passwords.items()):
+                    world.app_passwords[addr] = [p for p in items if str(p["id"]) not in ids]
             return 200, {}, json.dumps([{"type": "success", "msg": "deleted"}])
 
         rsps.add_callback("GET", re.compile(API + "get/mailbox/.*"), callback=get_mailbox)
