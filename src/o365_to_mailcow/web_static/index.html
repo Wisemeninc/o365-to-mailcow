@@ -2078,6 +2078,14 @@
             state.job.polling = false;
             return;
           }
+          if (err && err.status === 404) {
+            // the server no longer knows the job (it was restarted): stop at once
+            state.job.polling = false;
+            showError("Job #" + state.job.id + " is no longer known to the server (it was restarted); the run's state is on disk and a new run resumes it.");
+            $("btn-resume").hidden = false;
+            updateRunButtons();
+            return;
+          }
           state.job.failures += 1;
           if (state.job.failures >= 5) {
             state.job.polling = false;
