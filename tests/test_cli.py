@@ -65,7 +65,7 @@ def graph_routes(user: str) -> dict:
 class FakeTokens:
     error: Exception | None = None
 
-    def __init__(self, cfg) -> None:
+    def __init__(self, cfg, out=None) -> None:
         self.cfg = cfg
 
     def get_token(self) -> str:

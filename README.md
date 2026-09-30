@@ -41,6 +41,7 @@ no user signs in and nobody needs Full Access to the mailboxes.
    - `Mail.Read`
    - `Calendars.Read`
    - `Contacts.Read`
+   - only for the optional [web UI](#web-ui-optional): `User.Read.All` (lists the mailboxes)
 
    Then click **Grant admin consent for <tenant>**. No write permission is needed or used.
 4. **Certificates & secrets > Client secrets > New client secret**. Copy the *Value*
@@ -80,6 +81,7 @@ Use this only if your tenant forbids application permissions.
    - `Contacts.Read.Shared`
    - `User.Read`
    - `offline_access` (MSAL requests this automatically; it keeps the run signed in)
+   - only for the optional [web UI](#web-ui-optional): `User.Read.All`
 
    Grant admin consent.
 4. The signing-in administrator needs **Full Access** to every migrated mailbox:
@@ -188,6 +190,49 @@ Every run writes `state/reports/<UTC timestamp>.json` (per mailbox, per folder, 
 calendar and address book: counts, failures, skips, durations) and a log in
 `state/logs/`. Progress (done/total and items per minute per mailbox) is printed at
 least every 30 seconds.
+
+### Web UI (optional)
+
+`o365mig web` serves a local page for the work around the commands: list the tenant's
+mailboxes, pick the ones to migrate, set destination address, display name and quota per
+mailbox, check which destinations exist in mailcow, save the list, start `plan`,
+`provision`, `migrate`, `verify` and `cleanup`, watch their output and read the latest
+report.
+
+```sh
+docker compose up -d web
+docker compose logs web    # web UI: http://0.0.0.0:8080/#token=<token>
+```
+
+Open `http://127.0.0.1:8080/#token=<token>` on the Docker host. Without Docker,
+`o365mig --config config.toml web` prints `http://127.0.0.1:8080/#token=<token>`
+(options `--bind ADDRESS`, `--port N`).
+
+- **Token.** Every API call needs the token from that URL. It is new at every start, or
+  fixed with `O365MIG_WEB_TOKEN` in `.env` (at least 16 characters, for example from
+  `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`). It travels in the URL
+  fragment, which browsers never send to a server, but it is printed in the container log.
+  Anyone holding it can start migrations: treat it like the API key.
+- **Keep it on localhost.** The server speaks plain HTTP and the token is its only
+  protection. The compose file publishes it on `127.0.0.1:8080` only (inside the container
+  it listens on all interfaces, hence the "reachable from the network" warning in its
+  log). From another machine use an SSH tunnel (`ssh -L 8080:127.0.0.1:8080 docker-host`)
+  or your own reverse proxy with TLS and authentication in front of it; never publish the
+  port on a public interface.
+- **Extra Graph permission.** Listing the tenant's mailboxes needs **`User.Read.All`**:
+  as an *application* permission for app-only sign-in, as a *delegated* permission for
+  device-code sign-in, with admin consent either way. The migration itself does not use
+  it; without it only the listing fails, with a message saying so.
+- **Mailbox list.** The page saves `state/mailboxes.csv` (mode 0600, the same
+  `source,destination,name,quota_mib` format as `--mailboxes`) and every command it starts
+  runs with `--mailboxes` pointing at that file. The config's own `mailboxes = [...]` still
+  applies on top, so leave it empty when you use the page (a destination listed twice is
+  refused).
+- **One command at a time.** Commands run inside the web container and take the same
+  state lock as `docker compose run`, so a page-started run and a CLI run never overlap.
+  Stopping the web container stops a running command; start it again to resume, exactly as
+  after Ctrl-C. In delegated mode the device-code prompt appears in the command's output
+  (for the mailbox listing: in the container log).
 
 ## What is migrated, and how
 

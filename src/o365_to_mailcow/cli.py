@@ -1,4 +1,4 @@
-"""Command line entry point: ``o365mig plan|migrate|verify|cleanup``.
+"""Command line entry point: ``o365mig plan|migrate|verify|cleanup|provision|web``.
 
 Exit codes (ISC-115): 0 everything succeeded, 1 any item failed / was skipped (verify)
 or a mailbox errored, 2 configuration or sign-in error.
@@ -11,18 +11,20 @@ import fcntl
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from . import __version__
 from .auth import AuthError, TokenProvider
 from .calendar_sync import CalendarMigrator
-from .config import Config, ConfigError, MailboxMapping, load_config
+from .config import ENV_CONFIG, Config, ConfigError, MailboxMapping, load_config
 from .contacts_sync import ContactsMigrator
 from .dav import SogoDav
 from .graph import GraphClient
@@ -48,10 +50,17 @@ COMMANDS = {
     "cleanup": f"delete every '{APP_PASSWORD_NAME}-*' app password",
     "provision": "create missing destination mailboxes in mailcow (opt-in; never part of "
                  "migrate)",
+    "web": "serve the local web UI: pick mailboxes, run the commands above, read reports",
 }
 
 
 # -- arguments -------------------------------------------------------------------------
+
+def _port(text: str) -> int:
+    if not (text.isascii() and text.isdigit()) or not 1 <= int(text) <= 65535:
+        raise argparse.ArgumentTypeError(f"invalid port {text!r} (1-65535)")
+    return int(text)
+
 
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
@@ -82,6 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--sample", type=int, metavar="N", default=0,
                            help="re-download N random migrated messages per mailbox and "
                                 "compare SHA-256 with the destination copy")
+        if name == "web":
+            p.add_argument("--bind", default="127.0.0.1", metavar="ADDRESS",
+                           help="listen address (default 127.0.0.1; anything else exposes "
+                                "the UI to the network)")
+            p.add_argument("--port", type=_port, default=8080, help="port (default 8080)")
     return parser
 
 
@@ -156,16 +170,17 @@ class SecretFilter(logging.Filter):
         return True
 
 
-def setup_logging(cfg: Config, verbose: int,
-                  secret_filter: SecretFilter) -> tuple[Path, list[logging.Handler]]:
+def setup_logging(cfg: Config, verbose: int, secret_filter: SecretFilter,
+                  stream: TextIO | None = None) -> tuple[Path, list[logging.Handler]]:
     logs = cfg.state_dir / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     path = logs / f"{utc_stamp()}.log"
     os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s")
     level = logging.DEBUG if verbose else getattr(logging, cfg.log_level, logging.INFO)
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr),
-                                       logging.FileHandler(path, encoding="utf-8")]
+    handlers: list[logging.Handler] = [
+        logging.StreamHandler(sys.stderr if stream is None else stream),
+        logging.FileHandler(path, encoding="utf-8")]
     root = logging.getLogger()
     for h in handlers:
         h.setFormatter(fmt)
@@ -202,15 +217,16 @@ class Runner:
     """Executes one command against the selected mailboxes."""
 
     def __init__(self, cfg: Config, opts: Options, mailboxes: list[MailboxMapping],
-                 secret_filter: SecretFilter, out: Any = None) -> None:
+                 secret_filter: SecretFilter, out: Any = None, err: Any = None) -> None:
         self.cfg = cfg
         self.opts = opts
         self.mailboxes = mailboxes
         self.secret_filter = secret_filter
-        self.out = out or sys.stdout
+        self.out = sys.stdout if out is None else out
+        self.err = sys.stderr if err is None else err
         self.report = RunReport(opts.command, cfg.state_dir, dry_run=opts.dry_run,
                                 redactor=secret_filter.redact)
-        self.progress = Progress()
+        self.progress = Progress(self.err)
         self._tokens: TokenProvider | None = None
         self._state: State | None = None
         self._init_lock = threading.Lock()  # mailbox threads share one State/TokenProvider
@@ -223,8 +239,8 @@ class Runner:
     @property
     def tokens(self) -> TokenProvider:
         with self._init_lock:
-            if self._tokens is None:
-                self._tokens = TokenProvider(self.cfg)
+            if self._tokens is None:  # a device-code prompt goes where the output goes
+                self._tokens = TokenProvider(self.cfg, out=self.out)
             return self._tokens
 
     @property
@@ -236,6 +252,7 @@ class Runner:
 
     def api(self, allow_provision: bool = False) -> MailcowApi:
         return MailcowApi(self.cfg.mailcow_host, self.cfg.mailcow_api_key,
+                          verify=self.cfg.mailcow_ca_file or True,
                           allow_provision=allow_provision)
 
     def graph(self) -> GraphClient:
@@ -322,10 +339,11 @@ class Runner:
     def dest_factory(self, m: MailboxMapping, password: str) -> Callable[[], ImapDestination]:
         cfg = self.cfg
         return lambda: ImapDestination(cfg.mailcow_host, cfg.imap_port, m.destination,
-                                       password)
+                                       password, verify=cfg.mailcow_ca_file or True)
 
     def dav(self, m: MailboxMapping, password: str) -> SogoDav:
-        return SogoDav(self.cfg.mailcow_host, m.destination, password)
+        return SogoDav(self.cfg.mailcow_host, m.destination, password,
+                       verify=self.cfg.mailcow_ca_file or True)
 
     def exists(self, api: MailcowApi, m: MailboxMapping) -> bool:
         if api.mailbox_exists(m.destination):
@@ -563,47 +581,95 @@ HANDLERS: dict[str, Callable[[Runner], int]] = {
 
 # -- main ------------------------------------------------------------------------------
 
-def main(argv: Iterable[str] | None = None) -> int:
+def cmd_web(cfg: Config, opts: Options, bind: str, port: int, err: TextIO) -> int:
+    """Serve the web UI until Ctrl-C (security model: see ``web.py``). Takes no state lock:
+    each job started from the page runs ``main`` and takes it then."""
+    from . import web  # imported here because web imports this module
+
+    token = os.environ.get(web.ENV_TOKEN) or secrets.token_urlsafe(32)
+    if len(token) < web.MIN_TOKEN_CHARS:
+        print(f"configuration error: {web.ENV_TOKEN} must be at least "
+              f"{web.MIN_TOKEN_CHARS} characters", file=err)
+        return 2
+    config_path = opts.config or os.environ.get(ENV_CONFIG)
+    secret_filter = SecretFilter()
+    for value in (cfg.client_secret, cfg.mailcow_api_key, token):
+        secret_filter.add(value)
+    handler = logging.StreamHandler(err)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    handler.addFilter(secret_filter)
+    saved = (web.log.level, web.log.propagate)
+    web.log.addHandler(handler)
+    web.log.setLevel(logging.INFO)
+    web.log.propagate = False  # server messages stay out of the jobs' logs, and vice versa
+    try:
+        if not web.is_loopback(bind):
+            web.log.warning("the web UI on %s is reachable from the network; the token is its "
+                            "only protection and the connection is not encrypted", bind)
+        print(f"web UI: {web.base_url(bind, port)}/#token={token}", file=err, flush=True)
+        page = resources.files(__package__) / "web_static" / "index.html"
+        with resources.as_file(page) as page_path:
+            web.serve(cfg, bind, port, token, page_path, out=err,
+                      config_path=str(Path(config_path).resolve()) if config_path else None)
+    except OSError as exc:
+        print(f"web UI: cannot start on {bind}:{port}: {exc}", file=err)
+        return 2
+    finally:
+        web.log.removeHandler(handler)
+        web.log.setLevel(saved[0])
+        web.log.propagate = saved[1]
+    return 0
+
+
+def main(argv: Iterable[str] | None = None, *, stdout: TextIO | None = None,
+         stderr: TextIO | None = None) -> int:
+    """Run one command. Everything it prints, logs or reports as progress goes to
+    ``stdout``/``stderr`` (default: the process's streams); the web UI passes a buffer."""
+    out = sys.stdout if stdout is None else stdout
+    err = sys.stderr if stderr is None else stderr
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "o365mig":  # `docker run IMAGE o365mig ...` with ENTRYPOINT o365mig
         args = args[1:]
-    opts = Options.from_args(build_parser().parse_args(args))
+    ns = build_parser().parse_args(args)
+    opts = Options.from_args(ns)
     try:
-        cfg = load_config(opts.config, opts.mailboxes_csv)
+        cfg = load_config(opts.config, opts.mailboxes_csv,
+                          require_mailboxes=opts.command != "web")
         mailboxes = select_mailboxes(cfg, opts.mailbox)
         cfg.state_dir.mkdir(parents=True, exist_ok=True)
     except (ConfigError, OSError) as exc:
-        print(f"configuration error: {exc}", file=sys.stderr)
+        print(f"configuration error: {exc}", file=err)
         return 2
+    if opts.command == "web":
+        return cmd_web(cfg, opts, ns.bind, ns.port, err)
 
     lock = _acquire_lock(cfg.state_dir)
     if lock is None:
         print("another o365mig run is using this state directory; wait for it to finish",
-              file=sys.stderr)
+              file=err)
         return 2
     secret_filter = SecretFilter()
     secret_filter.add(cfg.client_secret)
     secret_filter.add(cfg.mailcow_api_key)
-    log_path, handlers = setup_logging(cfg, opts.verbose, secret_filter)
-    runner = Runner(cfg, opts, mailboxes, secret_filter)
+    log_path, handlers = setup_logging(cfg, opts.verbose, secret_filter, err)
+    runner = Runner(cfg, opts, mailboxes, secret_filter, out=out, err=err)
     code = 1
     try:
         log.info("o365mig %s %s: %d mailbox(es), log %s", __version__, opts.command,
                  len(mailboxes), log_path)
         code = HANDLERS[opts.command](runner)
     except AuthError as exc:
-        print(auth_hint(cfg, exc), file=sys.stderr)
+        print(auth_hint(cfg, exc), file=err)
         code = 2
     except KeyboardInterrupt:
-        print("interrupted; state is saved, re-run the same command to resume",
-              file=sys.stderr)
+        print("interrupted; state is saved, re-run the same command to resume", file=err)
         code = 1
     finally:
         try:
             path = runner.report.write(code)
-            print(f"report: {path}", file=sys.stderr)
+            print(f"report: {path}", file=err)
         except OSError as exc:
-            print(f"could not write report: {exc}", file=sys.stderr)
+            print(f"could not write report: {exc}", file=err)
         runner.close()
         root = logging.getLogger()
         for h in handlers:

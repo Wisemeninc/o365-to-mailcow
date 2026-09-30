@@ -130,7 +130,7 @@ def _read_mailboxes_csv(path: Path) -> list[MailboxMapping]:
 
 
 def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str | None = None,
-                env: dict[str, str] | None = None) -> Config:
+                env: dict[str, str] | None = None, *, require_mailboxes: bool = True) -> Config:
     env = dict(os.environ if env is None else env)
     path_str = config_path or env.get(ENV_CONFIG)
     if not path_str:
@@ -191,7 +191,7 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
                                    or not 1 <= quota <= 1_000_000)):
             raise ConfigError(f"invalid run.mailboxes entry: {entry!r}")
         mailboxes.append(MailboxMapping(src.strip().lower(), dst.strip().lower(), name, quota))
-    if not mailboxes:
+    if not mailboxes and require_mailboxes:
         missing.append("run.mailboxes (or --mailboxes CSV)")
     # Two mappings onto one destination would share one mailbox's app password and
     # IMAP folders from two threads; refuse rather than race (Silas M3).

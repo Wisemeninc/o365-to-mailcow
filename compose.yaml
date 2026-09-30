@@ -6,22 +6,38 @@
 #   docker compose run --rm o365mig migrate
 #   docker compose run --rm o365mig verify
 #   docker compose run --rm o365mig cleanup
+# Web UI (optional):
+#   docker compose up -d web
+#   docker compose logs web       # the URL with its token; open it as http://127.0.0.1:8080/
+
+# One definition for both services, so the web UI can never run with weaker hardening.
+x-o365mig: &o365mig
+  build: .
+  image: o365-to-mailcow:latest
+  env_file: .env
+  volumes:
+    - ./state:/state
+    - ./config:/config:ro
+  read_only: true
+  # bounded memory: at most 4 in-flight messages per mailbox x parallel mailboxes
+  mem_limit: 3g
+  pids_limit: 256
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
 services:
   o365mig:
-    build: .
-    image: o365-to-mailcow:latest
-    env_file: .env
-    volumes:
-      - ./state:/state
-      - ./config:/config:ro
+    <<: *o365mig
     command: ["plan"]
-    read_only: true
-    # bounded memory: at most 4 in-flight messages per mailbox x parallel mailboxes
-    mem_limit: 3g
-    pids_limit: 256
-    tmpfs:
-      - /tmp
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
+
+  web:
+    <<: *o365mig
+    # All interfaces inside the container, but published on the host's loopback only:
+    # reachable from this machine, nowhere else. Never publish it on 0.0.0.0.
+    command: ["web", "--bind", "0.0.0.0"]
+    ports:
+      - "127.0.0.1:8080:8080"

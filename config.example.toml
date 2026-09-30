@@ -17,6 +17,8 @@ auth_mode = "app"
 # client_secret = ""
 
 [mailcow]
+# Optional: PEM bundle of a private CA if the mailcow host does not use a public certificate.
+# ca_file = "/config/mailcow-ca.pem"
 # Bare hostname of the mailcow server (no scheme, no port, no path). Used for the API,
 # IMAP (port imap_port) and SOGo DAV. It is the only non-Microsoft host ever contacted.
 host = "mail.example.net"

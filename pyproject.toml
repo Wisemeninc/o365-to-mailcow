@@ -34,6 +34,9 @@ o365mig = "o365_to_mailcow.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+o365_to_mailcow = ["web_static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
