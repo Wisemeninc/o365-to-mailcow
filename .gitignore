@@ -7,3 +7,5 @@ state/
 *.toml.local
 .env
 .claude/
+compose.override.yaml
+config/

@@ -208,6 +208,11 @@ Open `http://127.0.0.1:8080/#token=<token>` on the Docker host. Without Docker,
 `o365mig --config config.toml web` prints `http://127.0.0.1:8080/#token=<token>`
 (options `--bind ADDRESS`, `--port N`).
 
+- **Connections panel.** The tenant id, client id, sign-in mode, client secret, mailcow
+  host and API key can be entered in the page instead of the files. They are saved to
+  `state/settings.toml` (mode 0600) and take precedence over `config.toml` and `.env`;
+  secrets are never shown again, only "set"/"not set". "Test connections" tries a
+  Microsoft sign-in, a Graph user listing (`User.Read.All`) and a mailcow API call.
 - **Token.** Every API call needs the token from that URL. It is new at every start, or
   fixed with `O365MIG_WEB_TOKEN` in `.env` (at least 16 characters, for example from
   `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`). It travels in the URL

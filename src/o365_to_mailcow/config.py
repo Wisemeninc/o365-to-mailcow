@@ -129,8 +129,31 @@ def _read_mailboxes_csv(path: Path) -> list[MailboxMapping]:
     return rows
 
 
+SETTINGS_FILE = "settings.toml"  # written by the web UI into state_dir; wins over file and env
+
+
+def settings_path(state_dir: Path) -> Path:
+    return Path(state_dir) / SETTINGS_FILE
+
+
+def read_settings(state_dir: Path) -> dict[str, dict[str, str]]:
+    """The web UI's saved settings ({"microsoft": {...}, "mailcow": {...}}) or {}."""
+    path = settings_path(state_dir)
+    if not path.is_file():
+        return {}
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
+    return {k: v for k, v in data.items() if isinstance(v, dict)}
+
+
 def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str | None = None,
-                env: dict[str, str] | None = None, *, require_mailboxes: bool = True) -> Config:
+                env: dict[str, str] | None = None, *, require_mailboxes: bool = True,
+                require_credentials: bool = True) -> Config:
+    """Precedence for tenant/client ids, hosts and secrets: values saved by the web UI
+    (``<state_dir>/settings.toml``) > environment variables > the config file."""
     env = dict(os.environ if env is None else env)
     path_str = config_path or env.get(ENV_CONFIG)
     if not path_str:
@@ -145,9 +168,20 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
 
-    ms = data.get("microsoft", {})
-    mc = data.get("mailcow", {})
+    ms = dict(data.get("microsoft", {}))
+    mc = dict(data.get("mailcow", {}))
     run = data.get("run", {})
+    state_dir = Path(run.get("state_dir", "/state"))
+
+    # values saved through the web UI override both the file and the environment
+    saved = read_settings(state_dir)
+    saved_ms, saved_mc = saved.get("microsoft", {}), saved.get("mailcow", {})
+    for key in ("tenant_id", "client_id", "auth_mode", "client_secret"):
+        if saved_ms.get(key):
+            ms[key] = saved_ms[key]
+    for key in ("host", "api_key"):
+        if saved_mc.get(key):
+            mc[key] = saved_mc[key]
 
     missing: list[str] = []
 
@@ -161,9 +195,10 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
     tenant_id = req(ms, "tenant_id", "microsoft.tenant_id")
     client_id = req(ms, "client_id", "microsoft.client_id")
     auth_mode = str(ms.get("auth_mode", "app")).lower()
-    client_secret = env.get(ENV_CLIENT_SECRET) or ms.get("client_secret") or None
+    client_secret = (saved_ms.get("client_secret") or env.get(ENV_CLIENT_SECRET)
+                     or ms.get("client_secret") or None)
     mailcow_host = req(mc, "host", "mailcow.host")
-    api_key = env.get(ENV_API_KEY) or mc.get("api_key") or ""
+    api_key = saved_mc.get("api_key") or env.get(ENV_API_KEY) or mc.get("api_key") or ""
     if not api_key:
         missing.append(f"mailcow.api_key (or {ENV_API_KEY})")
     if auth_mode == "app" and not client_secret:
@@ -205,8 +240,12 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         seen_dst.add(m.destination)
         seen_src.add(m.source)
 
-    if missing:
+    if missing and require_credentials:
         raise ConfigError("missing required configuration: " + ", ".join(missing))
+    if missing and not require_credentials:  # the web UI can start and be configured
+        missing = [m for m in missing if m.startswith("run.")]
+        if missing:
+            raise ConfigError("missing required configuration: " + ", ".join(missing))
 
     if str(run.get("calendar_attendees", "keep")).lower() not in ("keep", "strip"):
         raise ConfigError("run.calendar_attendees must be 'keep' or 'strip'")
@@ -217,7 +256,6 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         if not isinstance(ca_file, str) or not Path(ca_file).is_file():
             raise ConfigError(f"mailcow.ca_file must name a readable PEM file, got {ca_file!r}")
 
-    state_dir = Path(run.get("state_dir", "/state"))
     return Config(
         tenant_id=tenant_id,
         client_id=client_id,

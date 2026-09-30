@@ -404,6 +404,32 @@
   </section>
 
   <main id="app" hidden>
+    <section id="settings-section">
+      <h2>Connections</h2>
+      <p id="settings-hint" class="msg"></p>
+      <form id="settings-form" class="controls section-block" autocomplete="off">
+        <label for="s-tenant">Tenant ID</label>
+        <input id="s-tenant" type="text" spellcheck="false" placeholder="directory (tenant) id" required>
+        <label for="s-client">Client ID</label>
+        <input id="s-client" type="text" spellcheck="false" placeholder="application (client) id" required>
+        <label for="s-mode">Sign-in</label>
+        <select id="s-mode">
+          <option value="app">app-only (client secret)</option>
+          <option value="delegated">delegated (device code)</option>
+        </select>
+        <label for="s-secret">Client secret</label>
+        <input id="s-secret" type="password" spellcheck="false" placeholder="leave empty to keep">
+        <label for="s-host">mailcow host</label>
+        <input id="s-host" type="text" spellcheck="false" placeholder="mail.example.net" required>
+        <label for="s-apikey">mailcow API key</label>
+        <input id="s-apikey" type="password" spellcheck="false" placeholder="leave empty to keep">
+        <button id="btn-settings-save" type="submit">Save connections</button>
+        <button id="btn-settings-test" type="button">Test connections</button>
+      </form>
+      <p id="settings-msg" class="msg"></p>
+      <ul id="settings-test" class="msg"></ul>
+    </section>
+
     <section>
       <h2>Tenant mailboxes</h2>
       <div class="controls section-block">
@@ -986,12 +1012,98 @@
         $("token-input").focus();
       };
 
+      // ==== connections (settings) ====
+      const settingsMsg = (text, isError) => {
+        const node = $("settings-msg");
+        node.textContent = clean(String(text));
+        node.classList.toggle("error", Boolean(isError));
+      };
+
+      const renderSettings = (data) => {
+        if (!isObject(data) || !isObject(data.microsoft) || !isObject(data.mailcow)) {
+          throw badResponse("/api/settings");
+        }
+        $("s-tenant").value = isStr(data.microsoft.tenant_id) ? data.microsoft.tenant_id : "";
+        $("s-client").value = isStr(data.microsoft.client_id) ? data.microsoft.client_id : "";
+        $("s-mode").value = data.microsoft.auth_mode === "delegated" ? "delegated" : "app";
+        $("s-host").value = isStr(data.mailcow.host) ? data.mailcow.host : "";
+        $("s-secret").value = "";
+        $("s-apikey").value = "";
+        $("s-secret").placeholder = data.microsoft.client_secret_set ? "set (leave empty to keep)" : "required for app-only";
+        $("s-apikey").placeholder = data.mailcow.api_key_set ? "set (leave empty to keep)" : "required";
+        const hint = $("settings-hint");
+        if (data.configured) {
+          hint.textContent = "Saved in " + (isStr(data.path) ? data.path : "the state directory") + " (secrets are never shown again).";
+          hint.classList.remove("error");
+        } else {
+          hint.textContent = "Not configured yet: enter the Entra app registration and the mailcow API key, then save and test.";
+          hint.classList.add("error");
+        }
+      };
+
+      const loadSettings = async () => {
+        renderSettings(await api("GET", "/api/settings"));
+      };
+
+      const saveSettings = async (event) => {
+        event.preventDefault();
+        const body = {
+          microsoft: {
+            tenant_id: $("s-tenant").value.trim(),
+            client_id: $("s-client").value.trim(),
+            auth_mode: $("s-mode").value,
+          },
+          mailcow: { host: $("s-host").value.trim() },
+        };
+        if ($("s-secret").value) {
+          body.microsoft.client_secret = $("s-secret").value;
+        }
+        if ($("s-apikey").value) {
+          body.mailcow.api_key = $("s-apikey").value;
+        }
+        settingsMsg("Saving…", false);
+        try {
+          renderSettings(await api("PUT", "/api/settings", { body }));
+          settingsMsg("Saved. Run \"Test connections\" to check them.", false);
+          clear($("settings-test"));
+          await loadStatus();
+        } catch (err) {
+          settingsMsg(err && err.message ? err.message : String(err), true);
+        }
+      };
+
+      const testSettings = async () => {
+        const list = $("settings-test");
+        clear(list);
+        settingsMsg("Testing…", false);
+        try {
+          const data = await api("POST", "/api/settings/test", { body: {}, timeoutMs: 90000 });
+          for (const [name, result] of Object.entries(isObject(data) ? data : {})) {
+            const ok = isObject(result) ? result.ok : null;
+            const mark = ok === true ? "✓" : ok === false ? "✗" : "…";
+            const message = isObject(result) && isStr(result.message) ? result.message : "";
+            list.appendChild(el("li", { text: mark + " " + name + ": " + message }));
+          }
+          settingsMsg("", false);
+        } catch (err) {
+          settingsMsg(err && err.message ? err.message : String(err), true);
+        }
+      };
+
+      $("settings-form").addEventListener("submit", (event) => {
+        saveSettings(event).catch(reportError);
+      });
+      $("btn-settings-test").addEventListener("click", () => {
+        testSettings().catch(reportError);
+      });
+
       const startApp = async () => {
         state.authFailed = false;
         $("token-section").hidden = true;
         $("app").hidden = false;
 
         await loadStatus().catch(reportError);
+        await loadSettings().catch(reportError);
         await Promise.all([
           loadSelection().catch(reportError),
           loadJobs().catch(reportError),

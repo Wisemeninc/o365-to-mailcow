@@ -61,6 +61,7 @@ from typing import Any, TextIO
 from urllib.parse import parse_qs
 
 from . import __version__, cli
+from . import config as config_mod
 from .auth import AuthError, TokenProvider
 from .config import Config, ConfigError, _read_mailboxes_csv
 from .graph import GraphClient, GraphError
@@ -322,6 +323,19 @@ class Job:
 
 # -- application -----------------------------------------------------------------------
 
+def _toml_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _toml_settings(ms: dict[str, str], mc: dict[str, str]) -> str:
+    lines = ["# written by the web UI; wins over config.toml and the environment", "",
+             "[microsoft]"]
+    lines += [f"{k} = {_toml_string(str(v))}" for k, v in ms.items() if v]
+    lines += ["", "[mailcow]"]
+    lines += [f"{k} = {_toml_string(str(v))}" for k, v in mc.items() if v]
+    return "\n".join(lines) + "\n"
+
+
 class WebApp:
     """What the routes do. ``Handler`` only speaks HTTP and calls into this."""
 
@@ -369,7 +383,118 @@ class WebApp:
             running = {"id": job.id, "command": job.command} if job else None
         return {"version": __version__, "auth_mode": self.cfg.auth_mode,
                 "mailcow_host": self.cfg.mailcow_host, "state_dir": str(self.cfg.state_dir),
-                "selection_path": str(self.selection_path), "running_job": running}
+                "selection_path": str(self.selection_path), "running_job": running,
+                "configured": self._configured()}
+
+    # -- settings (saved to <state_dir>/settings.toml; secrets never returned) ----------
+
+    def _configured(self) -> bool:
+        cfg = self.cfg
+        return bool(cfg.tenant_id and cfg.client_id and cfg.mailcow_host and cfg.mailcow_api_key
+                    and (cfg.auth_mode == "delegated" or cfg.client_secret))
+
+    def settings(self) -> dict[str, Any]:
+        cfg = self.cfg
+        return {
+            "microsoft": {"tenant_id": cfg.tenant_id, "client_id": cfg.client_id,
+                          "auth_mode": cfg.auth_mode,
+                          "client_secret_set": bool(cfg.client_secret)},
+            "mailcow": {"host": cfg.mailcow_host, "api_key_set": bool(cfg.mailcow_api_key)},
+            "path": str(config_mod.settings_path(cfg.state_dir)),
+            "configured": self._configured(),
+        }
+
+    def save_settings(self, body: object) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise HttpError(400, "expected a JSON object")
+        ms = body.get("microsoft") if isinstance(body.get("microsoft"), dict) else {}
+        mc = body.get("mailcow") if isinstance(body.get("mailcow"), dict) else {}
+        current = config_mod.read_settings(self.cfg.state_dir)
+        out_ms = dict(current.get("microsoft", {}))
+        out_mc = dict(current.get("mailcow", {}))
+
+        def ident(value: object, what: str, limit: int = 200) -> str:
+            if not isinstance(value, str) or not value.strip():
+                raise HttpError(400, f"{what} is required")
+            value = value.strip()
+            if len(value) > limit or not all(0x21 <= ord(c) <= 0x7E for c in value):
+                raise HttpError(400, f"{what} must be printable ASCII without spaces")
+            return value
+
+        out_ms["tenant_id"] = ident(ms.get("tenant_id"), "microsoft.tenant_id")
+        out_ms["client_id"] = ident(ms.get("client_id"), "microsoft.client_id")
+        auth_mode = str(ms.get("auth_mode", "app")).lower()
+        if auth_mode not in ("app", "delegated"):
+            raise HttpError(400, "microsoft.auth_mode must be 'app' or 'delegated'")
+        out_ms["auth_mode"] = auth_mode
+        host = ident(mc.get("host"), "mailcow.host", 253)
+        if not config_mod._HOSTNAME.match(host):
+            raise HttpError(400, "mailcow.host must be a bare hostname")
+        out_mc["host"] = host.lower()
+        # secrets: only replaced when a non-empty value is sent; never echoed back
+        for section, key, sent in ((out_ms, "client_secret", ms.get("client_secret")),
+                                   (out_mc, "api_key", mc.get("api_key"))):
+            if isinstance(sent, str) and sent.strip():
+                if len(sent) > 1000 or any(ord(c) < 0x20 for c in sent):
+                    raise HttpError(400, f"{key} has an invalid value")
+                section[key] = sent.strip()
+        if auth_mode == "app" and not out_ms.get("client_secret") and not (
+                os.environ.get(config_mod.ENV_CLIENT_SECRET) or self.cfg.client_secret):
+            raise HttpError(400, "microsoft.client_secret is required for app-only sign-in")
+
+        path = config_mod.settings_path(self.cfg.state_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = _toml_settings(out_ms, out_mc)
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+        self._reload()
+        return self.settings()
+
+    def _reload(self) -> None:
+        """Re-read the effective configuration after settings changed."""
+        cfg = config_mod.load_config(self.config_path, require_mailboxes=False,
+                                     require_credentials=False)
+        with self._lock:
+            self.cfg = cfg
+            self._tokens = None
+            self._tenant = None
+        for value in (cfg.client_secret, cfg.mailcow_api_key):
+            self._secrets.add(value)
+
+    def test_settings(self) -> dict[str, Any]:
+        """Try a Microsoft sign-in, a Graph user listing and a mailcow API call."""
+        result: dict[str, Any] = {}
+        if not self._configured():
+            raise HttpError(400, "save the settings first")
+        if self.cfg.auth_mode == "delegated":
+            result["microsoft"] = {"ok": None, "message": "delegated sign-in happens on the "
+                                   "first job (device code in its output)"}
+            result["graph_users"] = {"ok": None, "message": "checked after sign-in"}
+        else:
+            try:
+                tokens = TokenProvider(self.cfg, out=self.out)
+                tokens.get_token()
+                result["microsoft"] = {"ok": True, "message": "signed in (client credentials)"}
+                try:
+                    next(iter(GraphClient(tokens).iter_pages(
+                        "/users", params={"$select": "id", "$top": "1"})), None)
+                    result["graph_users"] = {"ok": True, "message": "User.Read.All granted"}
+                except (GraphError, OSError, ValueError) as exc:
+                    result["graph_users"] = {"ok": False, "message": self._upstream_error(exc)}
+            except (AuthError, OSError, ValueError) as exc:
+                result["microsoft"] = {"ok": False, "message": self._upstream_error(exc)}
+                result["graph_users"] = {"ok": None, "message": "not checked"}
+        try:
+            api = MailcowApi(self.cfg.mailcow_host, self.cfg.mailcow_api_key,
+                             verify=self.cfg.mailcow_ca_file or True)
+            api.mailbox_exists("probe@example.invalid")
+            result["mailcow"] = {"ok": True, "message": "API key accepted"}
+        except (MailcowError, OSError, ValueError) as exc:
+            result["mailcow"] = {"ok": False, "message": self._upstream_error(exc)}
+        return result
 
     # -- tenant and mailcow ------------------------------------------------------------
 
@@ -659,6 +784,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             _allow(method, "GET")
             return json_response(200, app.status())
+        if path == "/api/settings":
+            _allow(method, "GET", "PUT")
+            if method == "GET":
+                return json_response(200, app.settings())
+            return json_response(200, app.save_settings(_parse_json(body)))
+        if path == "/api/settings/test":
+            _allow(method, "POST")
+            return json_response(200, app.test_settings())
         if path == "/api/tenant/mailboxes":
             _allow(method, "GET")
             return json_response(200, app.tenant_mailboxes(query.get("refresh") == ["1"]))

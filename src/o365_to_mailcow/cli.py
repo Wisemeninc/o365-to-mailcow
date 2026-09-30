@@ -634,7 +634,8 @@ def main(argv: Iterable[str] | None = None, *, stdout: TextIO | None = None,
     opts = Options.from_args(ns)
     try:
         cfg = load_config(opts.config, opts.mailboxes_csv,
-                          require_mailboxes=opts.command != "web")
+                          require_mailboxes=opts.command != "web",
+                          require_credentials=opts.command != "web")
         mailboxes = select_mailboxes(cfg, opts.mailbox)
         cfg.state_dir.mkdir(parents=True, exist_ok=True)
     except (ConfigError, OSError) as exc:

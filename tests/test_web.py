@@ -284,9 +284,52 @@ def test_status_has_settings_and_no_secrets_isc_166(client, tmp_path):
         "version": __version__, "auth_mode": "app", "mailcow_host": "mail.example.net",
         "state_dir": str(tmp_path / "state"),
         "selection_path": str(tmp_path / "state" / "mailboxes.csv"), "running_job": None,
+        "configured": True,
     }
     for secret in SECRETS:
         assert secret not in r.body.decode()
+
+
+# -- settings ----------------------------------------------------------------------------
+
+def test_settings_roundtrip_never_echoes_secrets(client, tmp_path):
+    r = client.get("/api/settings")
+    assert r.status == 200
+    data = r.json()
+    assert data["microsoft"]["client_secret_set"] is True and data["mailcow"]["api_key_set"]
+    for secret in SECRETS:
+        assert secret not in r.body.decode()
+    body = {"microsoft": {"tenant_id": "tenant-2", "client_id": "client-2", "auth_mode": "app",
+                          "client_secret": "new-secret-value-xyz"},
+            "mailcow": {"host": "Mail2.Example.net", "api_key": "new-api-key-value-xyz"}}
+    r = client.put("/api/settings", body)
+    assert r.status == 200, r.body
+    saved = r.json()
+    assert saved["microsoft"]["tenant_id"] == "tenant-2"
+    assert saved["mailcow"]["host"] == "mail2.example.net" and saved["configured"] is True
+    assert "new-secret-value-xyz" not in r.body.decode()
+    path = tmp_path / "state" / "settings.toml"
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    text = path.read_text()
+    assert 'client_secret = "new-secret-value-xyz"' in text
+    assert 'api_key = "new-api-key-value-xyz"' in text
+    # the effective config now uses the saved values, and status reflects the new host
+    assert client.get("/api/status").json()["mailcow_host"] == "mail2.example.net"
+    # saving again without secrets keeps the stored ones
+    body["microsoft"].pop("client_secret")
+    body["mailcow"].pop("api_key")
+    assert client.put("/api/settings", body).status == 200
+    assert "new-secret-value-xyz" in path.read_text()
+
+
+def test_settings_validation(client):
+    bad_host = {"microsoft": {"tenant_id": "t", "client_id": "c", "auth_mode": "app"},
+                "mailcow": {"host": "mail.example.net:993"}}
+    assert client.put("/api/settings", bad_host).status == 400
+    bad_mode = {"microsoft": {"tenant_id": "t", "client_id": "c", "auth_mode": "magic"},
+                "mailcow": {"host": "mail.example.net"}}
+    assert client.put("/api/settings", bad_mode).status == 400
+    assert client.put("/api/settings", []).status == 400
 
 
 # -- tenant listing --------------------------------------------------------------------
