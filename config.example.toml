@@ -33,10 +33,12 @@ state_dir = "/state"
 # a Microsoft 365 source address to a different mailcow destination address.
 mailboxes = [
     "alice@example.net",
-    { source = "bob@contoso.com", destination = "bob@example.net" },
+    { source = "bob@contoso.com", destination = "bob@example.net",
+      name = "Bob Berg", quota_mib = 5120, aliases = ["b.berg@example.net"] },
 ]
-# Optional CSV of "source[,destination[,name[,quota_mib]]]" rows (lines starting with #
-# are ignored), added to the list above; name and quota are used by `provision` only. The --mailboxes option does the same from the command line.
+# Optional CSV of "source[,destination[,name[,quota_mib[,aliases]]]]" rows (lines starting
+# with # are ignored), added to the list above; name, quota and the semicolon-separated
+# aliases are used by `provision` only. The --mailboxes option does the same from the command line.
 # mailboxes_csv = "/config/mailboxes.csv"
 # How many mailboxes are migrated at the same time (each gets its own 4-request Graph cap).
 parallel_mailboxes = 2

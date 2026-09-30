@@ -438,19 +438,21 @@ def test_selection_roundtrip_writes_a_0600_csv_the_cli_reads_isc_159(client, tmp
     assert r.json() == {"path": str(client.selection), "rows": [], "digest": None}
     rows = [
         {"source": " Alice@Contoso.com ", "destination": "Alice@Example.NET",
-         "name": "Alice\x07 Liddell", "quota_mib": 2048},
+         "name": "Alice\x07 Liddell", "quota_mib": 2048,
+         "aliases": ["Alice.Liddell@Example.net", "alice@example.net", "al@example.net"]},
         {"source": "bob@contoso.com", "destination": "robert@example.net",
          "name": 'Smith, Bob "B"', "quota_mib": None},
         {"source": "info@contoso.com", "destination": "info@example.net", "name": None,
          "quota_mib": None},
     ]
-    expected = [
+    expected = [  # aliases: normalised, sorted, the destination itself dropped
         {"source": "alice@contoso.com", "destination": "alice@example.net",
-         "name": "Alice Liddell", "quota_mib": 2048},
+         "name": "Alice Liddell", "quota_mib": 2048,
+         "aliases": ["al@example.net", "alice.liddell@example.net"]},
         {"source": "bob@contoso.com", "destination": "robert@example.net",
-         "name": 'Smith, Bob "B"', "quota_mib": None},
+         "name": 'Smith, Bob "B"', "quota_mib": None, "aliases": []},
         {"source": "info@contoso.com", "destination": "info@example.net", "name": "",
-         "quota_mib": None},
+         "quota_mib": None, "aliases": []},
     ]
     r = client.put("/api/selection", {"path": "/ignored", "rows": rows})
     assert r.status == 200, r.body
@@ -462,7 +464,8 @@ def test_selection_roundtrip_writes_a_0600_csv_the_cli_reads_isc_159(client, tmp
     # exactly the file `--mailboxes` accepts
     cfg = load_config(str(client.conf), mailboxes_csv=str(client.selection))
     assert cfg.mailboxes == (
-        MailboxMapping("alice@contoso.com", "alice@example.net", "Alice Liddell", 2048),
+        MailboxMapping("alice@contoso.com", "alice@example.net", "Alice Liddell", 2048,
+                       ("al@example.net", "alice.liddell@example.net")),
         MailboxMapping("bob@contoso.com", "robert@example.net", 'Smith, Bob "B"', None),
         MailboxMapping("info@contoso.com", "info@example.net", None, None),
     )

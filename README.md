@@ -140,8 +140,17 @@ may call mailcow's `get/domain` and `add/mailbox` endpoints. Rules:
 - The mailbox's **domain must already exist in mailcow** (adding a domain is a DNS
   decision; the tool refuses and tells you).
 - Display name and quota come from the mailbox list: CSV rows are
-  `source,destination,name,quota_mib`, TOML entries accept `name` and `quota_mib`; the
-  defaults are the local part of the address and `provision_quota_mib` (3072).
+  `source,destination,name,quota_mib,aliases`, TOML entries accept `name`, `quota_mib` and
+  `aliases = [...]`; the defaults are the local part of the address and
+  `provision_quota_mib` (3072).
+- **Aliases.** The fifth CSV column (semicolon-separated) lists the mailbox's other
+  addresses; `provision` creates each one as a mailcow alias pointing at the destination
+  mailbox. The web page fills this column from the user's Microsoft 365 proxy addresses,
+  moving aliases in the source's own domain to the destination domain when you changed
+  it. Aliases whose domain is not hosted in mailcow, addresses that already exist as a
+  mailbox, and aliases that already exist are listed and skipped. Distribution lists and
+  Microsoft 365 groups are *not* covered (they are separate objects; create them as
+  mailcow aliases with several targets by hand, see the migration guide).
 - Each mailbox gets a generated 32-character password with **"change password at first
   login"** set (TLS enforcement only with `provision_tls_enforce = true`, because it
   rejects mail from senders without TLS). The passwords are written to
@@ -351,6 +360,7 @@ still produce a few failures per run. If the container's address gets banned, un
 | "Test connections": `microsoft ✗ … AADSTS7000215` (invalid client secret) | The secret *Value* was not copied, or the secret expired. Create a new one under **Certificates & secrets** and enter it in the Connections panel together with the tenant and client ids. |
 | "Test connections": `microsoft ✗ … AADSTS700016` (application not found) | Wrong tenant id or client id: both come from the app's **Overview** page. |
 | "Test connections": `mailcow ✗ … HTTP 401` | API key wrong, API not activated, or this host's IP is not in mailcow's allowed API networks (System → Configuration → Access → API). Enter the key together with the host. |
+| `provision` says `alias … skipped, domain … is not hosted in mailcow` | The alias belongs to a domain you have not added to mailcow (for example `…onmicrosoft.com`). Add the domain in mailcow first if you want the alias, otherwise ignore it. |
 | `Load from Microsoft 365` shows no shared mailboxes | Shared mailboxes are users without a licence; they are listed as kind `shared`. If they are missing entirely they have no `mail` attribute or are guests. |
 | A job fails immediately with `missing required configuration` | Save the Connections panel first (or fill `config.toml`/`.env`); status shows `configured: false` until then. |
 | Phones or mail programs cannot log in to a *provisioned* mailbox | The initial password must be changed at first login in the mailcow UI (`force_pw_update`); mail programs cannot do that. |

@@ -1290,6 +1290,7 @@
           search: mb.search,
           kind: mb.kind,
           enabled: mb.enabled,
+          aliases: mb.aliases,
           tr,
           chk,
           dest,
@@ -1701,7 +1702,10 @@
             quota = entry.quota_mib;
           }
 
-          rows.push({ source, destination, name, quota_mib: quota });
+          const aliases = Array.isArray(entry.aliases)
+            ? entry.aliases.filter((v) => isStr(v)).map((v) => v.trim().toLowerCase())
+            : [];
+          rows.push({ source, destination, name, quota_mib: quota, aliases });
         }
 
         return { path: data.path, rows };
@@ -1861,7 +1865,25 @@
             problems.push(source + ": destination \"" + destination + "\" is not an address");
           }
 
-          rows.push({ source, destination, name, quota_mib: quota });
+          // the mailbox's other addresses become mailcow aliases; when the destination
+          // moved to another domain, aliases in the source's own domain move with it
+          const srcDomain = source.split("@")[1] || "";
+          const dstDomain = destination.toLowerCase().split("@")[1] || "";
+          const aliases = [];
+          for (const alias of row.aliases) {
+            const [local, domain] = alias.toLowerCase().split("@");
+            if (!local || !domain) {
+              continue;
+            }
+            const mapped = domain === srcDomain && dstDomain && dstDomain !== srcDomain
+              ? local + "@" + dstDomain
+              : alias.toLowerCase();
+            if (mapped !== destination.toLowerCase() && !aliases.includes(mapped)) {
+              aliases.push(mapped);
+            }
+          }
+
+          rows.push({ source, destination, name, quota_mib: quota, aliases });
 
           const lower = destination.toLowerCase();
           if (byDest.has(lower)) {
@@ -1877,6 +1899,7 @@
             destination: row.destination,
             name: row.name === undefined ? null : row.name,
             quota_mib: row.quota_mib === undefined ? null : row.quota_mib,
+            aliases: Array.isArray(row.aliases) ? row.aliases : [],
           };
           rows.push(copy);
           const lower = copy.destination.toLowerCase();

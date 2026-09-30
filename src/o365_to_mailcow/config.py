@@ -78,6 +78,7 @@ class MailboxMapping:
     destination: str
     name: str | None = None        # display name for `provision` (else the local part)
     quota_mib: int | None = None   # quota for `provision` (else run.provision_quota_mib)
+    aliases: tuple[str, ...] = ()  # extra addresses `provision` creates as mailcow aliases
 
 
 @dataclass(frozen=True)
@@ -129,7 +130,7 @@ def _read_mailboxes_csv(path: Path) -> list[MailboxMapping]:
         for raw in csv.reader(fh):
             if not raw or raw[0].strip().startswith("#"):
                 continue
-            cols = [c.strip() for c in raw] + ["", "", "", ""]
+            cols = [c.strip() for c in raw] + ["", "", "", "", ""]
             src = cols[0].lower()
             dst = cols[1].lower() or src
             if "@" not in src or "@" not in dst:
@@ -139,7 +140,11 @@ def _read_mailboxes_csv(path: Path) -> list[MailboxMapping]:
                 if not cols[3].isdigit() or not 1 <= int(cols[3]) <= 1_000_000:
                     raise ConfigError(f"invalid quota (MiB) in {path}: {raw!r}")
                 quota = int(cols[3])
-            rows.append(MailboxMapping(src, dst, cols[2] or None, quota))
+            aliases = tuple(sorted({a.strip().lower() for a in cols[4].split(";") if a.strip()}))
+            for alias in aliases:
+                if not valid_address(alias):
+                    raise ConfigError(f"invalid alias {alias!r} in {path}: {raw!r}")
+            rows.append(MailboxMapping(src, dst, cols[2] or None, quota, aliases))
     return rows
 
 
@@ -251,7 +256,15 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
             quota is not None and (isinstance(quota, bool) or not isinstance(quota, int)
                                    or not 1 <= quota <= 1_000_000)):
             raise ConfigError(f"invalid run.mailboxes entry: {entry!r}")
-        mailboxes.append(MailboxMapping(src.strip().lower(), dst.strip().lower(), name, quota))
+        raw_aliases = entry.get("aliases", []) if isinstance(entry, dict) else []
+        if not isinstance(raw_aliases, list) or not all(isinstance(a, str) for a in raw_aliases):
+            raise ConfigError(f"invalid run.mailboxes entry: {entry!r}")
+        aliases = tuple(sorted({a.strip().lower() for a in raw_aliases if a.strip()}))
+        for alias in aliases:
+            if not valid_address(alias):
+                raise ConfigError(f"invalid alias {alias!r} in run.mailboxes entry")
+        mailboxes.append(MailboxMapping(src.strip().lower(), dst.strip().lower(), name, quota,
+                                        aliases))
     if not mailboxes and require_mailboxes:
         missing.append("run.mailboxes (or --mailboxes CSV)")
     # Two mappings onto one destination would share one mailbox's app password and

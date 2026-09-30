@@ -498,3 +498,34 @@ def test_provisioning_endpoints_are_locked_for_every_other_command():
         api.create_mailbox("a@example.net", "A", 1024, "pw")
     with pytest.raises(MailcowError, match="non-allowlisted"):
         api.domain_exists("example.net")
+
+
+def test_provision_creates_aliases_for_hosted_domains_only(world, config, mailcow, tmp_path,
+                                                          capsys):
+    world.created_mailboxes = []
+    world.created_aliases = []
+    _provision_routes(mailcow, world)
+
+    def list_aliases(req):
+        return 200, {}, json.dumps([{"id": 1, "address": "old@example.net",
+                                     "goto": "bob@example.net"}])
+
+    def add_alias(req):
+        world.created_aliases.append(json.loads(req.body))
+        return 200, {}, json.dumps([{"type": "success", "msg": ["alias_added"], "log": []}])
+
+    mailcow.add_callback("GET", API + "get/alias/all", callback=list_aliases)
+    mailcow.add_callback("POST", API + "add/alias", callback=add_alias)
+    csv = tmp_path / "boxes.csv"
+    csv.write_text("bob@contoso.com,bob@example.net,Bob,,"
+                   "b.berg@example.net;old@example.net;bob@other.tld;alice@example.net\n",
+                   encoding="utf-8")
+    # the config lists bob too: --mailboxes-only makes the CSV the whole list
+    assert cli.main(["--config", config(), "--mailboxes", str(csv), "--mailboxes-only",
+                     "provision"]) == 0
+    out = capsys.readouterr().out
+    assert world.created_aliases == [{"address": "b.berg@example.net",
+                                      "goto": "bob@example.net", "active": "1"}]
+    assert "old@example.net: exists" in out                 # already an alias
+    assert "bob@other.tld: skipped, domain other.tld" in out  # not hosted in mailcow
+    assert "alice@example.net: skipped, a mailbox" in out    # an existing mailbox

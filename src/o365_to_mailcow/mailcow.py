@@ -22,8 +22,8 @@ log = logging.getLogger(__name__)
 APP_PASSWORD_NAME = "o365-migration"  # noqa: S105 - a label prefix, not a secret
 PROTOCOLS = ["imap_access", "dav_access"]
 ALLOWED_PREFIXES = ("get/mailbox/", "get/app-passwd/", "add/app-passwd", "delete/app-passwd")
-# only the explicit `provision` command unlocks these two
-PROVISION_PREFIXES = ("get/domain/", "add/mailbox")
+# only the explicit `provision` command unlocks these (matched exactly in _path_allowed)
+PROVISION_PATHS = ("get/domain/<domain>", "add/mailbox", "add/alias", "get/alias/all")
 TIMEOUT = (10.0, 60.0)
 
 
@@ -86,7 +86,7 @@ class MailcowApi:
             return True
         if not self._allow_provision:
             return False
-        if path == "add/mailbox":
+        if path in ("add/mailbox", "add/alias", "get/alias/all"):
             return True
         return path.startswith("get/domain/") and path.count("/") == 2 and path != "get/domain/"
 
@@ -196,6 +196,20 @@ class MailcowApi:
         }
         self._check_result(self._request("POST", "add/mailbox", body), "add/mailbox")
         log.info("created mailbox %s", address)
+
+    def list_aliases(self) -> dict[str, str]:
+        """All alias addresses -> goto (provision only)."""
+        data = self._request("GET", "get/alias/all")
+        out: dict[str, str] = {}
+        for item in data if isinstance(data, list) else []:
+            if isinstance(item, dict) and item.get("address"):
+                out[str(item["address"]).lower()] = str(item.get("goto", ""))
+        return out
+
+    def create_alias(self, address: str, goto: str) -> None:
+        body = {"address": address, "goto": goto, "active": "1"}
+        self._check_result(self._request("POST", "add/alias", body), "add/alias")
+        log.info("created alias %s -> %s", address, goto)
 
     def delete_app_password(self, mailcow_id: str) -> None:
         # mailcow's json_api.php decodes the raw body as the list of ids for every

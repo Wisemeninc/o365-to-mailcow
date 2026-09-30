@@ -588,7 +588,53 @@ def cmd_provision(r: Runner) -> int:
         ledger.close()
         r.say(f"initial passwords written to {ledger.path} (mode 0600); users must change "
               "them at first login. Delete the file once distributed.")
+    errors += _provision_aliases(r, api, domains_ok)
     return 1 if errors else 0
+
+
+def _provision_aliases(r: Runner, api: MailcowApi, domains_ok: dict[str, bool]) -> int:
+    """Create each mailbox's extra addresses as mailcow aliases pointing at it. Aliases in
+    a domain mailcow does not host are listed and skipped; existing addresses (mailboxes
+    or aliases) are left alone."""
+    wanted = [(alias, m) for m in r.mailboxes for alias in m.aliases]
+    if not wanted:
+        return 0
+    errors = 0
+    try:
+        existing = api.list_aliases()
+    except MailcowError as exc:
+        r.say(f"aliases: cannot list existing aliases: {exc}")
+        r.report.error("aliases", f"cannot list aliases: {exc}")
+        return 1
+    created = 0
+    for alias, m in wanted:
+        domain = alias.partition("@")[2]
+        try:
+            if alias in existing:
+                target = existing[alias]
+                note = "" if m.destination in target.split(",") else f" (points at {target})"
+                r.say(f"  alias {alias}: exists{note}")
+                continue
+            if domain not in domains_ok:
+                domains_ok[domain] = api.domain_exists(domain)
+            if not domains_ok[domain]:
+                r.say(f"  alias {alias}: skipped, domain {domain} is not hosted in mailcow")
+                continue
+            if api.mailbox_exists(alias):
+                r.say(f"  alias {alias}: skipped, a mailbox with that address exists")
+                continue
+            if r.opts.dry_run:
+                r.say(f"  alias {alias}: would create -> {m.destination}")
+                continue
+            api.create_alias(alias, m.destination)
+            created += 1
+            r.say(f"  alias {alias}: created -> {m.destination}")
+        except MailcowError as exc:
+            errors += 1
+            log.error("alias %s: %s", alias, exc)
+            r.report.error(m.source, f"alias {alias}: {exc}")
+    r.report.set("aliases", "created", created)
+    return errors
 
 
 class _PasswordLedger:

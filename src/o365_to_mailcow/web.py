@@ -93,7 +93,7 @@ JOB_OPTIONS = frozenset({"command", "dry_run", "only", "mailbox", "sample", "sel
 ALLOWED_METHODS = "GET, POST, PUT"
 NONCE_PLACEHOLDER = "__CSP_NONCE__"
 SELECTION_FILE = "mailboxes.csv"
-SELECTION_HEADER = "# source,destination,name,quota_mib"
+SELECTION_HEADER = "# source,destination,name,quota_mib,aliases (semicolon-separated)"
 USER_FIELDS = ("id,displayName,mail,userPrincipalName,userType,accountEnabled,"
                "assignedLicenses,proxyAddresses")
 PERMISSION_HINT = ("listing tenant users needs the Microsoft Graph permission User.Read.All "
@@ -216,7 +216,16 @@ def _selection_row(row: object, n: int) -> dict[str, Any]:
                               or not 1 <= quota <= MAX_QUOTA_MIB):
         raise HttpError(400, f"row {n}: quota_mib must be null or an integer from 1 to "
                              f"{MAX_QUOTA_MIB}")
-    return {"source": source, "destination": destination, "name": name, "quota_mib": quota}
+    raw_aliases = row.get("aliases", [])
+    if raw_aliases is None:
+        raw_aliases = []
+    if not isinstance(raw_aliases, list) or len(raw_aliases) > 100:
+        raise HttpError(400, f"row {n}: aliases must be a list of at most 100 addresses")
+    aliases = sorted({normalise_address(a, f"row {n}: alias") for a in raw_aliases})
+    if destination in aliases:
+        aliases.remove(destination)
+    return {"source": source, "destination": destination, "name": name, "quota_mib": quota,
+            "aliases": aliases}
 
 
 def tenant_rows(users: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -617,7 +626,7 @@ class WebApp:
         except (ConfigError, OSError, ValueError, csv.Error) as exc:
             raise HttpError(500, f"cannot read {path}: {clean(exc)[:300]}") from exc
         rows = [{"source": m.source, "destination": m.destination, "name": m.name or "",
-                 "quota_mib": m.quota_mib} for m in mappings]
+                 "quota_mib": m.quota_mib, "aliases": list(m.aliases)} for m in mappings]
         return {"path": str(path), "rows": rows, "digest": self._selection_digest()}
 
     def save_selection(self, body: object) -> dict[str, Any]:
@@ -646,7 +655,8 @@ class WebApp:
         writer = csv.writer(buf, lineterminator="\n")
         for r in rows:
             quota = "" if r["quota_mib"] is None else r["quota_mib"]
-            writer.writerow([r["source"], r["destination"], r["name"], quota])
+            writer.writerow([r["source"], r["destination"], r["name"], quota,
+                             ";".join(r.get("aliases", []))])
         path = self.selection_path
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
