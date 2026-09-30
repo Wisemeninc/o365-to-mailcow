@@ -526,6 +526,6 @@ def test_provision_creates_aliases_for_hosted_domains_only(world, config, mailco
     out = capsys.readouterr().out
     assert world.created_aliases == [{"address": "b.berg@example.net",
                                       "goto": "bob@example.net", "active": "1"}]
-    assert "old@example.net: exists" in out                 # already an alias
+    assert "old@example.net: exists -> bob@example.net" in out  # already an alias
     assert "bob@other.tld: skipped, domain other.tld" in out  # not hosted in mailcow
     assert "alice@example.net: skipped, a mailbox" in out    # an existing mailbox

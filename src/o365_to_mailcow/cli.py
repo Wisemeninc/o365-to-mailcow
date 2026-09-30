@@ -620,8 +620,10 @@ def _provision_aliases(r: Runner, api: MailcowApi, domains_ok: dict[str, bool]) 
         try:
             if alias in existing:
                 target = existing[alias]
-                note = "" if m.destination in target.split(",") else f" (points at {target})"
-                r.say(f"  alias {alias}: exists{note}")
+                if m.destination in target.split(","):
+                    r.say(f"  alias {alias}: exists -> {m.destination}")
+                else:
+                    r.say(f"  alias {alias}: exists but points at {target}; left unchanged")
                 continue
             if domain not in domains_ok:
                 domains_ok[domain] = api.domain_exists(domain)
