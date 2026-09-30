@@ -14,6 +14,7 @@ import responses
 from fakes_o365 import FakeDav, FakeGraph, FakeImap, ImapWorld
 from o365_to_mailcow import calendar_sync, cli, contacts_sync
 from o365_to_mailcow.auth import AuthError
+from o365_to_mailcow.mailcow import MailcowApi, MailcowError
 from o365_to_mailcow.state import State
 
 API = "https://mail.example.net/api/v1/"
@@ -435,3 +436,65 @@ def test_app_mode_auth_error_exit_2_plain_message(world, config, mailcow, capsys
     err = capsys.readouterr().err
     assert "Microsoft sign-in failed" in err and "authentication flows" not in err
     assert mailcow_calls(mailcow, "POST") == []
+
+
+# -- provision ---------------------------------------------------------------------------
+
+def _provision_routes(mailcow, world, known_domains=("example.net",)):
+    def get_domain(req):
+        domain = req.url.rsplit("/", 1)[1]
+        return 200, {}, json.dumps({"domain_name": domain} if domain in known_domains else {})
+
+    def add_mailbox(req):
+        body = json.loads(req.body)
+        world.created_mailboxes.append(body)
+        return 200, {}, json.dumps([{"type": "success", "msg": ["mailbox_added"], "log": []}])
+
+    mailcow.add_callback("GET", re.compile(API + "get/domain/.*"), callback=get_domain)
+    mailcow.add_callback("POST", API + "add/mailbox", callback=add_mailbox)
+
+
+def test_provision_creates_missing_mailboxes_and_writes_password_file(world, config, mailcow,
+                                                                      tmp_path, capsys):
+    world.created_mailboxes = []
+    _provision_routes(mailcow, world)
+    # bob@example.net is "known" to the fake get/mailbox; ghost is not
+    csv = tmp_path / "boxes.csv"
+    csv.write_text("ghost@contoso.com,ghost@example.net,Ghost Rider,2048\n", encoding="utf-8")
+    assert cli.main(["--config", config(), "--mailboxes", str(csv), "provision"]) == 0
+    out = capsys.readouterr().out
+    assert "alice@example.net: exists" in out and "ghost@example.net: created" in out
+    assert len(world.created_mailboxes) == 1
+    body = world.created_mailboxes[0]
+    assert body["local_part"] == "ghost" and body["domain"] == "example.net"
+    assert body["name"] == "Ghost Rider" and body["quota"] == "2048"
+    assert body["force_pw_update"] == "1" and body["password"] == body["password2"]
+    files = list((tmp_path / "state").glob("provisioned-*.csv"))
+    assert len(files) == 1 and oct(files[0].stat().st_mode & 0o777) == "0o600"
+    assert f"ghost@example.net,{body['password']}" in files[0].read_text()
+    # the generated password never reaches stdout or the log
+    assert body["password"] not in out
+    logs = "".join(p.read_text() for p in (tmp_path / "state" / "logs").glob("*.log"))
+    assert body["password"] not in logs
+
+
+def test_provision_dry_run_creates_nothing_and_refuses_unknown_domain(world, config, mailcow,
+                                                                     tmp_path, capsys):
+    world.created_mailboxes = []
+    _provision_routes(mailcow, world)
+    csv = tmp_path / "boxes.csv"
+    csv.write_text("ghost@contoso.com,ghost@example.net\nnew@contoso.com,new@other.tld\n",
+                   encoding="utf-8")
+    code = cli.main(["--config", config(), "--mailboxes", str(csv), "--dry-run", "provision"])
+    assert code == 1  # other.tld does not exist in mailcow
+    out = capsys.readouterr().out
+    assert "ghost@example.net: would create" in out and "other.tld does not exist" in out
+    assert world.created_mailboxes == [] and mailcow_calls(mailcow, "POST") == []
+
+
+def test_provisioning_endpoints_are_locked_for_every_other_command():
+    api = MailcowApi("mail.example.net", "key")
+    with pytest.raises(MailcowError, match="non-allowlisted"):
+        api.create_mailbox("a@example.net", "A", 1024, "pw")
+    with pytest.raises(MailcowError, match="non-allowlisted"):
+        api.domain_exists("example.net")

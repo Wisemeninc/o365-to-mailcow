@@ -33,8 +33,8 @@ mailboxes = [
     "alice@example.net",
     { source = "bob@contoso.com", destination = "bob@example.net" },
 ]
-# Optional CSV of "source[,destination]" rows (lines starting with # are ignored), added
-# to the list above. The --mailboxes option does the same from the command line.
+# Optional CSV of "source[,destination[,name[,quota_mib]]]" rows (lines starting with #
+# are ignored), added to the list above; name and quota are used by `provision` only. The --mailboxes option does the same from the command line.
 # mailboxes_csv = "/config/mailboxes.csv"
 # How many mailboxes are migrated at the same time (each gets its own 4-request Graph cap).
 parallel_mailboxes = 2
@@ -51,6 +51,9 @@ contacts_photos = false
 calendar_attendees = "keep"
 # IMAPS port of the mailcow host.
 imap_port = 993
+# Default quota (MiB) for mailboxes created by `o365mig provision` (per-mailbox override:
+# "quota_mib" in a mailboxes table entry, or the 4th CSV column).
+provision_quota_mib = 3072
 # Log level for stderr and state_dir/logs (DEBUG, INFO, WARNING, ERROR); -v forces DEBUG.
 log_level = "INFO"
 # Extra source folders to skip, by display path ("Inbox/Newsletters") or name ("RSS Feeds").

@@ -28,7 +28,13 @@ from .dav import SogoDav
 from .graph import GraphClient
 from .imap_dest import ImapDestination
 from .mail import MailMigrator
-from .mailcow import APP_PASSWORD_NAME, MailcowApi, MailcowError, is_our_app_password
+from .mailcow import (
+    APP_PASSWORD_NAME,
+    MailcowApi,
+    MailcowError,
+    generate_password,
+    is_our_app_password,
+)
 from .report import Progress, RunReport, clean, utc_stamp, verify_summary
 from .state import State
 
@@ -40,6 +46,8 @@ COMMANDS = {
     "migrate": "migrate mail, calendars and contacts (re-runnable)",
     "verify": "compare source and destination counts per folder and calendar",
     "cleanup": f"delete every '{APP_PASSWORD_NAME}-*' app password",
+    "provision": "create missing destination mailboxes in mailcow (opt-in; never part of "
+                 "migrate)",
 }
 
 
@@ -226,8 +234,9 @@ class Runner:
                 self._state = State(self.cfg.state_dir / "state.db")
             return self._state
 
-    def api(self) -> MailcowApi:
-        return MailcowApi(self.cfg.mailcow_host, self.cfg.mailcow_api_key)
+    def api(self, allow_provision: bool = False) -> MailcowApi:
+        return MailcowApi(self.cfg.mailcow_host, self.cfg.mailcow_api_key,
+                          allow_provision=allow_provision)
 
     def graph(self) -> GraphClient:
         """One client per mailbox, so Graph's 4-in-flight limit applies per mailbox."""
@@ -495,8 +504,60 @@ def cmd_cleanup(r: Runner) -> int:
     return 1 if errors else 0
 
 
+def cmd_provision(r: Runner) -> int:
+    """Create the destination mailboxes that do not exist yet. Passwords are generated,
+    written once to a 0600 file in the state directory and never logged; users must change
+    them at first login. Domains are never created."""
+    api = r.api(allow_provision=True)
+    created: list[tuple[str, str]] = []
+    errors = 0
+    domains_ok: dict[str, bool] = {}
+    for m in r.mailboxes:
+        try:
+            if api.mailbox_exists(m.destination):
+                r.say(f"{m.destination}: exists")
+                r.report.set(m.source, "provision", "exists")
+                continue
+            domain = m.destination.partition("@")[2]
+            if domain not in domains_ok:
+                domains_ok[domain] = api.domain_exists(domain)
+            if not domains_ok[domain]:
+                errors += 1
+                msg = f"domain {domain} does not exist in mailcow; add it in the UI first"
+                r.say(f"{m.destination}: {msg}")
+                r.report.error(m.source, msg)
+                continue
+            name = m.name or m.destination.partition("@")[0]
+            quota = m.quota_mib or r.cfg.provision_quota_mib
+            if r.opts.dry_run:
+                r.say(f"{m.destination}: would create ({name!r}, {quota} MiB)")
+                r.report.set(m.source, "provision", "would create")
+                continue
+            password = generate_password()
+            r.secret_filter.add(password)
+            api.create_mailbox(m.destination, name, quota, password)
+            created.append((m.destination, password))
+            r.say(f"{m.destination}: created ({name!r}, {quota} MiB)")
+            r.report.set(m.source, "provision", "created")
+        except MailcowError as exc:
+            errors += 1
+            log.error("%s: provisioning failed: %s", m.destination, exc)
+            r.report.error(m.source, f"provisioning failed: {exc}")
+    if created:
+        path = r.cfg.state_dir / f"provisioned-{utc_stamp()}.csv"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("mailbox,initial_password\n")
+            for address, password in created:
+                fh.write(f"{address},{password}\n")
+        r.say(f"initial passwords written to {path} (mode 0600); users must change them at "
+              "first login. Delete the file once distributed.")
+    return 1 if errors else 0
+
+
 HANDLERS: dict[str, Callable[[Runner], int]] = {
     "plan": cmd_plan, "migrate": cmd_migrate, "verify": cmd_verify, "cleanup": cmd_cleanup,
+    "provision": cmd_provision,
 }
 
 

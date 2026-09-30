@@ -22,6 +22,8 @@ log = logging.getLogger(__name__)
 APP_PASSWORD_NAME = "o365-migration"  # noqa: S105 - a label prefix, not a secret
 PROTOCOLS = ["imap_access", "dav_access"]
 ALLOWED_PREFIXES = ("get/mailbox/", "get/app-passwd/", "add/app-passwd", "delete/app-passwd")
+# only the explicit `provision` command unlocks these two
+PROVISION_PREFIXES = ("get/domain/", "add/mailbox")
 TIMEOUT = (10.0, 60.0)
 
 
@@ -66,7 +68,8 @@ class MailcowApi:
     """Thin client for ``https://{host}/api/v1/``."""
 
     def __init__(self, host: str, api_key: str, session: requests.Session | None = None,
-                 verify: bool = True) -> None:
+                 verify: bool = True, allow_provision: bool = False) -> None:
+        self._allowed = ALLOWED_PREFIXES + (PROVISION_PREFIXES if allow_provision else ())
         self._base = f"https://{host}/api/v1/"
         self._session = session or requests.Session()
         self._session.trust_env = False  # no proxy/netrc surprises for the API key
@@ -77,7 +80,7 @@ class MailcowApi:
     # -- transport ---------------------------------------------------------------------
 
     def _request(self, method: str, path: str, json_body: object | None = None) -> object:
-        if not path.startswith(ALLOWED_PREFIXES):
+        if not path.startswith(self._allowed):
             raise MailcowError(0, f"refusing non-allowlisted endpoint {path.split('/')[0]}/...")
         try:
             resp = self._session.request(
@@ -154,6 +157,30 @@ class MailcowApi:
         newest = max(matches, key=lambda p: _id_key(p["id"]))
         log.info("created app password id=%s for %s", newest["id"], address)
         return str(newest["id"]), pw
+
+    # -- provisioning (opt-in) ---------------------------------------------------------
+
+    def domain_exists(self, domain: str) -> bool:
+        data = self._request("GET", f"get/domain/{quote(domain, safe='')}")
+        return isinstance(data, dict) and str(data.get("domain_name", "")).lower() == domain.lower()
+
+    def create_mailbox(self, address: str, name: str, quota_mib: int, password: str) -> None:
+        """POST add/mailbox: active, TLS enforced, password change required at first login."""
+        local_part, _, domain = address.partition("@")
+        body = {
+            "local_part": local_part,
+            "domain": domain,
+            "name": name,
+            "quota": str(quota_mib),
+            "password": password,
+            "password2": password,
+            "active": "1",
+            "force_pw_update": "1",
+            "tls_enforce_in": "1",
+            "tls_enforce_out": "1",
+        }
+        self._check_result(self._request("POST", "add/mailbox", body), "add/mailbox")
+        log.info("created mailbox %s", address)
 
     def delete_app_password(self, mailcow_id: str) -> None:
         # mailcow's json_api.php decodes the raw body as the list of ids for every

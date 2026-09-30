@@ -63,6 +63,8 @@ def _int(section: dict, key: str, default: int, lo: int, hi: int) -> int:
 class MailboxMapping:
     source: str
     destination: str
+    name: str | None = None        # display name for `provision` (else the local part)
+    quota_mib: int | None = None   # quota for `provision` (else run.provision_quota_mib)
 
 
 @dataclass(frozen=True)
@@ -85,6 +87,7 @@ class Config:
     contacts_photos: bool = False
     calendar_attendees: str = "keep"  # "keep" (with SCHEDULE-AGENT=CLIENT) | "strip"
     imap_port: int = 993
+    provision_quota_mib: int = 3072  # default quota for mailboxes created by `provision`
     log_level: str = "INFO"
     source_folder_skip: tuple[str, ...] = field(default_factory=tuple)
 
@@ -111,11 +114,17 @@ def _read_mailboxes_csv(path: Path) -> list[MailboxMapping]:
         for raw in csv.reader(fh):
             if not raw or raw[0].strip().startswith("#"):
                 continue
-            src = raw[0].strip().lower()
-            dst = (raw[1].strip().lower() if len(raw) > 1 and raw[1].strip() else src)
+            cols = [c.strip() for c in raw] + ["", "", "", ""]
+            src = cols[0].lower()
+            dst = cols[1].lower() or src
             if "@" not in src or "@" not in dst:
                 raise ConfigError(f"invalid mailbox row in {path}: {raw!r}")
-            rows.append(MailboxMapping(src, dst))
+            quota: int | None = None
+            if cols[3]:
+                if not cols[3].isdigit() or not 1 <= int(cols[3]) <= 1_000_000:
+                    raise ConfigError(f"invalid quota (MiB) in {path}: {raw!r}")
+                quota = int(cols[3])
+            rows.append(MailboxMapping(src, dst, cols[2] or None, quota))
     return rows
 
 
@@ -174,7 +183,13 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
             raise ConfigError(f"invalid run.mailboxes entry: {entry!r}")
         if not isinstance(dst, str) or "@" not in src or "@" not in dst:
             raise ConfigError(f"invalid run.mailboxes entry: {entry!r}")
-        mailboxes.append(MailboxMapping(src.strip().lower(), dst.strip().lower()))
+        name = entry.get("name") if isinstance(entry, dict) else None
+        quota = entry.get("quota_mib") if isinstance(entry, dict) else None
+        if (name is not None and not isinstance(name, str)) or (
+            quota is not None and (isinstance(quota, bool) or not isinstance(quota, int)
+                                   or not 1 <= quota <= 1_000_000)):
+            raise ConfigError(f"invalid run.mailboxes entry: {entry!r}")
+        mailboxes.append(MailboxMapping(src.strip().lower(), dst.strip().lower(), name, quota))
     if not mailboxes:
         missing.append("run.mailboxes (or --mailboxes CSV)")
     # Two mappings onto one destination would share one mailbox's app password and
@@ -211,6 +226,7 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         contacts_photos=_bool(run, "contacts_photos", False),
         calendar_attendees=str(run.get("calendar_attendees", "keep")).lower(),
         imap_port=_int(run, "imap_port", 993, 1, 65535),
+        provision_quota_mib=_int(run, "provision_quota_mib", 3072, 1, 1_000_000),
         log_level=str(run.get("log_level", "INFO")).upper(),
         source_folder_skip=tuple(run.get("source_folder_skip", [])),
     )

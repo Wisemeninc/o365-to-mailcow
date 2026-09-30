@@ -104,9 +104,9 @@ for the duration of the migration or switch to app-only.
 3. Save and copy the key into `.env` as `O365MIG_MAILCOW_API_KEY`.
 
 The key could create or delete mailboxes, so the tool refuses every endpoint except
-`get/mailbox`, `get/app-passwd`, `add/app-passwd` and `delete/app-passwd`. It never creates
-mailboxes: **create the destination mailboxes in mailcow first**. Consider deactivating
-the API again after the migration.
+`get/mailbox`, `get/app-passwd`, `add/app-passwd` and `delete/app-passwd`. `migrate` never
+creates mailboxes; either create them in the mailcow UI first or use the separate
+`provision` command below. Consider deactivating the API again after the migration.
 
 ## 3. Configure and run
 
@@ -128,6 +128,28 @@ config file; the tool warns when the config file is readable by other users.
 
 Mailboxes come from `mailboxes = [...]` in the config and/or a CSV passed with
 `--mailboxes` (rows `source[,destination]`; the destination may differ from the source).
+
+### Provisioning mailboxes (optional)
+
+`o365mig provision` creates every destination mailbox that does not exist yet, and only
+those. It is a separate command, never part of `migrate`, and it is the only command that
+may call mailcow's `get/domain` and `add/mailbox` endpoints. Rules:
+
+- The mailbox's **domain must already exist in mailcow** (adding a domain is a DNS
+  decision; the tool refuses and tells you).
+- Display name and quota come from the mailbox list: CSV rows are
+  `source,destination,name,quota_mib`, TOML entries accept `name` and `quota_mib`; the
+  defaults are the local part of the address and `provision_quota_mib` (3072).
+- Each mailbox gets a generated 32-character password with **"change password at first
+  login"** set and TLS enforced. The passwords are written once to
+  `state/provisioned-<timestamp>.csv` (mode 0600) and never logged. Distribute them, then
+  delete the file. Users can enable two-factor authentication themselves afterwards.
+- `--dry-run` shows what would be created and creates nothing.
+
+```sh
+docker compose run --rm o365mig --mailboxes /config/mailboxes.csv provision --dry-run
+docker compose run --rm o365mig --mailboxes /config/mailboxes.csv provision
+```
 
 ### The four commands
 
