@@ -7,6 +7,7 @@ or a mailbox errored, 2 configuration or sign-in error.
 from __future__ import annotations
 
 import argparse
+import csv
 import fcntl
 import logging
 import os
@@ -69,6 +70,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="config TOML (default: $O365MIG_CONFIG)")
     common.add_argument("--mailboxes", metavar="CSV", default=s,
                         help="CSV of source[,destination] addresses (adds to config)")
+    common.add_argument("--mailboxes-only", action="store_true", default=s,
+                        help="use only the --mailboxes CSV, ignoring run.mailboxes in the config")
     common.add_argument("--only", choices=KINDS, default=s,
                         help="restrict to one kind of data")
     common.add_argument("--mailbox", metavar="ADDRESS", default=s,
@@ -96,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
                            help="listen address (default 127.0.0.1; anything else exposes "
                                 "the UI to the network)")
             p.add_argument("--port", type=_port, default=8080, help="port (default 8080)")
+            p.add_argument("--lock-settings", action="store_true",
+                           help="refuse changes to the connection settings from the page")
+            p.add_argument("--allow-host", action="append", default=[], metavar="NAME",
+                           help="extra Host header value to accept (loopback and the bind "
+                                "address are always accepted)")
     return parser
 
 
@@ -105,6 +113,7 @@ class Options:
     config: str | None
     mailboxes_csv: str | None
     only: str | None
+    mailboxes_only: bool
     mailbox: str | None
     dry_run: bool
     keep_app_passwords: bool
@@ -116,6 +125,7 @@ class Options:
         return cls(
             command=ns.command, config=getattr(ns, "config", None),
             mailboxes_csv=getattr(ns, "mailboxes", None), only=getattr(ns, "only", None),
+            mailboxes_only=getattr(ns, "mailboxes_only", False),
             mailbox=getattr(ns, "mailbox", None), dry_run=getattr(ns, "dry_run", False),
             keep_app_passwords=getattr(ns, "keep_app_passwords", False),
             verbose=getattr(ns, "verbose", 0) or 0, sample=getattr(ns, "sample", 0) or 0,
@@ -527,9 +537,9 @@ def cmd_provision(r: Runner) -> int:
     written once to a 0600 file in the state directory and never logged; users must change
     them at first login. Domains are never created."""
     api = r.api(allow_provision=True)
-    created: list[tuple[str, str]] = []
     errors = 0
     domains_ok: dict[str, bool] = {}
+    ledger: _PasswordLedger | None = None  # opened before the first create, never lost
     for m in r.mailboxes:
         try:
             if api.mailbox_exists(m.destination):
@@ -553,24 +563,67 @@ def cmd_provision(r: Runner) -> int:
                 continue
             password = generate_password()
             r.secret_filter.add(password)
-            api.create_mailbox(m.destination, name, quota, password)
-            created.append((m.destination, password))
+            if ledger is None:
+                ledger = _PasswordLedger(r.cfg.state_dir)
+            ledger.write(m.destination, password, "pending")  # on disk before the API call
+            try:
+                api.create_mailbox(m.destination, name, quota, password,
+                                   tls_enforce=r.cfg.provision_tls_enforce)
+            except MailcowError:
+                # the call may have completed server-side (timeout after commit): keep the
+                # row when the mailbox now exists, otherwise mark it failed
+                if api.mailbox_exists(m.destination):
+                    ledger.write(m.destination, password, "created-unconfirmed")
+                else:
+                    ledger.write(m.destination, password, "failed")
+                raise
+            ledger.write(m.destination, password, "created")
             r.say(f"{m.destination}: created ({name!r}, {quota} MiB)")
             r.report.set(m.source, "provision", "created")
         except MailcowError as exc:
             errors += 1
             log.error("%s: provisioning failed: %s", m.destination, exc)
             r.report.error(m.source, f"provisioning failed: {exc}")
-    if created:
-        path = r.cfg.state_dir / f"provisioned-{utc_stamp()}.csv"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write("mailbox,initial_password\n")
-            for address, password in created:
-                fh.write(f"{address},{password}\n")
-        r.say(f"initial passwords written to {path} (mode 0600); users must change them at "
-              "first login. Delete the file once distributed.")
+    if ledger is not None:
+        ledger.close()
+        r.say(f"initial passwords written to {ledger.path} (mode 0600); users must change "
+              "them at first login. Delete the file once distributed.")
     return 1 if errors else 0
+
+
+class _PasswordLedger:
+    """Append-only, fsync'd CSV of generated initial passwords: opened with a unique name
+    before the first mailbox is created, every row written before and after the API call,
+    so an interrupted run never loses a password it already set."""
+
+    def __init__(self, state_dir: Path) -> None:
+        base = state_dir / f"provisioned-{utc_stamp()}"
+        for n in range(1, 1000):
+            path = Path(f"{base}.csv" if n == 1 else f"{base}-{n}.csv")
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | getattr(os, "O_NOFOLLOW", 0), 0o600)
+                break
+            except FileExistsError:
+                continue
+        else:  # pragma: no cover - a thousand runs in one second
+            raise OSError("cannot create a unique provisioned-passwords file")
+        self.path = path
+        self._fh = os.fdopen(fd, "w", encoding="utf-8", newline="")
+        self._csv = csv.writer(self._fh)
+        self._csv.writerow(["mailbox", "initial_password", "status"])
+        self._flush()
+
+    def write(self, address: str, password: str, status: str) -> None:
+        self._csv.writerow([address, password, status])
+        self._flush()
+
+    def _flush(self) -> None:
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+    def close(self) -> None:
+        self._fh.close()
 
 
 HANDLERS: dict[str, Callable[[Runner], int]] = {
@@ -581,7 +634,9 @@ HANDLERS: dict[str, Callable[[Runner], int]] = {
 
 # -- main ------------------------------------------------------------------------------
 
-def cmd_web(cfg: Config, opts: Options, bind: str, port: int, err: TextIO) -> int:
+def cmd_web(cfg: Config, opts: Options, bind: str, port: int, err: TextIO,
+            lock_settings: bool = False, allowed_hosts: list[str] | None = None) -> int:
+    allowed_hosts = allowed_hosts or []
     """Serve the web UI until Ctrl-C (security model: see ``web.py``). Takes no state lock:
     each job started from the page runs ``main`` and takes it then."""
     from . import web  # imported here because web imports this module
@@ -606,11 +661,16 @@ def cmd_web(cfg: Config, opts: Options, bind: str, port: int, err: TextIO) -> in
         if not web.is_loopback(bind):
             web.log.warning("the web UI on %s is reachable from the network; the token is its "
                             "only protection and the connection is not encrypted", bind)
-        print(f"web UI: {web.base_url(bind, port)}/#token={token}", file=err, flush=True)
+        if os.environ.get("O365MIG_WEB_TOKEN"):
+            print(f"web UI: {web.base_url(bind, port)}/#token=<O365MIG_WEB_TOKEN from .env>",
+                  file=err, flush=True)
+        else:
+            print(f"web UI: {web.base_url(bind, port)}/#token={token}", file=err, flush=True)
         page = resources.files(__package__) / "web_static" / "index.html"
         with resources.as_file(page) as page_path:
             web.serve(cfg, bind, port, token, page_path, out=err,
-                      config_path=str(Path(config_path).resolve()) if config_path else None)
+                      config_path=str(Path(config_path).resolve()) if config_path else None,
+                      lock_settings=lock_settings, allowed_hosts=allowed_hosts)
     except OSError as exc:
         print(f"web UI: cannot start on {bind}:{port}: {exc}", file=err)
         return 2
@@ -633,7 +693,7 @@ def main(argv: Iterable[str] | None = None, *, stdout: TextIO | None = None,
     ns = build_parser().parse_args(args)
     opts = Options.from_args(ns)
     try:
-        cfg = load_config(opts.config, opts.mailboxes_csv,
+        cfg = load_config(opts.config, opts.mailboxes_csv, mailboxes_only=opts.mailboxes_only,
                           require_mailboxes=opts.command != "web",
                           require_credentials=opts.command != "web")
         mailboxes = select_mailboxes(cfg, opts.mailbox)
@@ -642,7 +702,8 @@ def main(argv: Iterable[str] | None = None, *, stdout: TextIO | None = None,
         print(f"configuration error: {exc}", file=err)
         return 2
     if opts.command == "web":
-        return cmd_web(cfg, opts, ns.bind, ns.port, err)
+        return cmd_web(cfg, opts, ns.bind, ns.port, err, lock_settings=ns.lock_settings,
+                       allowed_hosts=ns.allow_host)
 
     lock = _acquire_lock(cfg.state_dir)
     if lock is None:

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import hashlib
 import hmac
 import io
 import ipaddress
@@ -82,12 +83,13 @@ MAX_NAME_CHARS = 200
 MAX_QUOTA_MIB = 1_000_000
 MAX_SAMPLE = 10_000
 MAX_OUTPUT_LINES = 50_000
+MAX_OUTPUT_BYTES = 8 * 1024 * 1024  # per job; oldest lines dropped beyond this
 MAX_LINE_CHARS = 4_000
 MAX_PARTIAL_CHARS = 65_536
 TAIL_LINES = 200
 MAX_JOBS_KEPT = 20
 JOB_COMMANDS = ("plan", "provision", "migrate", "verify", "cleanup")
-JOB_OPTIONS = frozenset({"command", "dry_run", "only", "mailbox", "sample"})
+JOB_OPTIONS = frozenset({"command", "dry_run", "only", "mailbox", "sample", "selection_digest"})
 ALLOWED_METHODS = "GET, POST, PUT"
 NONCE_PLACEHOLDER = "__CSP_NONCE__"
 SELECTION_FILE = "mailboxes.csv"
@@ -118,6 +120,13 @@ def page_csp(nonce: str) -> str:
     return (f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
             "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; "
             "frame-ancestors 'none'")
+
+
+def _host_only(value: str) -> str:
+    """``host``, ``host:port``, ``[v6]`` or ``[v6]:port`` -> the bare host."""
+    if value.startswith("["):
+        return value[1:].partition("]")[0]
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
 
 
 def is_loopback(host: str) -> bool:
@@ -249,7 +258,10 @@ class JobOutput:
     caught. An unfinished line is never shown, for the same reason.
     """
 
-    def __init__(self, redact: Callable[[str], str], max_lines: int = MAX_OUTPUT_LINES) -> None:
+    def __init__(self, redact: Callable[[str], str], max_lines: int = MAX_OUTPUT_LINES,
+                 max_bytes: int = MAX_OUTPUT_BYTES) -> None:
+        self._max_bytes = max_bytes
+        self._bytes = 0
         self._redact = redact
         self._lines: deque[str] = deque(maxlen=max_lines)
         self._dropped = 0
@@ -280,6 +292,10 @@ class JobOutput:
                 self._partial = ""
 
     def _store(self, line: str) -> None:  # caller holds the lock
+        self._bytes += len(line)
+        while self._lines and self._bytes > self._max_bytes:
+            self._bytes -= len(self._lines.popleft())
+            self._dropped += 1
         line = self._redact(line.rstrip("\r"))  # redact first: truncation must not split
         if len(line) > MAX_LINE_CHARS:
             line = line[:MAX_LINE_CHARS] + " [line truncated]"
@@ -340,9 +356,12 @@ class WebApp:
     """What the routes do. ``Handler`` only speaks HTTP and calls into this."""
 
     def __init__(self, cfg: Config, token: str, page_template: str,
-                 config_path: str | None = None, out: TextIO | None = None) -> None:
+                 config_path: str | None = None, out: TextIO | None = None,
+                 lock_settings: bool = False) -> None:
         self.cfg = cfg
         self.token = token
+        self.lock_settings = lock_settings  # `web --lock-settings`: PUT /api/settings -> 403
+        self._settings_lock = threading.Lock()
         self.page_template = page_template
         self.config_path = config_path
         self.out = out  # where a delegated sign-in prompt for the tenant listing appears
@@ -405,13 +424,17 @@ class WebApp:
         }
 
     def save_settings(self, body: object) -> dict[str, Any]:
+        """Save connection settings. Rules that keep a token holder from redirecting a
+        credential: a mailcow host is only ever stored together with an API key sent in
+        the same request when it changes, and tenant/client ids only together with a
+        client secret (app-only). Saved values never borrow a secret from the environment
+        or the config file (see ``config.load_config``)."""
+        if self.lock_settings:
+            raise HttpError(403, "settings are locked (web --lock-settings)")
         if not isinstance(body, dict):
             raise HttpError(400, "expected a JSON object")
         ms = body.get("microsoft") if isinstance(body.get("microsoft"), dict) else {}
         mc = body.get("mailcow") if isinstance(body.get("mailcow"), dict) else {}
-        current = config_mod.read_settings(self.cfg.state_dir)
-        out_ms = dict(current.get("microsoft", {}))
-        out_mc = dict(current.get("mailcow", {}))
 
         def ident(value: object, what: str, limit: int = 200) -> str:
             if not isinstance(value, str) or not value.strip():
@@ -421,36 +444,69 @@ class WebApp:
                 raise HttpError(400, f"{what} must be printable ASCII without spaces")
             return value
 
-        out_ms["tenant_id"] = ident(ms.get("tenant_id"), "microsoft.tenant_id")
-        out_ms["client_id"] = ident(ms.get("client_id"), "microsoft.client_id")
+        def secret(value: object, what: str) -> str | None:
+            if not isinstance(value, str) or not value.strip():
+                return None
+            if len(value) > 1000 or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+                raise HttpError(400, f"{what} has an invalid value")
+            return value.strip()
+
+        tenant_id = ident(ms.get("tenant_id"), "microsoft.tenant_id")
+        client_id = ident(ms.get("client_id"), "microsoft.client_id")
         auth_mode = str(ms.get("auth_mode", "app")).lower()
         if auth_mode not in ("app", "delegated"):
             raise HttpError(400, "microsoft.auth_mode must be 'app' or 'delegated'")
-        out_ms["auth_mode"] = auth_mode
-        host = ident(mc.get("host"), "mailcow.host", 253)
-        if not config_mod._HOSTNAME.match(host):
-            raise HttpError(400, "mailcow.host must be a bare hostname")
-        out_mc["host"] = host.lower()
-        # secrets: only replaced when a non-empty value is sent; never echoed back
-        for section, key, sent in ((out_ms, "client_secret", ms.get("client_secret")),
-                                   (out_mc, "api_key", mc.get("api_key"))):
-            if isinstance(sent, str) and sent.strip():
-                if len(sent) > 1000 or any(ord(c) < 0x20 for c in sent):
-                    raise HttpError(400, f"{key} has an invalid value")
-                section[key] = sent.strip()
-        if auth_mode == "app" and not out_ms.get("client_secret") and not (
-                os.environ.get(config_mod.ENV_CLIENT_SECRET) or self.cfg.client_secret):
-            raise HttpError(400, "microsoft.client_secret is required for app-only sign-in")
+        host = ident(mc.get("host"), "mailcow.host", 253).lower()
+        if not config_mod.valid_hostname(host):
+            raise HttpError(400, "mailcow.host must be a bare host name (no IP address)")
+        client_secret = secret(ms.get("client_secret"), "client_secret")
+        api_key = secret(mc.get("api_key"), "api_key")
 
-        path = config_mod.settings_path(self.cfg.state_dir)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        text = _toml_settings(out_ms, out_mc)
-        tmp = path.with_name(path.name + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
-        self._reload()
+        with self._settings_lock:
+            try:
+                current = config_mod.read_settings(self.cfg.state_dir)
+            except ConfigError:
+                current = {}  # a broken file is replaced, never a dead end
+            cur_ms, cur_mc = current.get("microsoft", {}), current.get("mailcow", {})
+            ids_changed = (tenant_id, client_id) != (cur_ms.get("tenant_id"),
+                                                     cur_ms.get("client_id"))
+            if client_secret is None and (ids_changed or not cur_ms.get("client_secret")):
+                if auth_mode == "app":
+                    raise HttpError(400, "enter the client secret together with the tenant "
+                                         "and client ids")
+            if client_secret is None:
+                client_secret = cur_ms.get("client_secret") if not ids_changed else None
+            if api_key is None:
+                if host != cur_mc.get("host") or not cur_mc.get("api_key"):
+                    raise HttpError(400, "enter the mailcow API key together with the host")
+                api_key = cur_mc.get("api_key")
+
+            out_ms = {"tenant_id": tenant_id, "client_id": client_id, "auth_mode": auth_mode}
+            if client_secret:
+                out_ms["client_secret"] = client_secret
+            out_mc = {"host": host, "api_key": api_key}
+            path = config_mod.settings_path(self.cfg.state_dir)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=path.parent)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(_toml_settings(out_ms, out_mc))
+                os.replace(tmp, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
+            changed = [k for k, v in (("tenant_id", tenant_id), ("client_id", client_id),
+                                      ("auth_mode", auth_mode), ("host", host))
+                       if v != {**cur_ms, **cur_mc}.get(k)]
+            if client_secret and client_secret != cur_ms.get("client_secret"):
+                changed.append("client_secret")
+            if api_key != cur_mc.get("api_key"):
+                changed.append("api_key")
+            log.warning("settings saved to %s; changed: %s; mailcow host now %s",
+                        path, ", ".join(changed) or "nothing", host)
+            self._reload()
         return self.settings()
 
     def _reload(self) -> None:
@@ -502,7 +558,9 @@ class WebApp:
         with self._lock:
             tokens = self._tokens
         if tokens is None:  # built outside the lock: MSAL may contact the authority
-            tokens = TokenProvider(self.cfg, out=self.out)
+            # own cache file: a page-started job's TokenProvider writes msal_cache.bin
+            tokens = TokenProvider(self.cfg, cache_path=self.cfg.state_dir / "msal_cache_web.bin",
+                                   out=self.out)
             with self._lock:
                 self._tokens = tokens = self._tokens or tokens
         return tokens
@@ -544,17 +602,23 @@ class WebApp:
 
     # -- selection ---------------------------------------------------------------------
 
+    def _selection_digest(self) -> str | None:
+        try:
+            return hashlib.sha256(self.selection_path.read_bytes()).hexdigest()
+        except OSError:
+            return None
+
     def selection(self) -> dict[str, Any]:
         path = self.selection_path
         if not path.exists():
-            return {"path": str(path), "rows": []}
+            return {"path": str(path), "rows": [], "digest": None}
         try:
             mappings = _read_mailboxes_csv(path)
         except (ConfigError, OSError, ValueError, csv.Error) as exc:
             raise HttpError(500, f"cannot read {path}: {clean(exc)[:300]}") from exc
         rows = [{"source": m.source, "destination": m.destination, "name": m.name or "",
                  "quota_mib": m.quota_mib} for m in mappings]
-        return {"path": str(path), "rows": rows}
+        return {"path": str(path), "rows": rows, "digest": self._selection_digest()}
 
     def save_selection(self, body: object) -> dict[str, Any]:
         rows = body.get("rows") if isinstance(body, dict) else None
@@ -626,8 +690,14 @@ class WebApp:
         if isinstance(sample, bool) or not isinstance(sample, int) or not 0 <= sample <= MAX_SAMPLE:
             raise HttpError(400, f"sample must be an integer from 0 to {MAX_SAMPLE}")
         argv = ["--config", self.config_path] if self.config_path else []
-        if self.selection_path.is_file():  # else the config file's own mailbox list applies
-            argv += ["--mailboxes", str(self.selection_path)]
+        if self.selection_path.is_file():
+            # page-started jobs act on the saved selection alone (never the config's own
+            # list), and only on the selection the operator confirmed
+            digest = body.get("selection_digest")
+            if command != "cleanup" and digest != self._selection_digest():
+                raise HttpError(409, "the saved selection changed since the page loaded it; "
+                                     "reload the selection and start the job again")
+            argv += ["--mailboxes", str(self.selection_path), "--mailboxes-only"]
         argv.append(command)
         if dry_run:
             argv.append("--dry-run")
@@ -654,13 +724,18 @@ class WebApp:
                 raise HttpError(409, f"job {running.id} ({running.command}) is still running")
             self._seq += 1
             job = Job(secrets.token_hex(8), self._seq, command, argv, JobOutput(self.redact))
-            self._jobs[job.id] = job
             finished = sorted((j for j in self._jobs.values() if not j.running),
                               key=lambda j: j.seq)
-            for old in finished[:max(0, len(self._jobs) - MAX_JOBS_KEPT)]:
+            for old in finished[:max(0, len(self._jobs) + 1 - MAX_JOBS_KEPT)]:
                 del self._jobs[old.id]
-            threading.Thread(target=self._run, args=(job,), name=f"job-{job.id}",
-                             daemon=True).start()
+            thread = threading.Thread(target=self._run, args=(job,), name=f"job-{job.id}",
+                                      daemon=True)
+            try:
+                thread.start()
+            except RuntimeError as exc:  # cannot start a thread: never leave a phantom job
+                raise HttpError(503, f"cannot start the job: {exc}") from exc
+            self._jobs[job.id] = job
+            log.info("job %s started: %s", job.id, " ".join(argv))
         return job
 
     def _run(self, job: Job) -> None:
@@ -769,15 +844,36 @@ class Handler(BaseHTTPRequestHandler):
         app = self.server.app
         path, _, query = self.path.partition("?")
         path = path.partition("#")[0]
-        body = self._read_body()
+        self._check_host_and_origin()
         if path == "/":
             _allow(self.command, "GET")
+            self._read_body()
             return app.page()
         if not path.startswith("/api/"):
             raise HttpError(404, "not found")
         if not app.authorized(self.headers.get("Authorization")):
+            self.close_connection = True  # no body is read for an unauthenticated request
             raise HttpError(401, "unauthorized")
-        return self._api(path, parse_qs(query), body)
+        body = self._read_body()
+        response = self._api(path, parse_qs(query), body)
+        if self.command != "GET":
+            log.info("%s %s -> %s", self.command, path, response.status)
+        return response
+
+    def _check_host_and_origin(self) -> None:
+        """DNS rebinding and cross-site defence on top of the token: the Host header must
+        name this server (loopback, its bind address or a plain host name without a port
+        mismatch), and a non-GET request that carries an Origin must come from it."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        hostname = _host_only(host)
+        allowed = self.server.allowed_hosts
+        if hostname and hostname not in allowed and not is_loopback(hostname):
+            raise HttpError(421, "unexpected Host header")
+        origin = self.headers.get("Origin")
+        if origin and self.command != "GET":
+            origin_host = _host_only(origin.split("://", 1)[-1].lower())
+            if origin_host not in allowed and not is_loopback(origin_host):
+                raise HttpError(403, "cross-origin request refused")
 
     def _api(self, path: str, query: dict[str, list[str]], body: bytes) -> Response:
         app, method = self.server.app, self.command
@@ -882,8 +978,12 @@ class Handler(BaseHTTPRequestHandler):
 class WebServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], app: WebApp) -> None:
+    def __init__(self, address: tuple[str, int], app: WebApp,
+                 allowed_hosts: frozenset[str] = frozenset()) -> None:
         self.app = app
+        # Host header values accepted besides loopback: the bind address and any names
+        # the operator passes with --allow-host (e.g. the docker service name)
+        self.allowed_hosts = frozenset(h.lower() for h in allowed_hosts) | {address[0].lower()}
         super().__init__(address, Handler)
 
     def server_bind(self) -> None:
@@ -898,21 +998,26 @@ class WebServer6(WebServer):
 
 
 def make_server(cfg: Config, bind: str, port: int, token: str, page_path: Path, *,
-                config_path: str | None = None, out: TextIO | None = None) -> WebServer:
+                config_path: str | None = None, out: TextIO | None = None,
+                lock_settings: bool = False,
+                allowed_hosts: Iterable[str] = ()) -> WebServer:
     """Read the page and bind (port 0 picks a free port); ``serve_forever`` runs it.
     ``config_path`` is handed to every job; ``out`` receives a delegated sign-in prompt."""
     template = Path(page_path).read_text(encoding="utf-8")
-    app = WebApp(cfg, token, template, config_path=config_path, out=out)
+    app = WebApp(cfg, token, template, config_path=config_path, out=out,
+                 lock_settings=lock_settings)
     server_class = WebServer6 if ":" in bind else WebServer
-    return server_class((bind, port), app)
+    return server_class((bind, port), app, frozenset(allowed_hosts))
 
 
 def serve(cfg: Config, bind: str, port: int, token: str, page_path: Path, *,
-          config_path: str | None = None, out: TextIO | None = None) -> None:
+          config_path: str | None = None, out: TextIO | None = None,
+          lock_settings: bool = False, allowed_hosts: Iterable[str] = ()) -> None:
     """Serve until Ctrl-C. A job still running then stops with the process; like any
     interrupted run it resumes when started again, and a temporary app password it leaves
     behind is removed by the next run for that mailbox or by ``cleanup``."""
-    server = make_server(cfg, bind, port, token, page_path, config_path=config_path, out=out)
+    server = make_server(cfg, bind, port, token, page_path, config_path=config_path, out=out,
+                         lock_settings=lock_settings, allowed_hosts=allowed_hosts)
     try:
         with contextlib.suppress(KeyboardInterrupt):
             server.serve_forever()

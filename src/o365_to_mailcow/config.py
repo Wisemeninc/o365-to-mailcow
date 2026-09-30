@@ -43,6 +43,19 @@ class ConfigError(Exception):
 _HOSTNAME = re.compile(
     r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
 )
+_LOCAL_PART = re.compile(r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$")
+
+
+def valid_hostname(value: str) -> bool:
+    """RFC 1123 host name with a non-numeric top label: never an IPv4 literal."""
+    return bool(_HOSTNAME.match(value)) and not value.rsplit(".", 1)[-1].isdigit()
+
+
+def valid_address(value: str) -> bool:
+    """``local@host`` with a real host name (used for mailbox sources and destinations)."""
+    local, _, domain = value.partition("@")
+    return bool(local) and len(local) <= 64 and bool(_LOCAL_PART.match(local)) \
+        and valid_hostname(domain)
 
 
 def _bool(section: dict, key: str, default: bool) -> bool:
@@ -89,6 +102,7 @@ class Config:
     calendar_attendees: str = "keep"  # "keep" (with SCHEDULE-AGENT=CLIENT) | "strip"
     imap_port: int = 993
     provision_quota_mib: int = 3072  # default quota for mailboxes created by `provision`
+    provision_tls_enforce: bool = False  # mailcow tls_enforce_in/out on created mailboxes
     log_level: str = "INFO"
     source_folder_skip: tuple[str, ...] = field(default_factory=tuple)
 
@@ -151,9 +165,13 @@ def read_settings(state_dir: Path) -> dict[str, dict[str, str]]:
 
 def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str | None = None,
                 env: dict[str, str] | None = None, *, require_mailboxes: bool = True,
-                require_credentials: bool = True) -> Config:
+                require_credentials: bool = True, mailboxes_only: bool = False) -> Config:
     """Precedence for tenant/client ids, hosts and secrets: values saved by the web UI
-    (``<state_dir>/settings.toml``) > environment variables > the config file."""
+    (``<state_dir>/settings.toml``) > environment variables > the config file.
+
+    A saved host is only ever paired with a *saved* key, and saved tenant/client ids only
+    with a saved client secret: the overlay never borrows a secret from the environment or
+    the file, so redirecting the host cannot carry a credential elsewhere."""
     env = dict(os.environ if env is None else env)
     path_str = config_path or env.get(ENV_CONFIG)
     if not path_str:
@@ -182,6 +200,9 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
     for key in ("host", "api_key"):
         if saved_mc.get(key):
             mc[key] = saved_mc[key]
+    if saved_ms or saved_mc:
+        log.warning("using connection settings saved by the web UI from %s (mailcow host %s)",
+                    settings_path(state_dir), mc.get("host", ""))
 
     missing: list[str] = []
 
@@ -195,10 +216,15 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
     tenant_id = req(ms, "tenant_id", "microsoft.tenant_id")
     client_id = req(ms, "client_id", "microsoft.client_id")
     auth_mode = str(ms.get("auth_mode", "app")).lower()
-    client_secret = (saved_ms.get("client_secret") or env.get(ENV_CLIENT_SECRET)
-                     or ms.get("client_secret") or None)
+    if saved_ms.get("tenant_id") or saved_ms.get("client_id"):
+        client_secret = saved_ms.get("client_secret") or None  # paired with saved ids only
+    else:
+        client_secret = env.get(ENV_CLIENT_SECRET) or ms.get("client_secret") or None
     mailcow_host = req(mc, "host", "mailcow.host")
-    api_key = saved_mc.get("api_key") or env.get(ENV_API_KEY) or mc.get("api_key") or ""
+    if saved_mc.get("host"):
+        api_key = saved_mc.get("api_key") or ""  # paired with the saved host only
+    else:
+        api_key = env.get(ENV_API_KEY) or mc.get("api_key") or ""
     if not api_key:
         missing.append(f"mailcow.api_key (or {ENV_API_KEY})")
     if auth_mode == "app" and not client_secret:
@@ -210,7 +236,7 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
     csv_path = mailboxes_csv or run.get("mailboxes_csv")
     if csv_path:
         mailboxes.extend(_read_mailboxes_csv(Path(csv_path)))
-    for entry in run.get("mailboxes", []):
+    for entry in ([] if mailboxes_only and csv_path else run.get("mailboxes", [])):
         if isinstance(entry, str):
             src, dst = entry, entry
         elif isinstance(entry, dict) and isinstance(entry.get("source"), str):
@@ -249,8 +275,11 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
 
     if str(run.get("calendar_attendees", "keep")).lower() not in ("keep", "strip"):
         raise ConfigError("run.calendar_attendees must be 'keep' or 'strip'")
-    if mailcow_host and not _HOSTNAME.match(mailcow_host):
+    if mailcow_host and not valid_hostname(mailcow_host):
         raise ConfigError("mailcow.host must be a bare hostname, e.g. mail.example.net")
+    for m in mailboxes:
+        if not valid_address(m.source) or not valid_address(m.destination):
+            raise ConfigError(f"invalid mailbox address in {m.source} -> {m.destination}")
     ca_file = mc.get("ca_file")
     if ca_file is not None:
         if not isinstance(ca_file, str) or not Path(ca_file).is_file():
@@ -275,6 +304,7 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         calendar_attendees=str(run.get("calendar_attendees", "keep")).lower(),
         imap_port=_int(run, "imap_port", 993, 1, 65535),
         provision_quota_mib=_int(run, "provision_quota_mib", 3072, 1, 1_000_000),
+        provision_tls_enforce=_bool(run, "provision_tls_enforce", False),
         log_level=str(run.get("log_level", "INFO")).upper(),
         source_folder_skip=tuple(run.get("source_folder_skip", [])),
     )

@@ -15,6 +15,7 @@ import stat
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 import responses
@@ -434,7 +435,7 @@ def test_mailcow_check_rejects_bad_input(client, body):
 def test_selection_roundtrip_writes_a_0600_csv_the_cli_reads_isc_159(client, tmp_path):
     r = client.get("/api/selection")
     assert r.status == 200
-    assert r.json() == {"path": str(client.selection), "rows": []}
+    assert r.json() == {"path": str(client.selection), "rows": [], "digest": None}
     rows = [
         {"source": " Alice@Contoso.com ", "destination": "Alice@Example.NET",
          "name": "Alice\x07 Liddell", "quota_mib": 2048},
@@ -520,13 +521,18 @@ def test_job_runs_cli_main_and_captures_output_isc_160_161(client, monkeypatch):
 
     monkeypatch.setattr(cli, "main", fake_main)
     assert client.put("/api/selection", {"rows": [GOOD]}).status == 200
+    digest = client.get("/api/selection").json()["digest"]
+    # a job must name the selection it was confirmed against (M2: no TOCTOU on the list)
+    stale = client.post("/api/jobs", {"command": "plan", "dry_run": True, "only": None,
+                                      "mailbox": None, "sample": 0, "selection_digest": "x"})
+    assert stale.status == 409
     r = client.post("/api/jobs", {"command": "plan", "dry_run": True, "only": None,
-                                  "mailbox": None, "sample": 0})
+                                  "mailbox": None, "sample": 0, "selection_digest": digest})
     assert r.status == 202, r.body
     job_id = r.json()["id"]
     job = wait_job(client, job_id)
     assert seen["argv"] == ["--config", str(client.conf), "--mailboxes", str(client.selection),
-                            "plan", "--dry-run"]
+                            "--mailboxes-only", "plan", "--dry-run"]
     assert job["exit_code"] == 0 and job["running"] is False
     assert job["command"] == "plan" and job["args"] == seen["argv"]
     assert job["started"] <= job["finished"]
@@ -712,7 +718,7 @@ def test_runner_sends_prompts_and_progress_to_the_given_streams(tmp_path, monkey
 
     monkeypatch.setattr(cli, "TokenProvider", Tokens)
     out, err = io.StringIO(), io.StringIO()
-    opts = cli.Options("plan", None, None, None, None, False, False, 0, 0)
+    opts = cli.Options("plan", None, None, None, None, False, False, 0, 0, False)
     runner = cli.Runner(make_config(tmp_path), opts, [], cli.SecretFilter(), out=out, err=err)
     assert runner.tokens and seen["out"] is out  # device-code prompt goes to the job's stdout
     runner.progress.start("alice", 3)
@@ -726,7 +732,9 @@ def test_cli_web_prints_the_url_and_serves_isc_155(conf, monkeypatch):
     monkeypatch.setenv("O365MIG_WEB_TOKEN", TOKEN)
     err = io.StringIO()
     assert cli.main(["--config", str(conf), "web", "--port", "8099"], stderr=err) == 0
-    assert f"web UI: http://127.0.0.1:8099/#token={TOKEN}\n" in err.getvalue()
+    # a token that came from the environment is not repeated in the log
+    assert "web UI: http://127.0.0.1:8099/#token=<O365MIG_WEB_TOKEN from .env>\n" in err.getvalue()
+    assert TOKEN not in err.getvalue()
     assert "WARNING" not in err.getvalue()
     (cfg, bind, port, token, page), kw = calls[0]
     assert (bind, port, token) == ("127.0.0.1", 8099, TOKEN)
@@ -782,3 +790,97 @@ def test_serve_binds_serves_and_stops_on_keyboard_interrupt(tmp_path, monkeypatc
     web.serve(cfg, "127.0.0.1", 0, TOKEN, page)  # returns instead of raising
     with pytest.raises(OSError):
         web.serve(cfg, "127.0.0.1", 0, TOKEN, tmp_path / "missing.html")
+
+
+# -- hardening after the security review of the web UI ------------------------------------
+
+def test_host_change_requires_the_api_key_in_the_same_request(client, tmp_path):
+    """A token holder must not be able to point the stored API key at another host."""
+    base = {"microsoft": {"tenant_id": "t1", "client_id": "c1", "auth_mode": "app",
+                          "client_secret": "secret-one-value"},
+            "mailcow": {"host": "mail.example.net", "api_key": "key-one-value"}}
+    assert client.put("/api/settings", base).status == 200
+    moved = {"microsoft": base["microsoft"], "mailcow": {"host": "attacker.example"}}
+    r = client.put("/api/settings", moved)
+    assert r.status == 400 and b"API key together with the host" in r.body
+    assert "attacker.example" not in (tmp_path / "state" / "settings.toml").read_text()
+    # same for the tenant/client ids and the client secret
+    ids = {"microsoft": {"tenant_id": "t2", "client_id": "c2", "auth_mode": "app"},
+           "mailcow": {"host": "mail.example.net"}}
+    r = client.put("/api/settings", ids)
+    assert r.status == 400 and b"client secret together" in r.body
+    # with the paired secrets the change is accepted
+    moved["mailcow"]["api_key"] = "key-two-value"
+    assert client.put("/api/settings", moved).status == 200
+    text = (tmp_path / "state" / "settings.toml").read_text()
+    assert 'host = "attacker.example"' in text and 'api_key = "key-two-value"' in text
+    assert "key-one-value" not in text
+
+
+def test_settings_reject_ip_literals_and_del_characters(client):
+    body = {"microsoft": {"tenant_id": "t", "client_id": "c", "auth_mode": "app",
+                          "client_secret": "s3cret-value"},
+            "mailcow": {"host": "169.254.169.254", "api_key": "key-value"}}
+    assert client.put("/api/settings", body).status == 400
+    body["mailcow"]["host"] = "mail.example.net"
+    body["mailcow"]["api_key"] = "key\x7fvalue"
+    assert client.put("/api/settings", body).status == 400
+
+
+def test_saved_host_never_borrows_a_secret_from_env_or_file(tmp_path, conf, monkeypatch):
+    """config.load_config pairs a saved host only with a saved key (H1)."""
+    from o365_to_mailcow import config as config_mod
+
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "settings.toml").write_text('[mailcow]\nhost = "other.example.net"\n')
+    with pytest.raises(config_mod.ConfigError, match="mailcow.api_key"):
+        config_mod.load_config(str(conf), require_mailboxes=False)
+    cfg = config_mod.load_config(str(conf), require_mailboxes=False, require_credentials=False)
+    assert cfg.mailcow_host == "other.example.net" and cfg.mailcow_api_key == ""
+
+
+def test_host_header_and_origin_are_checked(client):
+    r = client.get("/api/status", headers={"Host": "rebind.attacker.example"})
+    assert r.status == 421
+    r = client.post("/api/mailcow/check", {"addresses": []},
+                    headers={"Origin": "https://evil.example"})
+    assert r.status == 403
+    r = client.post("/api/mailcow/check", {"addresses": []},
+                    headers={"Origin": "http://127.0.0.1:1234"})
+    assert r.status == 200
+
+
+def test_unauthenticated_requests_do_not_read_the_body(client):
+    r = client.request("POST", "/api/jobs", token=None,
+                       headers={"Content-Length": "5000000"}, raw=b"x")
+    assert r.status == 401
+
+
+def test_lock_settings_refuses_changes(tmp_path, conf, graph, monkeypatch):
+    from o365_to_mailcow import config as config_mod
+
+    cfg = config_mod.load_config(str(conf), require_mailboxes=False)
+    page = Path(web.__file__).parent / "web_static" / "index.html"
+    srv = web.make_server(cfg, "127.0.0.1", 0, TOKEN, page, config_path=str(conf),
+                          lock_settings=True)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        c = Client(srv.server_address[1])
+        body = {"microsoft": {"tenant_id": "t", "client_id": "c", "auth_mode": "app",
+                              "client_secret": "s"}, "mailcow": {"host": "mail.example.net",
+                                                                  "api_key": "k"}}
+        assert c.put("/api/settings", body).status == 403
+        assert c.get("/api/settings").status == 200
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_job_output_is_byte_capped():
+    out = web.JobOutput(lambda t: t, max_lines=10_000, max_bytes=1000)
+    for i in range(200):
+        out.write(f"line {i:04d} " + "x" * 40 + "\n")
+    text = out.text()
+    assert len(text) <= 1400 and "line 0199" in text and "line 0000" not in text

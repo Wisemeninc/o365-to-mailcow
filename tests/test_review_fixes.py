@@ -242,7 +242,7 @@ def test_duplicate_destination_rejected_silas_m3(tmp_path):
 
 
 def test_tls_toggle_is_gone_silas_m1(tmp_path):
-    path = _write(tmp_path, 'mailboxes = ["a@x"]\nverify_tls = false\n')
+    path = _write(tmp_path, 'mailboxes = ["a@example.net"]\nverify_tls = false\n')
     cfg = config.load_config(path, env=ENV)
     assert not hasattr(cfg, "verify_tls")
 
@@ -251,17 +251,17 @@ def test_tls_toggle_is_gone_silas_m1(tmp_path):
 def test_bad_hostnames_rejected_silas_l8(tmp_path, host):
     p = tmp_path / "c.toml"
     p.write_text(f'[microsoft]\ntenant_id = "t"\nclient_id = "c"\n[mailcow]\nhost = "{host}"\n'
-                 f'[run]\nmailboxes = ["a@x"]\n', encoding="utf-8")
+                 f'[run]\nmailboxes = ["a@example.net"]\n', encoding="utf-8")
     os.chmod(p, 0o600)
     with pytest.raises(ConfigError, match="bare hostname"):
         config.load_config(str(p), env=ENV)
 
 
 def test_non_boolean_and_out_of_range_values_rejected(tmp_path):
-    bad_bool = _write(tmp_path, 'mailboxes = ["a@x"]\ncontacts_photos = "false"\n')
+    bad_bool = _write(tmp_path, 'mailboxes = ["a@example.net"]\ncontacts_photos = "false"\n')
     with pytest.raises(ConfigError, match="true or false"):
         config.load_config(bad_bool, env=ENV)
-    too_many = _write(tmp_path, 'mailboxes = ["a@x"]\nparallel_mailboxes = 50\n')
+    too_many = _write(tmp_path, 'mailboxes = ["a@example.net"]\nparallel_mailboxes = 50\n')
     with pytest.raises(ConfigError, match="between 1 and 4"):
         config.load_config(too_many, env=ENV)
 

@@ -71,7 +71,7 @@ class MailcowApi:
                  verify: bool | str = True, allow_provision: bool = False) -> None:
         """``verify`` is True (system CAs) or the path of a private CA bundle; never False
         outside tests."""
-        self._allowed = ALLOWED_PREFIXES + (PROVISION_PREFIXES if allow_provision else ())
+        self._allow_provision = allow_provision
         self._base = f"https://{host}/api/v1/"
         self._session = session or requests.Session()
         self._session.trust_env = False  # no proxy/netrc surprises for the API key
@@ -81,8 +81,17 @@ class MailcowApi:
 
     # -- transport ---------------------------------------------------------------------
 
+    def _path_allowed(self, path: str) -> bool:
+        if path.startswith(ALLOWED_PREFIXES):
+            return True
+        if not self._allow_provision:
+            return False
+        if path == "add/mailbox":
+            return True
+        return path.startswith("get/domain/") and path.count("/") == 2 and path != "get/domain/"
+
     def _request(self, method: str, path: str, json_body: object | None = None) -> object:
-        if not path.startswith(self._allowed):
+        if not self._path_allowed(path):
             raise MailcowError(0, f"refusing non-allowlisted endpoint {path.split('/')[0]}/...")
         try:
             resp = self._session.request(
@@ -163,11 +172,15 @@ class MailcowApi:
     # -- provisioning (opt-in) ---------------------------------------------------------
 
     def domain_exists(self, domain: str) -> bool:
+        if not domain:
+            return False
         data = self._request("GET", f"get/domain/{quote(domain, safe='')}")
         return isinstance(data, dict) and str(data.get("domain_name", "")).lower() == domain.lower()
 
-    def create_mailbox(self, address: str, name: str, quota_mib: int, password: str) -> None:
-        """POST add/mailbox: active, TLS enforced, password change required at first login."""
+    def create_mailbox(self, address: str, name: str, quota_mib: int, password: str,
+                       tls_enforce: bool = False) -> None:
+        """POST add/mailbox: active, password change required at first login; TLS
+        enforcement only when asked (it rejects mail from MTAs without TLS)."""
         local_part, _, domain = address.partition("@")
         body = {
             "local_part": local_part,
@@ -178,8 +191,8 @@ class MailcowApi:
             "password2": password,
             "active": "1",
             "force_pw_update": "1",
-            "tls_enforce_in": "1",
-            "tls_enforce_out": "1",
+            "tls_enforce_in": "1" if tls_enforce else "0",
+            "tls_enforce_out": "1" if tls_enforce else "0",
         }
         self._check_result(self._request("POST", "add/mailbox", body), "add/mailbox")
         log.info("created mailbox %s", address)

@@ -597,6 +597,7 @@
         status: null,
         statusGen: 0,
         savedRows: [],
+        selectionDigest: null,
         selectionPath: "",
         tenantLoaded: false,
         rows: [],
@@ -1711,6 +1712,7 @@
         const parsed = validateSelection(data);
         state.savedRows = parsed.rows;
         state.selectionPath = parsed.path;
+        state.selectionDigest = isObject(data) && isStr(data.digest) ? data.digest : null;
         renderSaved();
         if (state.tenantLoaded) {
           if (!state.dirty) {
@@ -2138,21 +2140,26 @@
           }
         }
 
-        if (!dryRun && (command === "provision" || command === "migrate" || command === "cleanup")) {
+        const realRun = !dryRun && (command === "provision" || command === "migrate"
+          || command === "cleanup" || command === "verify");
+        if (realRun) {
+          // jobs started here act on the saved selection only (never the config's list)
           const n = state.savedRows.length;
           const what = mailbox
             ? "1 mailbox (" + mailbox + ")"
             : n === 0
-              ? "the mailboxes from the config file (the saved selection is empty)"
+              ? "the mailboxes from the config file (no selection is saved)"
               : n === 1
-                ? "the 1 selected mailbox"
-                : "the " + String(n) + " selected mailboxes";
+                ? "the 1 saved mailbox"
+                : "the " + String(n) + " saved mailboxes";
           const scope = only ? " (only " + only + ")" : "";
           let text = "";
           if (command === "provision") {
             text = "Provision " + what + " in mailcow for real? This creates mailboxes.";
           } else if (command === "migrate") {
             text = "Migrate " + what + scope + " for real? This writes to mailcow.";
+          } else if (command === "verify") {
+            text = "Verify " + what + scope + "? This creates temporary app passwords.";
           } else {
             text = "Clean up " + what + " for real? This deletes the o365-migration app passwords.";
           }
@@ -2173,6 +2180,7 @@
               only,
               mailbox,
               sample,
+              selection_digest: state.selectionDigest,
             },
           });
           if (!isObject(r) || !(isStr(r.id) || isNum(r.id))) {
