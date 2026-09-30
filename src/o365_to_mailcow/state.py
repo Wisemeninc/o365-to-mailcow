@@ -29,6 +29,12 @@ CREATE TABLE IF NOT EXISTS app_passwords (
 CREATE TABLE IF NOT EXISTS folder_delta (
     mailbox TEXT NOT NULL, folder_id TEXT NOT NULL, delta_link TEXT NOT NULL,
     updated_at REAL NOT NULL, PRIMARY KEY (mailbox, folder_id));
+CREATE TABLE IF NOT EXISTS folder_meta (
+    mailbox TEXT NOT NULL, folder_id TEXT NOT NULL, dest_name TEXT NOT NULL,
+    uidvalidity INTEGER, updated_at REAL NOT NULL, PRIMARY KEY (mailbox, folder_id));
+CREATE TABLE IF NOT EXISTS collections (
+    mailbox TEXT NOT NULL, kind TEXT NOT NULL, source_id TEXT NOT NULL, slug TEXT NOT NULL,
+    updated_at REAL NOT NULL, PRIMARY KEY (mailbox, kind, source_id));
 CREATE TABLE IF NOT EXISTS events (
     mailbox TEXT NOT NULL, calendar TEXT NOT NULL, uid TEXT NOT NULL,
     last_modified TEXT, status TEXT NOT NULL, error TEXT, updated_at REAL NOT NULL,
@@ -82,12 +88,47 @@ class State:
         )
 
     def folder_uidvalidity(self, mailbox: str, folder_id: str) -> int | None:
+        """UIDVALIDITY last seen for a folder: folder_meta first, else the newest message."""
+        row = self._exec(
+            "SELECT uidvalidity FROM folder_meta WHERE mailbox=? AND folder_id=? "
+            "AND uidvalidity IS NOT NULL",
+            (mailbox, folder_id),
+        ).fetchone()
+        if row:
+            return row[0]
         row = self._exec(
             "SELECT uidvalidity FROM messages WHERE mailbox=? AND folder_id=? "
             "AND uidvalidity IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
             (mailbox, folder_id),
         ).fetchone()
         return row[0] if row else None
+
+    def set_folder_meta(self, mailbox: str, folder_id: str, dest_name: str,
+                        uidvalidity: int | None) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO folder_meta VALUES (?,?,?,?,?)",
+            (mailbox, folder_id, dest_name, uidvalidity, time.time()),
+        )
+
+    def done_count_for_message_id(self, mailbox: str, folder_id: str, message_id: str) -> int:
+        """How many source items with this Message-ID are already recorded done here."""
+        row = self._exec(
+            "SELECT COUNT(*) FROM messages WHERE mailbox=? AND folder_id=? "
+            "AND message_id=? AND status=?",
+            (mailbox, folder_id, message_id, STATUS_DONE),
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def message_counts_by_folder_id(self, mailbox: str) -> dict[str, dict[str, int]]:
+        """{folder_id: {status: count}} for one mailbox (verify keys on the source folder)."""
+        out: dict[str, dict[str, int]] = {}
+        for folder_id, status, n in self._exec(
+            "SELECT folder_id, status, COUNT(*) FROM messages WHERE mailbox=? "
+            "GROUP BY folder_id, status",
+            (mailbox,),
+        ):
+            out.setdefault(folder_id, {})[status] = n
+        return out
 
     def done_message_ids(self, mailbox: str, folder_id: str) -> set[str]:
         return {
@@ -134,6 +175,28 @@ class State:
         self._exec(
             "INSERT OR REPLACE INTO folder_delta VALUES (?,?,?,?)",
             (mailbox, folder_id, delta_link, time.time()),
+        )
+
+    def clear_delta(self, mailbox: str, folder_id: str) -> None:
+        """Forget an expired delta link so the next pass lists the folder fully."""
+        self._exec(
+            "DELETE FROM folder_delta WHERE mailbox=? AND folder_id=?", (mailbox, folder_id)
+        )
+
+    # -- collection slugs (calendars, address books) -----------------------------------
+
+    def collection_slugs(self, mailbox: str, kind: str) -> dict[str, str]:
+        return {
+            r[0]: r[1] for r in self._exec(
+                "SELECT source_id, slug FROM collections WHERE mailbox=? AND kind=?",
+                (mailbox, kind),
+            )
+        }
+
+    def set_collection_slug(self, mailbox: str, kind: str, source_id: str, slug: str) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO collections VALUES (?,?,?,?,?)",
+            (mailbox, kind, source_id, slug, time.time()),
         )
 
     # -- events ------------------------------------------------------------------------

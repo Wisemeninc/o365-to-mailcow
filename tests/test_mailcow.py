@@ -54,18 +54,42 @@ def test_list_app_passwords_handles_empty_object(api):
 def test_create_app_password_payload_and_newest_id_isc_92(api):
     responses.post(BASE + "add/app-passwd",
                    json=[{"type": "success", "msg": ["app_passwd_added"], "log": []}])
+    name = APP_PASSWORD_NAME + "-cafe0123"
     responses.get(BASE + "get/app-passwd/all/alice@example.net", json=[
-        {"id": 3, "name": APP_PASSWORD_NAME}, {"id": 12, "name": APP_PASSWORD_NAME},
+        {"id": 3, "name": name}, {"id": 12, "name": name},
         {"id": 40, "name": "thunderbird"},
+        {"id": 41, "name": name, "mailbox": "bob@example.net"},  # not ours: other mailbox
     ])
-    mid, pw = api.create_app_password("alice@example.net")
+    mid, pw = api.create_app_password("alice@example.net", name=name)
     assert mid == "12"
     body = json.loads(responses.calls[0].request.body)
     assert body == {
-        "username": "alice@example.net", "app_name": "o365-migration", "app_passwd": pw,
+        "username": "alice@example.net", "app_name": name, "app_passwd": pw,
         "app_passwd2": pw, "active": "1", "protocols": ["imap_access", "dav_access"],
     }
     assert len(pw) == 32
+
+
+@responses.activate
+def test_default_name_is_unique_per_run(api):
+    responses.post(BASE + "add/app-passwd",
+                   json=[{"type": "success", "msg": ["app_passwd_added"], "log": []}])
+    seen: list[str] = []
+
+    def listing(req):
+        return 200, {}, json.dumps([{"id": len(seen) + 1, "name": seen[-1]}])
+
+    def capture(req):
+        seen.append(json.loads(req.body)["app_name"])
+        return 200, {}, json.dumps([{"type": "success", "msg": ["ok"], "log": []}])
+
+    responses.reset()
+    responses.add_callback("POST", BASE + "add/app-passwd", callback=capture)
+    responses.add_callback("GET", BASE + "get/app-passwd/all/alice@example.net",
+                           callback=listing)
+    api.create_app_password("alice@example.net")
+    api.create_app_password("alice@example.net")
+    assert len(set(seen)) == 2 and all(n.startswith(APP_PASSWORD_NAME + "-") for n in seen)
     assert_only_allowed_endpoints()
 
 

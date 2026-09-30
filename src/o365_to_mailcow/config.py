@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import logging
 import os
+import re
 import stat
 import tomllib
 from dataclasses import dataclass, field
@@ -38,6 +39,26 @@ class ConfigError(Exception):
     """Raised for any invalid or incomplete configuration. CLI maps this to exit code 2."""
 
 
+# RFC 1123 hostname (labels of letters, digits, hyphens; dots between), no port, no path.
+_HOSTNAME = re.compile(
+    r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))+$"
+)
+
+
+def _bool(section: dict, key: str, default: bool) -> bool:
+    value = section.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"run.{key} must be true or false, got {value!r}")
+    return value
+
+
+def _int(section: dict, key: str, default: int, lo: int, hi: int) -> int:
+    value = section.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi:
+        raise ConfigError(f"run.{key} must be an integer between {lo} and {hi}, got {value!r}")
+    return value
+
+
 @dataclass(frozen=True)
 class MailboxMapping:
     source: str
@@ -63,7 +84,6 @@ class Config:
     calendar_exceptions_to_days: int = 1095
     contacts_photos: bool = False
     calendar_attendees: str = "keep"  # "keep" (with SCHEDULE-AGENT=CLIENT) | "strip"
-    verify_tls: bool = True  # exists only so tests can point at a local server; default True
     imap_port: int = 993
     log_level: str = "INFO"
     source_folder_skip: tuple[str, ...] = field(default_factory=tuple)
@@ -144,21 +164,30 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         mailboxes.extend(_read_mailboxes_csv(Path(csv_path)))
     for entry in run.get("mailboxes", []):
         if isinstance(entry, str):
-            mailboxes.append(MailboxMapping(entry.lower(), entry.lower()))
-        elif isinstance(entry, dict) and "source" in entry:
-            dest = entry.get("destination", entry["source"])
-            mailboxes.append(MailboxMapping(entry["source"].lower(), dest.lower()))
+            src, dst = entry, entry
+        elif isinstance(entry, dict) and isinstance(entry.get("source"), str):
+            src, dst = entry["source"], entry.get("destination", entry["source"])
         else:
             raise ConfigError(f"invalid run.mailboxes entry: {entry!r}")
+        if not isinstance(dst, str) or "@" not in src or "@" not in dst:
+            raise ConfigError(f"invalid run.mailboxes entry: {entry!r}")
+        mailboxes.append(MailboxMapping(src.strip().lower(), dst.strip().lower()))
     if not mailboxes:
         missing.append("run.mailboxes (or --mailboxes CSV)")
+    # Two mappings onto one destination would share one mailbox's app password and
+    # IMAP folders from two threads; refuse rather than race (Silas M3).
+    seen_dst: set[str] = set()
+    for m in mailboxes:
+        if m.destination in seen_dst:
+            raise ConfigError(f"destination mailbox {m.destination} is listed more than once")
+        seen_dst.add(m.destination)
 
     if missing:
         raise ConfigError("missing required configuration: " + ", ".join(missing))
 
     if str(run.get("calendar_attendees", "keep")).lower() not in ("keep", "strip"):
         raise ConfigError("run.calendar_attendees must be 'keep' or 'strip'")
-    if "/" in mailcow_host or ":" in mailcow_host:
+    if mailcow_host and not _HOSTNAME.match(mailcow_host):
         raise ConfigError("mailcow.host must be a bare hostname, e.g. mail.example.net")
 
     state_dir = Path(run.get("state_dir", "/state"))
@@ -171,14 +200,14 @@ def load_config(config_path: str | os.PathLike[str] | None, mailboxes_csv: str |
         mailcow_api_key=api_key,
         state_dir=state_dir,
         mailboxes=tuple(mailboxes),
-        parallel_mailboxes=int(run.get("parallel_mailboxes", 2)),
-        max_message_bytes=int(run.get("max_message_bytes", 150 * 1024 * 1024)),
-        calendar_exceptions_from_days=int(run.get("calendar_exceptions_from_days", 730)),
-        calendar_exceptions_to_days=int(run.get("calendar_exceptions_to_days", 1095)),
-        contacts_photos=bool(run.get("contacts_photos", False)),
+        parallel_mailboxes=_int(run, "parallel_mailboxes", 2, 1, 8),
+        max_message_bytes=_int(run, "max_message_bytes", 150 * 1024 * 1024,
+                               1024, 1024 * 1024 * 1024),
+        calendar_exceptions_from_days=_int(run, "calendar_exceptions_from_days", 730, 0, 36500),
+        calendar_exceptions_to_days=_int(run, "calendar_exceptions_to_days", 1095, 0, 36500),
+        contacts_photos=_bool(run, "contacts_photos", False),
         calendar_attendees=str(run.get("calendar_attendees", "keep")).lower(),
-        verify_tls=bool(run.get("verify_tls", True)),
-        imap_port=int(run.get("imap_port", 993)),
+        imap_port=_int(run, "imap_port", 993, 1, 65535),
         log_level=str(run.get("log_level", "INFO")).upper(),
         source_folder_skip=tuple(run.get("source_folder_skip", [])),
     )

@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 
 GRAPH_BASE = f"https://{GRAPH_HOST}/v1.0"
 RETRY_STATUSES = {429, 503, 504}
+MAX_RETRY_AFTER = 300.0
 
 
 class GraphError(Exception):
@@ -32,6 +33,30 @@ class GraphError(Exception):
         super().__init__(f"HTTP {status} for {path}: {message}")
         self.status = status
         self.path = path
+
+
+class GraphTooLarge(GraphError):
+    """A streamed download exceeded the caller's byte limit and was abandoned."""
+
+    def __init__(self, path: str, limit: int) -> None:
+        super().__init__(413, f"download exceeded {limit} bytes; abandoned", path)
+        self.limit = limit
+
+
+DELTA_EXPIRED_CODES = ("syncStateNotFound", "resyncRequired", "SyncStateInvalid")
+
+
+def _clamp(seconds: float) -> float:
+    """Keep a server-suggested delay sane: NaN, negative and huge values become bounded."""
+    if seconds != seconds:  # NaN
+        return 1.0
+    return min(MAX_RETRY_AFTER, max(0.0, seconds))
+
+
+def delta_expired(exc: GraphError) -> bool:
+    """True when Graph says a stored delta link can no longer be used (HTTP 410 or code)."""
+    text = str(exc)
+    return exc.status == 410 or any(code.lower() in text.lower() for code in DELTA_EXPIRED_CODES)
 
 
 class GraphClient:
@@ -85,10 +110,25 @@ class GraphClient:
             url = page.get("@odata.nextLink")
         return items, delta_link
 
-    def get_bytes(self, path: str, headers: dict | None = None) -> bytes:
-        resp = self._request(path, params=None, headers=headers, stream=True)
+    def get_bytes(self, path: str, headers: dict | None = None,
+                  max_bytes: int | None = None) -> bytes:
+        """Download a binary resource, streaming; abandon it once ``max_bytes`` is exceeded."""
+        hdrs = {"Accept": "*/*"}
+        if headers:
+            hdrs.update(headers)
+        resp = self._request(path, params=None, headers=hdrs, stream=True)
         try:
-            return resp.content
+            chunks: list[bytes] = []
+            total = 0
+            for chunk in resp.iter_content(chunk_size=1 << 16):
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise GraphTooLarge(path, max_bytes)
+                chunks.append(chunk)
+            return b"".join(chunks)
+        except requests.RequestException as exc:
+            raise GraphError(0, f"network error while streaming: {exc.__class__.__name__}",
+                             path) from exc
         finally:
             resp.close()
 
@@ -108,10 +148,14 @@ class GraphClient:
         raw = resp.headers.get("Retry-After")
         if raw:
             try:
-                return float(raw)
+                return _clamp(float(raw))
             except ValueError:
+                pass
+            try:
                 when = email.utils.parsedate_to_datetime(raw)
-                return max(0.0, when.timestamp() - time.time())
+                return _clamp(when.timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):  # malformed: plain backoff
+                pass
         return min(60.0, (2**attempt) + random.uniform(0, 1))  # noqa: S311 - jitter only
 
     def _request(
@@ -128,7 +172,7 @@ class GraphClient:
                 try:
                     resp = self._session.get(
                         url, params=params, headers=base_headers,
-                        timeout=self._timeout, stream=stream,
+                        timeout=self._timeout, stream=stream, allow_redirects=False,
                     )
                 except requests.RequestException as exc:
                     if attempt >= self._max_retries:
@@ -136,8 +180,11 @@ class GraphClient:
                         raise GraphError(0, f"network error: {name}", path) from exc
                     self._sleep(self._retry_after_network(attempt))
                     continue
-                if resp.status_code < 400:
+                if resp.status_code < 300:
                     return resp
+                if 300 <= resp.status_code < 400:
+                    resp.close()
+                    raise GraphError(resp.status_code, "redirect refused", path)
                 if resp.status_code == 401 and not refreshed:
                     refreshed = True
                     self._tokens.invalidate()
@@ -155,7 +202,7 @@ class GraphClient:
         raise GraphError(0, "retries exhausted", path)
 
     @staticmethod
-    def _retry_after_network(attempt: int) -> float:
+    def _retry_after_network(attempt: int) -> float:  # noqa: D401
         return min(30.0, (2**attempt) + random.uniform(0, 1))  # noqa: S311
 
     @staticmethod

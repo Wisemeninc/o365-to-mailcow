@@ -75,22 +75,27 @@ class ContactsMigrator:
     def _folders(self) -> list[ContactFolder]:
         base = f"/users/{quote(self._src, safe='@')}"
         out = [ContactFolder(DEFAULT_ID, "Contacts", f"{base}/contacts", DEFAULT_SLUG, True)]
-        used = set(RESERVED_SLUGS)
+        known = self._state.collection_slugs(self._src, self.kind)
+        used = set(RESERVED_SLUGS) | set(known.values())
         stack = list(reversed(list(self._graph.iter_pages(
             f"{base}/contactFolders", params={"$top": PAGE_SIZE}))))
         while stack:
             folder = stack.pop()
             name = str(folder.get("displayName") or "Contacts")
-            slug_base = slugify(name)
-            slug, n = slug_base, 1
-            while slug in used:
-                n += 1
-                slug = f"{slug_base}-{n}"
-            used.add(slug)
             fid = folder["id"]
-            out.append(ContactFolder(fid, name, f"{base}/contactFolders/{fid}/contacts", slug))
+            slug = known.get(fid)
+            if slug is None:
+                slug_base = slugify(name)
+                slug, n = slug_base, 1
+                while slug in used:
+                    n += 1
+                    slug = f"{slug_base}-{n}"
+                used.add(slug)
+                self._state.set_collection_slug(self._src, self.kind, fid, slug)
+            qfid = quote(fid, safe="")
+            out.append(ContactFolder(fid, name, f"{base}/contactFolders/{qfid}/contacts", slug))
             children = list(self._graph.iter_pages(
-                f"{base}/contactFolders/{fid}/childFolders", params={"$top": PAGE_SIZE}))
+                f"{base}/contactFolders/{qfid}/childFolders", params={"$top": PAGE_SIZE}))
             stack.extend(reversed(children))
         return out
 
@@ -100,7 +105,8 @@ class ContactsMigrator:
     def _photo(self, contact_id: str) -> bytes | None:
         try:
             user = quote(self._src, safe="@")
-            data = self._graph.get_bytes(f"/users/{user}/contacts/{contact_id}/photo/$value")
+            cid = quote(contact_id, safe="")
+            data = self._graph.get_bytes(f"/users/{user}/contacts/{cid}/photo/$value")
         except GraphError as exc:
             if exc.status != 404:  # 404 = no photo (ISC-111); anything else: go on without
                 self._photo_errors += 1

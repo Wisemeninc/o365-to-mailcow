@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -95,6 +96,15 @@ class CollectionsVerify:
     skipped: list[str] = dataclasses.field(default_factory=list)
     fallbacks: list[str] = dataclasses.field(default_factory=list)
     errors: list[str] = dataclasses.field(default_factory=list)
+
+
+_UNSAFE = re.compile(r"[\x00-\x1f\x7f\u200b-\u200f\u2028-\u202e\u2066-\u2069]")
+
+
+def clean(text: object) -> str:
+    """Strip control and bidi/zero-width characters from tenant-supplied strings before
+    they reach a terminal or a log line (no escape-sequence or log-forging tricks)."""
+    return _UNSAFE.sub("", str(text))
 
 
 def utc_stamp(now: datetime | None = None) -> str:
@@ -192,8 +202,10 @@ class RunReport:
     """Accumulates one command's results; thread-safe; written once at the end."""
 
     def __init__(self, command: str, state_dir: Path, dry_run: bool = False,
-                 now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> None:
+                 now: Callable[[], datetime] = lambda: datetime.now(UTC),
+                 redactor: Callable[[str], str] | None = None) -> None:
         self._now = now
+        self._redact = redactor or (lambda text: text)
         self._state_dir = Path(state_dir)
         self._lock = threading.Lock()
         self._t0 = time.monotonic()
@@ -217,6 +229,7 @@ class RunReport:
             self.data["mailboxes"].setdefault(source, {"errors": []})[section] = _plain(value)
 
     def error(self, source: str, message: str) -> None:
+        message = clean(self._redact(message))
         with self._lock:
             self.data["mailboxes"].setdefault(source, {"errors": []}).setdefault(
                 "errors", []).append(message)
@@ -293,9 +306,10 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
                 lines.append(
                     f"  sample: {mail['sample_checked']} compared, "
                     f"{len(mail['sample_mismatches'])} mismatched, "
-                    f"{mail['sample_unverifiable']} without Message-ID/gone at source")
+                    f"{mail.get('sample_regenerated', 0)} re-rendered by Exchange (same "
+                    f"headers), {mail['sample_unverifiable']} without Message-ID/gone at source")
                 for mm in mail["sample_mismatches"]:
-                    problem(f"sample SHA-256 mismatch: {mm}")
+                    problem(f"sample content mismatch: {mm}")
             for err in mail.get("errors", []):
                 problem(f"mail: {err}")
         for kind in ("calendar", "contacts"):

@@ -18,7 +18,7 @@ from typing import Any
 
 import o365_to_mailcow
 from o365_to_mailcow.config import Config, MailboxMapping
-from o365_to_mailcow.graph import GraphError
+from o365_to_mailcow.graph import GraphError, GraphTooLarge
 from o365_to_mailcow.imap_dest import ImapError
 
 
@@ -128,8 +128,12 @@ class FakeGraph:
     def get_delta(self, path: str, params: dict | None = None, headers: dict | None = None):
         return self._resolve("get_delta", path, params, headers)
 
-    def get_bytes(self, path: str, headers: dict | None = None) -> bytes:
-        return self._resolve("get_bytes", path, None, headers)
+    def get_bytes(self, path: str, headers: dict | None = None,
+                  max_bytes: int | None = None) -> bytes:
+        data = self._resolve("get_bytes", path, None, headers)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise GraphTooLarge(path, max_bytes)
+        return data
 
     def paths(self, method: str | None = None) -> list[str]:
         return [p for m, p, _, _ in self.calls if method is None or m == method]
@@ -193,7 +197,7 @@ class FakeImap:
         return bool(self.search_message_id(folder, message_id))
 
     def append(self, folder: str, mime: bytes, flags: list[str],
-               internal_date: datetime) -> int | None:
+               internal_date: datetime, message_id: str | None = None) -> int | None:
         import threading
 
         self.world.append_threads.add(threading.current_thread().name)

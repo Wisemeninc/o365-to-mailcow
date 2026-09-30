@@ -107,7 +107,7 @@ def test_verify_lists_every_skipped_and_failed_category_isc_119_128():
     assert "INBOX: 2 failed" in text and "INBOX: 1 skipped (too large)" in text
     assert "Sent: expected 4, IMAP has 3" in text
     assert "Conversation History" in text and "12 messages" in text
-    assert "sample SHA-256 mismatch: INBOX: <m@x>" in text
+    assert "sample content mismatch: INBOX: <m@x>" in text
     assert "contacts Contacts: 1 failed" in text
     assert problems == 2 + 1 + 1 + 12 + 1 + 1
     assert "All counts match" not in text and lines[-1].startswith("VERIFY FAILED")

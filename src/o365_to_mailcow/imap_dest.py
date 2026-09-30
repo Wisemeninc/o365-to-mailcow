@@ -32,6 +32,12 @@ class ImapError(Exception):
     """The server answered NO or BAD (for example OVERQUOTA). Not retried."""
 
 
+def is_quota_error(exc: BaseException) -> bool:
+    """True for the one NO that should stop a mailbox: the destination is out of space."""
+    text = str(exc).upper()
+    return "OVERQUOTA" in text or "QUOTA" in text
+
+
 class ImapConnectionError(Exception):
     """The connection failed and one reconnect-and-retry did not help."""
 
@@ -56,7 +62,7 @@ class ImapDestination:
 
     def _ssl_context(self) -> ssl.SSLContext:
         ctx = ssl.create_default_context()
-        if not self._verify:  # only reachable from tests via cfg.verify_tls
+        if not self._verify:  # test hook only; production callers never pass False
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         return ctx
@@ -147,23 +153,53 @@ class ImapDestination:
 
     # -- messages ----------------------------------------------------------------------
 
+    @staticmethod
+    def _search(c: IMAPClient, folder: str, message_id: str) -> list[int]:
+        c.select_folder(folder, readonly=True)
+        return [int(u) for u in c.search(["HEADER", "Message-ID", message_id])]
+
     def search_message_id(self, folder: str, message_id: str) -> list[int]:
         """UIDs in ``folder`` whose Message-ID header matches (EXAMINE + SEARCH)."""
-        def op(c: IMAPClient) -> list[int]:
-            c.select_folder(folder, readonly=True)
-            return [int(u) for u in c.search(["HEADER", "Message-ID", message_id])]
-        return self._call(op, f"SEARCH {folder!r}")
+        return self._call(lambda c: self._search(c, folder, message_id), f"SEARCH {folder!r}")
 
     def has_message_id(self, folder: str, message_id: str) -> bool:
         return bool(self.search_message_id(folder, message_id))
 
     def append(self, folder: str, mime: bytes, flags: list[str],
-               internal_date: datetime) -> int | None:
-        """APPEND the message byte-for-byte; return the UID from APPENDUID if present."""
-        resp = self._call(
-            lambda c: c.append(folder, mime, flags=tuple(flags), msg_time=internal_date),
-            f"APPEND {folder!r}",
-        )
+               internal_date: datetime, message_id: str | None = None) -> int | None:
+        """APPEND the message byte-for-byte; return the UID from APPENDUID if present.
+
+        If the connection drops during APPEND the server may already have committed the
+        message. After reconnecting, a message with a Message-ID is looked up first and,
+        if present, its UID is returned instead of appending a duplicate.
+        """
+        def do_append(c: IMAPClient) -> object:
+            return c.append(folder, mime, flags=tuple(flags), msg_time=internal_date)
+
+        if self._client is None:
+            self.connect()
+        try:
+            resp = do_append(self._client)  # type: ignore[arg-type]
+        except CONNECTION_ERRORS as exc:
+            log.warning("IMAP connection lost during APPEND %r (%s); reconnecting once",
+                        folder, exc.__class__.__name__)
+            self._client = None
+            try:
+                self.connect()
+                if message_id:
+                    found = self._search(self._client, folder, message_id)  # type: ignore[arg-type]
+                    if found:
+                        return found[-1]
+                resp = do_append(self._client)  # type: ignore[arg-type]
+            except CONNECTION_ERRORS as exc2:
+                self._client = None
+                raise ImapConnectionError(
+                    f"IMAP APPEND failed after reconnect: {exc2.__class__.__name__}"
+                ) from exc2
+            except IMAPClientError as exc2:
+                raise ImapError(f"IMAP APPEND refused: {_short(exc2)}") from exc2
+        except IMAPClientError as exc:
+            raise ImapError(f"IMAP APPEND refused: {_short(exc)}") from exc
         raw = resp if isinstance(resp, bytes) else str(resp).encode()
         m = _APPENDUID.search(raw)
         return int(m.group(2)) if m else None

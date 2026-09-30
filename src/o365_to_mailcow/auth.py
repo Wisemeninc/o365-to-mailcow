@@ -66,7 +66,8 @@ class TokenProvider:
         if self._cfg.auth_mode != "delegated" or not self._cache.has_state_changed:
             return
         self._cache_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._cache_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self._cache_path, flags, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(self._cache.serialize())
         os.chmod(self._cache_path, 0o600)

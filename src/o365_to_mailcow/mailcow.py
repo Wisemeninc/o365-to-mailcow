@@ -19,7 +19,7 @@ from . import USER_AGENT
 
 log = logging.getLogger(__name__)
 
-APP_PASSWORD_NAME = "o365-migration"  # noqa: S105 - a label, not a secret
+APP_PASSWORD_NAME = "o365-migration"  # noqa: S105 - a label prefix, not a secret
 PROTOCOLS = ["imap_access", "dav_access"]
 ALLOWED_PREFIXES = ("get/mailbox/", "get/app-passwd/", "add/app-passwd", "delete/app-passwd")
 TIMEOUT = (10.0, 60.0)
@@ -50,6 +50,18 @@ def generate_password() -> str:
             return pw
 
 
+def run_app_password_name() -> str:
+    """A per-run name (``o365-migration-<8 hex>``) so parallel runs never pick each
+    other's password out of the listing, and ``cleanup`` can still find every one of ours
+    by prefix."""
+    return f"{APP_PASSWORD_NAME}-{secrets.token_hex(4)}"
+
+
+def is_our_app_password(entry: dict) -> bool:
+    name = str(entry.get("name", ""))
+    return name == APP_PASSWORD_NAME or name.startswith(APP_PASSWORD_NAME + "-")
+
+
 class MailcowApi:
     """Thin client for ``https://{host}/api/v1/``."""
 
@@ -57,6 +69,7 @@ class MailcowApi:
                  verify: bool = True) -> None:
         self._base = f"https://{host}/api/v1/"
         self._session = session or requests.Session()
+        self._session.trust_env = False  # no proxy/netrc surprises for the API key
         self._headers = {"X-API-Key": api_key, "User-Agent": USER_AGENT,
                          "Accept": "application/json"}
         self._verify = verify
@@ -69,10 +82,12 @@ class MailcowApi:
         try:
             resp = self._session.request(
                 method, self._base + path, headers=self._headers, json=json_body,
-                timeout=TIMEOUT, verify=self._verify,
+                timeout=TIMEOUT, verify=self._verify, allow_redirects=False,
             )
         except requests.RequestException as exc:
             raise MailcowError(0, f"network error: {exc.__class__.__name__}") from exc
+        if 300 <= resp.status_code < 400:  # never follow: the key must stay on this host
+            raise MailcowError(resp.status_code, "redirect refused")
         if resp.status_code >= 400:
             raise MailcowError(resp.status_code, resp.text[:200])
         try:
@@ -104,16 +119,25 @@ class MailcowApi:
         return False
 
     def list_app_passwords(self, address: str) -> list[dict]:
+        """App passwords of ``address``; entries naming another mailbox are dropped."""
         data = self._request("GET", f"get/app-passwd/all/{quote(address, safe='@')}")
-        if isinstance(data, list):
-            return [d for d in data if isinstance(d, dict) and "id" in d]
         if isinstance(data, dict) and "id" in data:
-            return [data]
-        return []
+            data = [data]
+        if not isinstance(data, list):
+            return []
+        out: list[dict] = []
+        for d in data:
+            if not isinstance(d, dict) or "id" not in d:
+                continue
+            owner = d.get("mailbox") or d.get("username")
+            if owner is not None and str(owner).lower() != address.lower():
+                continue
+            out.append(d)
+        return out
 
-    def create_app_password(self, address: str,
-                            name: str = APP_PASSWORD_NAME) -> tuple[str, str]:
+    def create_app_password(self, address: str, name: str | None = None) -> tuple[str, str]:
         """Create an IMAP+DAV app password. Returns ``(mailcow_id, password)``."""
+        name = name or run_app_password_name()
         pw = generate_password()
         body = {
             "username": address,

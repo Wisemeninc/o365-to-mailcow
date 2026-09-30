@@ -27,8 +27,8 @@ from .dav import SogoDav
 from .graph import GraphClient
 from .imap_dest import ImapDestination
 from .mail import MailMigrator
-from .mailcow import APP_PASSWORD_NAME, MailcowApi, MailcowError
-from .report import Progress, RunReport, utc_stamp, verify_summary
+from .mailcow import APP_PASSWORD_NAME, MailcowApi, MailcowError, is_our_app_password
+from .report import Progress, RunReport, clean, utc_stamp, verify_summary
 from .state import State
 
 log = logging.getLogger("o365_to_mailcow")
@@ -38,7 +38,7 @@ COMMANDS = {
     "plan": "show what would be migrated (read-only; creates nothing)",
     "migrate": "migrate mail, calendars and contacts (re-runnable)",
     "verify": "compare source and destination counts per folder and calendar",
-    "cleanup": f"delete every '{APP_PASSWORD_NAME}' app password",
+    "cleanup": f"delete every '{APP_PASSWORD_NAME}-*' app password",
 }
 
 
@@ -128,17 +128,22 @@ class SecretFilter(logging.Filter):
             with self._lock:
                 self._secrets.add(value)
 
-    def filter(self, record: logging.LogRecord) -> bool:
+    def redact(self, text: str) -> str:
         with self._lock:
             secrets_ = list(self._secrets)
-        if not secrets_:
-            return True
-        msg = record.getMessage()
-        redacted = msg
         for value in secrets_:
-            redacted = redacted.replace(value, "***")
+            text = text.replace(value, "***")
+        return text
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        redacted = self.redact(msg)
         if redacted != msg:
             record.msg, record.args = redacted, ()
+        if record.exc_info:  # tracebacks are formatted later; redact them now instead
+            record.exc_text = self.redact(
+                logging.Formatter().formatException(record.exc_info))
+            record.exc_info = None
         return True
 
 
@@ -194,7 +199,8 @@ class Runner:
         self.mailboxes = mailboxes
         self.secret_filter = secret_filter
         self.out = out or sys.stdout
-        self.report = RunReport(opts.command, cfg.state_dir, dry_run=opts.dry_run)
+        self.report = RunReport(opts.command, cfg.state_dir, dry_run=opts.dry_run,
+                                redactor=secret_filter.redact)
         self.progress = Progress()
         self._tokens: TokenProvider | None = None
         self._state: State | None = None
@@ -220,8 +226,7 @@ class Runner:
             return self._state
 
     def api(self) -> MailcowApi:
-        return MailcowApi(self.cfg.mailcow_host, self.cfg.mailcow_api_key,
-                          verify=self.cfg.verify_tls)
+        return MailcowApi(self.cfg.mailcow_host, self.cfg.mailcow_api_key)
 
     def graph(self) -> GraphClient:
         """One client per mailbox, so Graph's 4-in-flight limit applies per mailbox."""
@@ -261,7 +266,7 @@ class Runner:
         recorded = {mid for mbx, mid in self.state.app_passwords() if mbx == address}
         targets = recorded & listed_ids
         if include_named:
-            targets |= {str(p["id"]) for p in listed if p.get("name") == APP_PASSWORD_NAME}
+            targets |= {str(p["id"]) for p in listed if is_our_app_password(p)}
         deleted = 0
         for mid in sorted(targets):
             if self.opts.dry_run:
@@ -302,11 +307,10 @@ class Runner:
     def dest_factory(self, m: MailboxMapping, password: str) -> Callable[[], ImapDestination]:
         cfg = self.cfg
         return lambda: ImapDestination(cfg.mailcow_host, cfg.imap_port, m.destination,
-                                       password, verify=cfg.verify_tls)
+                                       password)
 
     def dav(self, m: MailboxMapping, password: str) -> SogoDav:
-        return SogoDav(self.cfg.mailcow_host, m.destination, password,
-                       verify=self.cfg.verify_tls)
+        return SogoDav(self.cfg.mailcow_host, m.destination, password)
 
     def exists(self, api: MailcowApi, m: MailboxMapping) -> bool:
         if api.mailbox_exists(m.destination):
@@ -352,7 +356,7 @@ def cmd_plan(r: Runner) -> int:
                          f"({plan.skipped_folders} skipped)")
             for f in plan.folders:
                 what = f"skip: {f.skip_reason}" if f.skip else f"-> {f.dest_name}"
-                lines.append(f"    {f.source_path} ({f.total}) {what}")
+                lines.append(f"    {clean(f.source_path)} ({f.total}) {what}")
         for kind, cls in (("calendar", CalendarMigrator), ("contacts", ContactsMigrator)):
             if kind not in r.opts.kinds:
                 continue
@@ -361,9 +365,9 @@ def cmd_plan(r: Runner) -> int:
             total = sum(c.count for c in cplan.collections)
             lines.append(f"  {kind}: {total} items in {len(cplan.collections)} collection(s)")
             for c in cplan.collections:
-                lines.append(f"    {c.name} ({c.count}) -> {c.slug}")
+                lines.append(f"    {clean(c.name)} ({c.count}) -> {c.slug}")
             for sk in cplan.skipped:
-                lines.append(f"    skip (not owned by mailbox): {sk}")
+                lines.append(f"    skip (not owned by mailbox): {clean(sk)}")
         r.say("\n".join(lines))
         if exists:
             r.report.set(m.source, "status", "ok")
@@ -402,9 +406,9 @@ def _run_migrators(r: Runner, m: MailboxMapping, password: str | None) -> None:
             f"{sum(c.unchanged for c in cres.collections)}, failed "
             f"{sum(c.failed for c in cres.collections)}, skipped {len(cres.skipped)}")
         for w in cres.warnings:
-            summary.append(f"  warning: {w}")
+            summary.append(f"  warning: {clean(w)}")
         for e in cres.errors:
-            summary.append(f"  error: {e}")
+            summary.append(f"  error: {clean(e)}")
     r.report.set(m.source, "status", "failed" if failed else "ok")
     r.say(f"{m.source} -> {m.destination}\n  " + "\n  ".join(summary))
 

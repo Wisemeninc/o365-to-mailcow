@@ -16,6 +16,9 @@ services:
       - ./config:/config:ro
     command: ["plan"]
     read_only: true
+    # bounded memory: at most 4 in-flight messages per mailbox x parallel mailboxes
+    mem_limit: 3g
+    pids_limit: 256
     tmpfs:
       - /tmp
     cap_drop:

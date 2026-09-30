@@ -6,9 +6,13 @@ ARG PYTHON_IMAGE=python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d
 FROM ${PYTHON_IMAGE} AS build
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /src
+# The build backend is hash-pinned too (requirements-build.txt), so no unpinned
+# setuptools/wheel is fetched by build isolation.
+COPY requirements-build.txt ./
+RUN pip install --require-hashes --only-binary=:all: -r requirements-build.txt
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip wheel --no-deps --wheel-dir /wheels .
+RUN pip wheel --no-deps --no-build-isolation --wheel-dir /wheels .
 
 # --- runtime
 FROM ${PYTHON_IMAGE}

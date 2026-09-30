@@ -217,13 +217,14 @@ def test_message_id_hit_marks_done_without_append_isc_48(env):
     cfg, state, world, graph = env
     world.folders["INBOX"] = []
     world.uidvalidity["INBOX"] = 7
-    FakeImap(world).append("INBOX", mime("<m1@x>", "pre-existing"), [], datetime.now(UTC))
+    # a true earlier copy of m1 (same MIME) already sits in the destination
+    FakeImap(world).append("INBOX", mime("<m1@x>", "one"), [], datetime.now(UTC))
     searched: list[str] = []
 
     class Recording(FakeImap):
-        def has_message_id(self, folder, message_id):
+        def search_message_id(self, folder, message_id):
             searched.append(message_id)
-            return super().has_message_id(folder, message_id)
+            return super().search_message_id(folder, message_id)
 
     res = migrator(cfg, state, world, graph, imap_cls=Recording).migrate()
     inbox_res = next(f for f in res.folders if f.dest_name == "INBOX")
@@ -231,6 +232,34 @@ def test_message_id_hit_marks_done_without_append_isc_48(env):
     assert len(world.folders["INBOX"]) == 2  # pre-existing + m2 only
     assert state.message_status(MAPPING.source, "f-inbox", "m1") == STATUS_DONE
     assert searched == ["<m1@x>"]  # m2 has no Message-ID: never searched (ISC-98)
+
+
+def test_message_id_hit_with_different_content_is_appended_not_skipped(env):
+    """A stranger can send mail carrying a known Message-ID (Silas M4): only a copy whose
+    content matches counts as already migrated."""
+    cfg, state, world, graph = env
+    world.folders["INBOX"] = []
+    world.uidvalidity["INBOX"] = 7
+    FakeImap(world).append("INBOX", mime("<m1@x>", "forged"), [], datetime.now(UTC))
+    res = migrator(cfg, state, world, graph).migrate()
+    inbox_res = next(f for f in res.folders if f.dest_name == "INBOX")
+    assert inbox_res.dedup_hits == 0 and inbox_res.appended == 2
+    assert len(world.folders["INBOX"]) == 3  # forged + m1 + m2
+
+
+def test_message_id_hit_only_dedupes_more_copies_than_recorded(env):
+    """Two source items sharing a Message-ID (Cato F3): the second is not swallowed by
+    the first one's destination copy."""
+    cfg, state, world, graph = env
+    world.folders["INBOX"] = []
+    world.uidvalidity["INBOX"] = 7
+    FakeImap(world).append("INBOX", mime("<m1@x>", "one"), [], datetime.now(UTC))
+    # state already says one source item with this Message-ID is done here
+    state.mark_message(MAPPING.source, "f-inbox", "m0", "INBOX", "<m1@x>", STATUS_DONE,
+                       dest_uid=1, uidvalidity=7)
+    res = migrator(cfg, state, world, graph).migrate()
+    inbox_res = next(f for f in res.folders if f.dest_name == "INBOX")
+    assert inbox_res.dedup_hits == 0 and inbox_res.appended == 2
 
 
 def test_graph_download_failure_recorded_and_run_continues_isc_49(env):

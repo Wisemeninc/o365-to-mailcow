@@ -20,9 +20,12 @@ reading everything through Microsoft Graph and writing through IMAP, CalDAV and 
 | Calendars | `/calendars`, `/calendars/{id}/events`, `/events/{id}/instances` | SOGo CalDAV `PUT` (`.ics`) |
 | Contacts | `/contactFolders` (recursive), `/contacts`, contact photos | SOGo CardDAV `PUT` (`.vcf`) |
 
-Destination credentials are temporary mailcow **app passwords** (one per mailbox, named
-`o365-migration`, protocols `imap_access` and `dav_access` only), created through the
-mailcow API at the start of a run and deleted at the end, also when the run fails.
+Destination credentials are temporary mailcow **app passwords** (one per mailbox and run,
+named `o365-migration-<id>`, protocols `imap_access` and `dav_access` only), created
+through the mailcow API at the start of a run and deleted at the end, also when the run
+fails or is interrupted with Ctrl-C. A hard kill (`docker stop`, power loss) can leave one
+behind; it is recorded in the state database and removed by the next `migrate` or by
+`cleanup`.
 
 ## 1. Register the app in Microsoft Entra
 
@@ -108,12 +111,17 @@ the API again after the migration.
 ## 3. Configure and run
 
 ```sh
-mkdir -p state config && sudo chown 10001:10001 state   # container runs as uid 10001
-cp config.example.toml config/config.toml && chmod 600 config/config.toml
+mkdir -p state config
+cp config.example.toml config/config.toml
 cp .env.example .env && chmod 600 .env                  # fill in both secrets
 $EDITOR config/config.toml                               # tenant, client id, host, mailboxes
+sudo chown -R 10001:10001 state config                   # the container runs as uid 10001
+chmod 600 config/config.toml
 docker compose build
 ```
+
+Secrets given through `.env` are visible to anyone who can run `docker inspect` on the
+host; on a shared host, prefer Docker secrets or a root-only `.env`.
 
 Every option in `config.example.toml` is commented. Secrets belong in `.env`, not in the
 config file; the tool warns when the config file is readable by other users.
@@ -135,7 +143,7 @@ docker compose run --rm o365mig cleanup   # delete all o365-migration app passwo
 | `plan` | Lists folders with message counts and sizes, calendars, contact folders, skipped items; checks that each destination mailbox exists | nothing (Graph reads, mailcow `get` calls) |
 | `migrate` | Creates a temporary app password per mailbox, migrates, deletes the app password | IMAP APPEND, DAV MKCALENDAR/MKCOL/PUT, app password add/delete |
 | `verify` | Per folder: Graph total, skipped, failed, expected, IMAP count. Per calendar/address book: Graph count vs DAV count. Prints every skipped and failed category | app password add/delete only |
-| `cleanup` | Deletes every app password named `o365-migration` for the configured mailboxes plus any recorded in state | app password delete |
+| `cleanup` | Deletes every app password named `o365-migration-*` for the configured mailboxes plus any recorded in state | app password delete |
 
 Options (before or after the command):
 
@@ -146,7 +154,9 @@ Options (before or after the command):
 - `--dry-run` list and count only: no APPEND, PUT, MKCALENDAR, MKCOL, no app passwords
 - `--keep-app-passwords` do not delete the temporary app passwords (debugging)
 - `verify --sample N` re-download N random migrated messages per mailbox and compare
-  their SHA-256 with the destination copy
+  them with the destination copy. Exchange re-renders the MIME of some items (mail it
+  stores natively, not as received bytes); those show up as "re-rendered", not as
+  mismatches, when Message-ID, Date, From, Subject and size class agree
 - `-v` debug logging
 
 Exit codes: **0** everything succeeded, **1** something failed (or, for `verify`, anything
@@ -170,12 +180,18 @@ date as the internal date. Messages above `max_message_bytes` (default 150 MiB) 
 and reported.
 
 Re-runs: messages are keyed on (mailbox, source folder, immutable Graph id). Before
-appending a message the tool searches the destination folder for its `Message-ID`, so
-mail that is already there (for example from an earlier manual copy) is not duplicated.
-After the first full pass each folder uses a Graph delta link, so later runs only look at
-new messages. Messages deleted at the source are counted and reported, **never deleted at
-the destination**. If a destination folder's UIDVALIDITY changes, the tool re-checks
-every message of that folder by Message-ID.
+appending a message into a folder that already had content, the tool searches the
+destination for its `Message-ID` and compares the content, so mail that is already there
+(for example from an earlier manual copy) is not duplicated, while a different message
+that merely carries the same Message-ID is still copied. After the first full pass each
+folder uses a Graph delta link, so later runs only look at new messages; if Microsoft has
+expired the link, the folder is listed fully again. Messages deleted at the source are
+counted and reported, **never deleted at the destination**. If a destination folder's
+UIDVALIDITY changes, the tool re-checks every message of that folder by Message-ID.
+
+Read and flag changes made at the source *after* a message was copied are not carried
+over by later runs (the tool never modifies existing messages at the destination). Plan
+the final run for a moment when users have stopped working in Microsoft 365.
 
 **Calendars.** The default calendar goes to SOGo's `personal` calendar; every other
 calendar the mailbox owns is created with MKCALENDAR. Calendars shared *to* the mailbox by
@@ -224,11 +240,16 @@ Then run `plan` for everyone, `migrate` a few mailboxes, `verify`, and only then
 - `state/state.db` (mode 0600) is the idempotency ledger: identifiers, statuses, error
   summaries, app-password IDs. It never contains message content or credentials. Keep it
   between runs; deleting it makes the next run fall back to Message-ID checks.
+- In delegated mode, `state/msal_cache.bin` holds a refresh token with Full Access to
+  every migrated mailbox. **Delete it when the migration is finished.**
 - App-password IDs are recorded *before* use; a crashed run's leftovers are deleted by
   the next `migrate` or by `cleanup`. Do not run `cleanup` while a `migrate` is running.
 - Secrets are read from the environment, never logged, never written to state or reports.
-- TLS verification is always on. Graph requests carry a timeout, retry 429/503/504 with
-  `Retry-After`, and are capped at four in flight per mailbox (Graph's per-mailbox limit).
+- TLS verification is always on and cannot be switched off; redirects are never followed
+  (a redirect from any endpoint is an error, so credentials cannot be sent elsewhere).
+  Graph requests carry a timeout, retry 429/503/504 with `Retry-After`, and are capped at
+  four in flight per mailbox (Graph's per-mailbox limit). Downloads are streamed and
+  abandoned past `max_message_bytes`; the compose file caps memory at 3 GiB.
 - The container runs as uid 10001, read-only root filesystem in `compose.yaml`.
 
 ## Development
@@ -241,4 +262,5 @@ docker build -t o365-to-mailcow . && docker run --rm o365-to-mailcow --help
 ```
 
 Dependencies are locked with hashes in `requirements.txt`
-(`uv pip compile pyproject.toml -o requirements.txt --generate-hashes`).
+(`uv pip compile pyproject.toml -o requirements.txt --generate-hashes`); the build
+backend is locked the same way in `requirements-build.txt`.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import threading
 import time
 from urllib.parse import urlsplit
@@ -158,6 +159,7 @@ class Recorder(requests.Session):
         resp = requests.Response()
         resp.status_code = 200
         resp._content = b'{"value": []}'
+        resp.raw = io.BytesIO(b'{"value": []}')  # get_bytes streams from raw
         return resp
 
 

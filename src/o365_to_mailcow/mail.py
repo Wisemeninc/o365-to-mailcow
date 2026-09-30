@@ -23,13 +23,15 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from email import policy
+from email.parser import BytesHeaderParser
 from urllib.parse import quote
 
 from dateutil import parser as dtparser
 
 from .config import Config, MailboxMapping
-from .graph import GraphClient, GraphError
-from .imap_dest import ImapConnectionError, ImapDestination, ImapError
+from .graph import GraphClient, GraphError, GraphTooLarge, delta_expired
+from .imap_dest import ImapConnectionError, ImapDestination, ImapError, is_quota_error
 from .report import NullProgress, Progress
 from .state import STATUS_DONE, STATUS_FAILED, STATUS_SKIPPED, State
 
@@ -50,7 +52,9 @@ FOLDER_SIZE_PROPERTY = "Long 0x0E08"
 FOLDER_EXPAND = f"singleValueExtendedProperties($filter=id eq '{FOLDER_SIZE_PROPERTY}')"
 PAGE_SIZE = 100
 DOWNLOAD_WORKERS = 4
-PREFETCH_WINDOW = 8
+PREFETCH_WINDOW = 4  # bounded by count; each item is at most max_message_bytes
+MAX_KEYWORDS = 20
+MAX_KEYWORD_LEN = 50  # Dovecot's default mail_max_keyword_length
 
 WELL_KNOWN_MAP = {
     "inbox": "INBOX",
@@ -68,7 +72,11 @@ WELL_KNOWN_SKIP = (
     "serverfailures",
     "localfailures",
 )
-_KEYWORD_BAD = re.compile(r"[^A-Za-z0-9_\-.+:@#&!$]")
+_KEYWORD_BAD = re.compile(r"[^A-Za-z0-9_\-.+:@#&!]")
+# RFC 5322 msg-id, restricted to printable ASCII without spaces; anything else is treated
+# as "no Message-ID" so tenant data never reaches an IMAP SEARCH unvalidated.
+_MESSAGE_ID = re.compile(r"^<[\x21-\x3b\x3d\x3f-\x7e]{1,995}>$")
+_WS = re.compile(r"\s+")
 
 
 # -- dataclasses -----------------------------------------------------------------------
@@ -107,8 +115,11 @@ class FolderResult:
     failed: int = 0
     skipped_too_large: int = 0
     removed_in_source: int = 0
+    vanished_in_source: int = 0
+    unverifiable_after_uidvalidity: int = 0
     would_append: int = 0
     uidvalidity_changed: bool = False
+    delta_reset: bool = False
     error: str | None = None
 
 
@@ -151,6 +162,7 @@ class MailVerify:
     sample_requested: int = 0
     sample_checked: int = 0
     sample_mismatches: list[str] = field(default_factory=list)
+    sample_regenerated: int = 0  # same headers and size class, different MIME rendering
     sample_unverifiable: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -166,8 +178,23 @@ def sanitize_folder_name(name: str, delimiter: str) -> str:
 
 
 def category_keyword(category: str) -> str:
-    """Graph category -> IMAP keyword (atom): spaces and disallowed chars become ``_``."""
-    return _KEYWORD_BAD.sub("_", category.strip())
+    """Graph category -> IMAP keyword (atom).
+
+    Spaces and disallowed characters become ``_``; a leading ``$`` or ``\\`` is replaced
+    so a category can never masquerade as a system flag or a client-defined ``$Keyword``;
+    the result is capped at Dovecot's default keyword length.
+    """
+    kw = _KEYWORD_BAD.sub("_", category.strip())[:MAX_KEYWORD_LEN]
+    if kw[:1] in ("$", "\\"):
+        kw = "_" + kw[1:]
+    return kw
+
+
+def valid_message_id(value: object) -> str | None:
+    """Return the Message-ID if it is a plain RFC 5322 msg-id, else None (ISC-98)."""
+    if isinstance(value, str) and _MESSAGE_ID.match(value):
+        return value
+    return None
 
 
 def imap_flags(msg: dict) -> list[str]:
@@ -179,10 +206,14 @@ def imap_flags(msg: dict) -> list[str]:
         flags.append("\\Flagged")
     if msg.get("isDraft"):
         flags.append("\\Draft")
+    keywords = 0
     for cat in msg.get("categories") or []:
         kw = category_keyword(str(cat))
         if kw and kw not in flags:
             flags.append(kw)
+            keywords += 1
+            if keywords >= MAX_KEYWORDS:
+                break
     return flags
 
 
@@ -235,6 +266,32 @@ def folder_size(folder: dict) -> int | None:
 
 def _normalised_sha256(data: bytes) -> str:
     return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+
+
+def _header(msg, name: str) -> str:
+    value = msg.get(name)
+    return _WS.sub(" ", str(value)).strip().lower() if value else ""
+
+
+def same_message(source: bytes, dest: bytes) -> str:
+    """Decide whether two MIME renderings are the same message.
+
+    Returns ``"identical"`` (byte-equal after CRLF normalisation), ``"regenerated"``
+    (Exchange re-renders MIME for items it stores as MAPI: same Message-ID, Date, From and
+    Subject and a size within a third of each other) or ``"different"``.
+    """
+    if _normalised_sha256(source) == _normalised_sha256(dest):
+        return "identical"
+    parser = BytesHeaderParser(policy=policy.default)
+    try:
+        a, b = parser.parsebytes(source), parser.parsebytes(dest)
+    except Exception:  # noqa: BLE001 - unparsable headers are simply "different"
+        return "different"
+    for name in ("message-id", "date", "from", "subject"):
+        if _header(a, name) != _header(b, name):
+            return "different"
+    big, small = max(len(source), len(dest)), max(1, min(len(source), len(dest)))
+    return "regenerated" if big / small <= 4 / 3 else "different"
 
 
 # -- migrator --------------------------------------------------------------------------
@@ -388,11 +445,13 @@ class MailMigrator:
             except GraphError as exc:
                 if exc.status != 404:
                     raise
+                fr.vanished_in_source += 1  # listed by delta, gone before we fetched it
         return out, new_link
 
     def _download(self, graph_id: str) -> bytes:
         return self._graph.get_bytes(self._user_path(f"messages/{graph_id}/$value"),
-                                     headers=PREFER_IMMUTABLE)
+                                     headers=PREFER_IMMUTABLE,
+                                     max_bytes=self._cfg.max_message_bytes)
 
     # -- migrate -----------------------------------------------------------------------
 
@@ -489,9 +548,22 @@ class MailMigrator:
         done = self._state.done_message_ids(src, fid)
         stored_link = None if forced else self._state.get_delta(src, fid)
         try:
+            messages: list[dict] = []
+            new_link: str | None = None
             if stored_link:
-                messages, new_link = self._delta_messages(stored_link, fr, done)
-            else:
+                try:
+                    messages, new_link = self._delta_messages(stored_link, fr, done)
+                except GraphError as exc:
+                    if not delta_expired(exc):
+                        raise
+                    # Graph discards old delta tokens; a stale one must never wedge the
+                    # folder, so forget it and list fully in the same run.
+                    log.warning("%s: delta link for %r expired (%s); listing fully",
+                                src, name, exc)
+                    self._state.clear_delta(src, fid)
+                    fr.delta_reset = True
+                    stored_link = None
+            if not stored_link:
                 new_link = self._initial_delta_link(fid)
                 messages = list(self._list_messages(fid))
         except GraphError as exc:
@@ -509,6 +581,8 @@ class MailMigrator:
         todo.sort(key=internal_date)  # oldest first, so destination UIDs follow date order
         self._append_all(dest, fp, fr, result, pool, todo, uidvalidity)
 
+        if not result.stopped:
+            self._state.set_folder_meta(src, fid, name, uidvalidity)
         if new_link and not result.stopped and fr.failed == 0:
             self._state.set_delta(src, fid, new_link)
 
@@ -520,10 +594,19 @@ class MailMigrator:
         for msg in messages:
             fr.listed += 1
             gid = msg["id"]
-            mid = msg.get("internetMessageId") or None
+            mid = valid_message_id(msg.get("internetMessageId"))
             if gid in done:
                 # after a UIDVALIDITY change, confirm the copy still exists
-                if not forced or not mid or dest.has_message_id(name, mid):
+                if not forced:
+                    fr.already_done += 1
+                    self._progress.advance(self._key)
+                    continue
+                if not mid:
+                    fr.unverifiable_after_uidvalidity += 1  # cannot be searched for
+                    fr.already_done += 1
+                    self._progress.advance(self._key)
+                    continue
+                if dest.has_message_id(name, mid):
                     fr.already_done += 1
                     self._progress.advance(self._key)
                     continue
@@ -535,14 +618,43 @@ class MailMigrator:
                 self._progress.advance(self._key)
                 continue
             # ISC-48/98: only messages with a Message-ID, only if the folder had content
-            if mid and gid not in done and count_at_start > 0 and dest.has_message_id(name, mid):
-                self._state.mark_message(src, fid, gid, name, mid, STATUS_DONE,
-                                         uidvalidity=uidvalidity)
-                fr.dedup_hits += 1
-                self._progress.advance(self._key)
-                continue
+            if mid and gid not in done and count_at_start > 0:
+                verdict = self._dedupe(dest, fp, fr, msg, mid, uidvalidity)
+                if verdict != "append":
+                    continue
             todo.append(msg)
         return todo
+
+    def _dedupe(self, dest: ImapDestination, fp: FolderPlan, fr: FolderResult, msg: dict,
+                mid: str, uidvalidity: int) -> str:
+        """Message-ID hit at the destination: count it as already migrated only when a
+        destination copy really is this message (content compared) and the destination
+        holds more copies than source items already recorded for this Message-ID.
+        Anything else is appended. Returns "done", "skipped" or "append"."""
+        src, fid, name, gid = self._src, fp.folder_id, fp.dest_name, msg["id"]
+        uids = dest.search_message_id(name, mid)
+        already = self._state.done_count_for_message_id(src, fid, mid)
+        if len(uids) <= already:
+            return "append"
+        try:
+            mime = self._download(gid)
+        except GraphTooLarge as exc:
+            self._state.mark_message(src, fid, gid, name, mid, STATUS_SKIPPED,
+                                     error=f"too large: over {exc.limit} bytes")
+            fr.skipped_too_large += 1
+            self._progress.advance(self._key)
+            return "skipped"
+        except GraphError:
+            return "append"  # the normal path records the failure
+        msg["_mime"] = mime  # no second download if we end up appending
+        for uid in uids[-5:]:
+            if same_message(mime, dest.fetch_message(name, uid)) != "different":
+                self._state.mark_message(src, fid, gid, name, mid, STATUS_DONE,
+                                         dest_uid=uid, uidvalidity=uidvalidity)
+                fr.dedup_hits += 1
+                self._progress.advance(self._key)
+                return "done"
+        return "append"
 
     def _append_all(self, dest: ImapDestination, fp: FolderPlan, fr: FolderResult,
                     result: MailResult, pool: ThreadPoolExecutor, todo: list[dict],
@@ -551,35 +663,50 @@ class MailMigrator:
         queue = iter(todo)
         pending: deque[tuple[dict, Future[bytes]]] = deque()
 
+        def fetch(m: dict) -> bytes:
+            return m["_mime"] if "_mime" in m else self._download(m["id"])
+
         def refill() -> None:
             while len(pending) < PREFETCH_WINDOW:
                 nxt = next(queue, None)
                 if nxt is None:
                     return
-                pending.append((nxt, pool.submit(self._download, nxt["id"])))
+                pending.append((nxt, pool.submit(fetch, nxt)))
 
         refill()
         while pending:
             msg, fut = pending.popleft()
             refill()
-            gid, mid = msg["id"], msg.get("internetMessageId") or None
+            gid, mid = msg["id"], valid_message_id(msg.get("internetMessageId"))
             try:
                 mime = fut.result()
+            except GraphTooLarge as exc:  # ISC-52: abandoned while streaming
+                self._state.mark_message(src, fid, gid, name, mid, STATUS_SKIPPED,
+                                         error=f"too large: over {exc.limit} bytes")
+                fr.skipped_too_large += 1
+                self._progress.advance(self._key)
+                continue
             except GraphError as exc:  # ISC-49: record and continue
                 self._state.mark_message(src, fid, gid, name, mid, STATUS_FAILED,
                                          error=f"graph HTTP {exc.status}: {exc}")
                 fr.failed += 1
                 self._progress.advance(self._key)
                 continue
-            if len(mime) > self._cfg.max_message_bytes:
-                self._state.mark_message(src, fid, gid, name, mid, STATUS_SKIPPED,
-                                         error=f"too large: {len(mime)} bytes")
-                fr.skipped_too_large += 1
-                self._progress.advance(self._key)
-                continue
             try:
-                uid = dest.append(name, mime, imap_flags(msg), internal_date(msg))
-            except (ImapError, ImapConnectionError) as exc:  # ISC-99/100
+                uid = dest.append(name, mime, imap_flags(msg), internal_date(msg),
+                                  message_id=mid)
+            except ImapError as exc:
+                self._state.mark_message(src, fid, gid, name, mid, STATUS_FAILED,
+                                         error=str(exc))
+                fr.failed += 1
+                if not is_quota_error(exc):  # one refused message must not halt a mailbox
+                    self._progress.advance(self._key)
+                    continue
+                for _, other in pending:  # ISC-99: out of space, stop this mailbox
+                    other.cancel()
+                self._stop(result, fp, exc)
+                return
+            except ImapConnectionError as exc:  # ISC-100: reconnect already failed once
                 self._state.mark_message(src, fid, gid, name, mid, STATUS_FAILED,
                                          error=str(exc))
                 fr.failed += 1
@@ -602,13 +729,13 @@ class MailMigrator:
         dest.connect()
         try:
             plan = self._build_plan(dest.delimiter)
-            counts = self._state.message_counts(self._src)
+            counts = self._state.message_counts_by_folder_id(self._src)
             for fp in plan.folders:
                 if fp.skip:
                     out.skipped_folders.append(
                         {"path": fp.source_path, "reason": fp.skip_reason, "total": fp.total})
                     continue
-                c = counts.get(fp.dest_name, {})
+                c = counts.get(fp.folder_id, {})
                 done, failed = c.get(STATUS_DONE, 0), c.get(STATUS_FAILED, 0)
                 skipped = c.get(STATUS_SKIPPED, 0)
                 note = None
@@ -638,10 +765,11 @@ class MailMigrator:
                                        params={"$select": "internetMessageId"},
                                        headers=PREFER_IMMUTABLE)
                 mid = meta.get("internetMessageId")
+                mid = valid_message_id(mid)
                 if not mid:
                     out.sample_unverifiable += 1
                     continue
-                source = _normalised_sha256(self._download(gid))
+                source = self._download(gid)
             except GraphError as exc:
                 if exc.status == 404:
                     out.sample_unverifiable += 1
@@ -649,7 +777,11 @@ class MailMigrator:
                 out.errors.append(f"sample {gid}: {exc}")
                 continue
             out.sample_checked += 1
-            uids = dest.search_message_id(folder, mid)
-            if not any(_normalised_sha256(dest.fetch_message(folder, uid)) == source
-                       for uid in uids[:5]):
-                out.sample_mismatches.append(f"{folder}: {mid}")
+            verdicts = {same_message(source, dest.fetch_message(folder, uid))
+                        for uid in dest.search_message_id(folder, mid)[:5]}
+            if "identical" in verdicts:
+                continue
+            if "regenerated" in verdicts:
+                out.sample_regenerated += 1
+                continue
+            out.sample_mismatches.append(f"{folder}: {mid}")

@@ -56,6 +56,7 @@ class SogoDav:
         self._user = user
         self._base = f"https://{host}/SOGo/dav/{quote(user, safe='@')}/"
         self._session = session or requests.Session()
+        self._session.trust_env = False
         self._auth = (user, password)
         self._verify = verify
 
@@ -70,11 +71,14 @@ class SogoDav:
         if headers:
             hdrs.update(headers)
         try:
-            return self._session.request(method, url, data=body, headers=hdrs,
+            resp = self._session.request(method, url, data=body, headers=hdrs,
                                          auth=self._auth, timeout=TIMEOUT,
-                                         verify=self._verify)
+                                         verify=self._verify, allow_redirects=False)
         except requests.RequestException as exc:
             raise DavError(0, f"network error: {exc.__class__.__name__}") from exc
+        if 300 <= resp.status_code < 400:  # credentials never follow a redirect
+            raise DavError(resp.status_code, "redirect refused")
+        return resp
 
     @staticmethod
     def _fail(resp: requests.Response) -> DavError:

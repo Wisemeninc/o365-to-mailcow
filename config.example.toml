@@ -49,8 +49,6 @@ contacts_photos = false
 # "keep" copies attendees and organizer with SCHEDULE-AGENT=CLIENT so SOGo sends nothing;
 # "strip" removes ATTENDEE/ORGANIZER entirely for zero scheduling risk.
 calendar_attendees = "keep"
-# TLS certificate verification towards mailcow. Leave true; false exists only for tests.
-verify_tls = true
 # IMAPS port of the mailcow host.
 imap_port = 993
 # Log level for stderr and state_dir/logs (DEBUG, INFO, WARNING, ERROR); -v forces DEBUG.

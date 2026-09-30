@@ -49,7 +49,7 @@ def test_loads_from_path_with_env_secrets_isc_15_16(tmp_path):
                              MailboxMapping("bob@contoso.com", "robert@example.net"))
     assert cfg.scopes == APP_SCOPES
     assert cfg.authority == "https://login.microsoftonline.com/t-1"
-    assert cfg.verify_tls is True and cfg.max_message_bytes == 150 * 1024 * 1024
+    assert cfg.max_message_bytes == 150 * 1024 * 1024
     assert cfg.calendar_attendees == "keep"
 
 
@@ -137,7 +137,7 @@ def test_example_config_documents_every_key_isc_8():
             "state_dir", "mailboxes", "mailboxes_csv", "parallel_mailboxes",
             "max_message_bytes", "calendar_exceptions_from_days",
             "calendar_exceptions_to_days", "contacts_photos", "calendar_attendees",
-            "verify_tls", "imap_port", "log_level", "source_folder_skip"]
+            "imap_port", "log_level", "source_folder_skip"]
     lines = text.splitlines()
     for key in keys:
         idx = next(i for i, line in enumerate(lines)

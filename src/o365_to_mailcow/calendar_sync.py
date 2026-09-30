@@ -87,7 +87,10 @@ class CalendarMigrator:
         """Owned calendars with their destination slug, plus a list of skipped shared ones."""
         owned: list[tuple[dict, str]] = []
         skipped: list[str] = []
-        used = {DEFAULT_SLUG}
+        # Slugs are remembered per Graph calendar id (ISC-57): two calendars with the
+        # same name keep their own destinations across runs whatever the listing order.
+        known = self._state.collection_slugs(self._src, self.kind)
+        used = {DEFAULT_SLUG, *known.values()}
         for cal in self._graph.iter_pages(f"/users/{quote(self._src, safe='@')}/calendars",
                                           params={"$top": PAGE_SIZE}):
             name = str(cal.get("name") or "Calendar")
@@ -98,18 +101,21 @@ class CalendarMigrator:
             if cal.get("isDefaultCalendar"):
                 owned.append((cal, DEFAULT_SLUG))
                 continue
-            base = slugify(name)
-            slug, n = base, 1
-            while slug in used:
-                n += 1
-                slug = f"{base}-{n}"
-            used.add(slug)
+            slug = known.get(cal["id"])
+            if slug is None:
+                base = slugify(name)
+                slug, n = base, 1
+                while slug in used:
+                    n += 1
+                    slug = f"{base}-{n}"
+                used.add(slug)
+                self._state.set_collection_slug(self._src, self.kind, cal["id"], slug)
             owned.append((cal, slug))
         return owned, skipped
 
     def _events(self, cal_id: str):
         for ev in self._graph.iter_pages(
-                f"/users/{quote(self._src, safe='@')}/calendars/{cal_id}/events",
+                f"/users/{quote(self._src, safe='@')}/calendars/{quote(cal_id, safe='')}/events",
                 params={"$select": EVENT_SELECT, "$top": PAGE_SIZE}, headers=PREFER_UTC):
             if ev.get("type", "singleInstance") in KEEP_TYPES:  # ISC-105
                 yield ev
@@ -117,7 +123,7 @@ class CalendarMigrator:
     def _instances(self, event_id: str) -> list[dict]:
         start, end = self._window
         return list(self._graph.iter_pages(
-            f"/users/{quote(self._src, safe='@')}/events/{event_id}/instances",
+            f"/users/{quote(self._src, safe='@')}/events/{quote(event_id, safe='')}/instances",
             params={"startDateTime": iso_utc(start), "endDateTime": iso_utc(end),
                     "$select": INSTANCE_SELECT, "$top": PAGE_SIZE},
             headers=PREFER_UTC))
