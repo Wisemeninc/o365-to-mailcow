@@ -161,6 +161,7 @@ class ImapWorld:
     appends: int = 0
     append_threads: set[str] = field(default_factory=set)
     indexed: list[str] = field(default_factory=list)  # folders indexed by Message-ID
+    batches: list[int] = field(default_factory=list)  # sizes of append_many calls
 
 
 class FakeImap:
@@ -207,6 +208,28 @@ class FakeImap:
             on_progress(len(self.world.folders.get(folder, [])),
                         len(self.world.folders.get(folder, [])))
         return index
+
+    def append_many(self, folder: str, items: list) -> list:
+        """Like the real one: one atomic batch; a refused item is its ImapError
+        (quota raised), recorded by the world as a batch of this size."""
+        from o365_to_mailcow.imap_dest import ImapError, is_quota_error
+
+        self.world.batches.append(len(items))
+        out: list = []
+        before = len(self.world.folders.get(folder, []))
+        try:
+            for it in items:
+                try:
+                    out.append(self.append(folder, it.mime, list(it.flags), it.internal_date,
+                                           message_id=it.message_id))
+                except ImapError as exc:
+                    out.append(exc)
+                    if is_quota_error(exc):
+                        break
+        except BaseException:  # MULTIAPPEND is atomic: a failed batch stores nothing
+            del self.world.folders[folder][before:]
+            raise
+        return out
 
     def append(self, folder: str, mime: bytes, flags: list[str],
                internal_date: datetime, message_id: str | None = None) -> int | None:

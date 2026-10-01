@@ -249,3 +249,101 @@ def test_fetch_message_without_a_body_is_an_error_not_empty_bytes(data, what):
     f.clients[0].fetch.return_value = data
     with pytest.raises(ImapError, match=what):
         d.fetch_message("INBOX", 5)
+
+
+# -- ISC-193: MULTIAPPEND -----------------------------------------------------------------
+
+def _items(n: int, start: int = 0):
+    from o365_to_mailcow.imap_dest import AppendItem
+
+    return [AppendItem(f"Message-ID: <b{start + i}@x>\r\n\r\nx".encode(), ("\\Seen",),
+                       datetime(2024, 1, 1, tzinfo=UTC), f"<b{start + i}@x>") for i in range(n)]
+
+
+def test_expand_uid_set():
+    from o365_to_mailcow.imap_dest import expand_uid_set
+
+    assert expand_uid_set("13:22") == list(range(13, 23))
+    assert expand_uid_set("5") == [5]
+    assert expand_uid_set("13:15,20,30:31") == [13, 14, 15, 20, 30, 31]
+    assert expand_uid_set("") == []
+
+
+def test_append_many_uses_one_multiappend_and_maps_appenduid():
+    f = Factory()
+    d = make(f)
+    c = f.clients[0]
+    c.has_capability.side_effect = lambda cap: cap in ("MULTIAPPEND", "LITERAL+")
+    c.multiappend.return_value = ("OK", [b"[APPENDUID 42 100:102] Append completed."])
+    items = _items(3)
+    assert d.append_many("INBOX", items) == [100, 101, 102]
+    c.multiappend.assert_called_once()
+    folder, batch = c.multiappend.call_args.args
+    assert folder == "INBOX" and len(batch) == 3
+    assert batch[0] == {"msg": items[0].mime, "flags": ("\\Seen",), "date": items[0].internal_date}
+    c.append.assert_not_called()
+    assert used_methods(f) <= set(ALLOWED) | {"multiappend", "has_capability"}
+
+
+def test_append_many_without_the_capability_appends_one_by_one():
+    f = Factory()
+    d = make(f)
+    c = f.clients[0]
+    c.has_capability.return_value = False
+    c.append.return_value = b"[APPENDUID 42 7] Append completed."
+    assert d.append_many("INBOX", _items(2)) == [7, 7]
+    assert c.append.call_count == 2 and not c.multiappend.called
+
+
+def test_append_many_refused_batch_falls_back_to_singles_with_per_item_errors():
+    from imapclient.exceptions import IMAPClientError
+
+    from o365_to_mailcow.imap_dest import ImapError
+
+    f = Factory()
+    d = make(f)
+    c = f.clients[0]
+    c.has_capability.return_value = True
+    c.multiappend.side_effect = IMAPClientError("APPEND command error: BAD [b'Invalid message']")
+    responses = iter([b"[APPENDUID 42 1] ok", IMAPClientError("NO [LIMIT] too big"),
+                      b"[APPENDUID 42 2] ok"])
+
+    def single(*a, **kw):
+        r = next(responses)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    c.append.side_effect = single
+    out = d.append_many("INBOX", _items(3))
+    assert out[0] == 1 and out[2] == 2
+    assert isinstance(out[1], ImapError) and "too big" in str(out[1])
+
+
+def test_append_many_out_of_quota_ends_the_list_after_what_fits():
+    from imapclient.exceptions import IMAPClientError
+
+    from o365_to_mailcow.imap_dest import ImapError, is_quota_error
+
+    f = Factory()
+    d = make(f)
+    c = f.clients[0]
+    c.has_capability.return_value = True
+    c.multiappend.side_effect = IMAPClientError("NO [OVERQUOTA] Quota exceeded")
+    c.append.side_effect = [b"[APPENDUID 42 1] ok",
+                            IMAPClientError("NO [OVERQUOTA] Quota exceeded")]
+    out = d.append_many("INBOX", _items(5))
+    assert len(out) == 2 and out[0] == 1
+    assert isinstance(out[1], ImapError) and is_quota_error(out[1])
+    assert c.append.call_count == 2  # the other three were never attempted
+
+
+def test_append_many_unparseable_appenduid_gives_unknown_uids():
+    f = Factory()
+    d = make(f)
+    c = f.clients[0]
+    c.has_capability.return_value = True
+    c.multiappend.return_value = ("OK", [b"Append completed."])
+    assert d.append_many("INBOX", _items(2)) == [None, None]
+    c.multiappend.return_value = ("OK", [b"[APPENDUID 42 100:102] done"])  # 3 uids, 2 items
+    assert d.append_many("INBOX", _items(2)) == [None, None]

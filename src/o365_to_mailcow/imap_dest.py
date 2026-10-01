@@ -1,9 +1,9 @@
 """Destination IMAP connection (Dovecot in mailcow), write-only in the append sense.
 
 Only these IMAP commands are ever issued (ISC-54): LOGIN, LIST, CREATE, SUBSCRIBE,
-STATUS, SELECT/EXAMINE, SEARCH, APPEND, FETCH (Message-ID index and verify sampling,
-always BODY.PEEK), LOGOUT. The class deliberately has no way to STORE flags, EXPUNGE or
-DELETE (ISC-55).
+STATUS, SELECT/EXAMINE, SEARCH, APPEND (one message, or several per command with
+MULTIAPPEND), FETCH (Message-ID index and verify sampling, always BODY.PEEK), LOGOUT.
+The class deliberately has no way to STORE flags, EXPUNGE or DELETE (ISC-55).
 
 Folder names are passed to imapclient as ``str``; imapclient encodes them to modified
 UTF-7 and decodes LIST results back (ISC-40).
@@ -15,6 +15,7 @@ import logging
 import re
 import ssl
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TypeVar
 
@@ -26,6 +27,30 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _APPENDUID = re.compile(rb"\[APPENDUID (\d+) (\d+)\]", re.IGNORECASE)
+_APPENDUID_SET = re.compile(rb"\[APPENDUID (\d+) ([0-9:,]+)\]", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class AppendItem:
+    """One message for ``append_many``."""
+
+    mime: bytes
+    flags: tuple[str, ...]
+    internal_date: datetime
+    message_id: str | None = None
+
+
+def expand_uid_set(text: str) -> list[int]:
+    """``"13:22,30"`` -> ``[13, 14, …, 22, 30]`` (RFC 4315 uid-set, ascending ranges)."""
+    out: list[int] = []
+    for part in text.split(","):
+        if not part:
+            continue
+        lo, _, hi = part.partition(":")
+        a = int(lo)
+        b = int(hi) if hi else a
+        out.extend(range(min(a, b), max(a, b) + 1))
+    return out
 # "Message-ID: <id>", the obsolete "Message-ID : <id>" and a comment before the id
 _HEADER_MID = re.compile(rb"^message-id[ \t]*:[ \t]*(?:\([^)]*\)[ \t]*)*(<[^>]*>)",
                          re.IGNORECASE | re.MULTILINE)
@@ -45,6 +70,9 @@ def is_quota_error(exc: BaseException) -> bool:
 
 class ImapConnectionError(Exception):
     """The connection failed and one reconnect-and-retry did not help."""
+
+
+AppendOutcome = int | None | ImapError  # per item of append_many
 
 
 class ImapDestination:
@@ -244,6 +272,92 @@ class ImapDestination:
         raw = resp if isinstance(resp, bytes) else str(resp).encode()
         m = _APPENDUID.search(raw)
         return int(m.group(2)) if m else None
+
+    def supports_multiappend(self) -> bool:
+        if self._client is None:
+            self.connect()
+        try:
+            return self._client.has_capability("MULTIAPPEND")  # type: ignore[union-attr]
+        except (IMAPClientError, *CONNECTION_ERRORS):
+            return False
+
+    def _append_singly(self, folder: str, items: list[AppendItem]) -> list[AppendOutcome]:
+        """One APPEND per item; a refused item becomes its ImapError. An out-of-quota
+        NO ends the list there (the rest is not attempted): the caller stops."""
+        out: list[AppendOutcome] = []
+        for it in items:
+            try:
+                out.append(self.append(folder, it.mime, list(it.flags), it.internal_date,
+                                       message_id=it.message_id))
+            except ImapError as exc:
+                out.append(exc)
+                if is_quota_error(exc):
+                    break
+        return out
+
+    def append_many(self, folder: str, items: list[AppendItem]) -> list[AppendOutcome]:
+        """APPEND several messages in one MULTIAPPEND command (RFC 3502; LITERAL+ makes
+        it one round trip). Returns, per item and in order, its UID from APPENDUID,
+        None when unknown, or the ImapError that refused that one message. Dovecot
+        spends ~80 ms per message this way against ~400 ms for one APPEND per command
+        (ISC-193). The command is atomic: either every message is stored or none. On a
+        server NO the batch falls back to single appends so one refused message does
+        not hold back the others and the messages that still fit under a quota are
+        stored; an out-of-quota NO is the last outcome returned (shorter list) and the
+        caller stops the mailbox. A dropped connection is handled like ``append``:
+        after reconnecting, a batch whose first identifiable message is already present
+        is treated as committed."""
+        if not items:
+            return []
+        if not self.supports_multiappend():
+            return self._append_singly(folder, items)
+        batch = [{"msg": it.mime, "flags": tuple(it.flags), "date": it.internal_date}
+                 for it in items]
+
+        def do_multi(c: IMAPClient) -> object:
+            return c.multiappend(folder, batch)
+
+        if self._client is None:
+            self.connect()
+        try:
+            resp = do_multi(self._client)  # type: ignore[arg-type]
+        except CONNECTION_ERRORS as exc:
+            log.warning("IMAP connection lost during MULTIAPPEND %r (%s); reconnecting once",
+                        folder, exc.__class__.__name__)
+            self._client = None
+            try:
+                self.connect()
+                probe = next((it for it in items if it.message_id), None)
+                if probe is not None and self._search(self._client, folder,  # type: ignore[arg-type]
+                                                      probe.message_id):  # type: ignore[arg-type]
+                    # atomic batch, and its first message is there: all committed
+                    return [self._search(self._client, folder, it.message_id)[-1]  # type: ignore[arg-type]
+                            if it.message_id and self._search(self._client, folder, it.message_id)  # type: ignore[arg-type]
+                            else None for it in items]
+                resp = do_multi(self._client)  # type: ignore[arg-type]
+            except CONNECTION_ERRORS as exc2:
+                self._client = None
+                raise ImapConnectionError(
+                    f"IMAP MULTIAPPEND failed after reconnect: {exc2.__class__.__name__}"
+                ) from exc2
+            except IMAPClientError:
+                return self._append_singly(folder, items)
+        except IMAPClientError as exc:
+            log.info("MULTIAPPEND of %d messages into %r refused (%s); appending one by one",
+                     len(items), folder, _short(exc))
+            return self._append_singly(folder, items)
+        return list(self._uids_from_multiappend(resp, len(items)))
+
+    @staticmethod
+    def _uids_from_multiappend(resp: object, n: int) -> list[int | None]:
+        raw = b" ".join(x for x in (resp[1] if isinstance(resp, tuple) else [resp])
+                        if isinstance(x, bytes)) if isinstance(resp, (tuple, list)) \
+            else (resp if isinstance(resp, bytes) else str(resp).encode())
+        m = _APPENDUID_SET.search(raw)
+        if not m:
+            return [None] * n
+        uids = expand_uid_set(m.group(2).decode("ascii"))
+        return [int(u) for u in uids] if len(uids) == n else [None] * n
 
     def fetch_message(self, folder: str, uid: int) -> bytes:
         """FETCH BODY.PEEK[] of one message (dedupe comparison and verify sampling; does

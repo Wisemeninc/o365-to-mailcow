@@ -33,7 +33,13 @@ from dateutil import parser as dtparser
 
 from .config import Config, MailboxMapping
 from .graph import GraphClient, GraphError, GraphTooLarge, delta_expired
-from .imap_dest import ImapConnectionError, ImapDestination, ImapError, is_quota_error
+from .imap_dest import (
+    AppendItem,
+    ImapConnectionError,
+    ImapDestination,
+    ImapError,
+    is_quota_error,
+)
 from .report import NullProgress, Progress
 from .state import STATUS_DONE, STATUS_FAILED, STATUS_SKIPPED, State
 
@@ -57,7 +63,9 @@ INDEX_THRESHOLD = 200  # candidates below this use one SEARCH each instead of an
 SURPLUS_LIMIT = 2000  # surplus copies listed per folder in the verify report
 LIST_PAGE_SIZE = 999  # messages: Graph allows up to 1000 per page; 10x fewer round trips
 DOWNLOAD_WORKERS = 4
-PREFETCH_WINDOW = 4  # at most this many downloads queued; also bounded by a byte budget
+PREFETCH_WINDOW = 8  # at most this many downloads queued; also bounded by a byte budget
+APPEND_BATCH = 20  # messages per MULTIAPPEND command (ISC-193) ...
+APPEND_BATCH_BYTES = 8 * 1024 * 1024  # ... or fewer when their MIME exceeds this
 MIME_OVERHEAD = 1.4  # MAPI size -> rough MIME size (base64 attachments)
 MAX_KEYWORDS = 20
 MAX_KEYWORD_LEN = 50  # Dovecot's default mail_max_keyword_length
@@ -835,6 +843,49 @@ class MailMigrator:
                 queued_bytes += est
                 pending.append((nxt, pool.submit(self._download, nxt["id"]), est))
 
+        batch: list[tuple[dict, str | None, AppendItem]] = []  # (msg, mid, item)
+        batch_bytes = 0
+
+        def flush() -> bool:
+            """APPEND the batch (one MULTIAPPEND); False when the mailbox must stop."""
+            nonlocal batch, batch_bytes
+            if not batch:
+                return True
+            items = [it for _, _, it in batch]
+            try:
+                outcomes = dest.append_many(name, items)
+            except ImapConnectionError as exc:  # ISC-100: reconnect already failed once
+                for m, mid, _ in batch:
+                    self._state.mark_message(src, fid, m["id"], name, mid, STATUS_FAILED,
+                                             error=str(exc))
+                    fr.failed += 1
+                for _, other, _e in pending:
+                    other.cancel()
+                self._stop(result, fp, exc)
+                batch, batch_bytes = [], 0
+                return False
+            stop: ImapError | None = None
+            for (m, mid, _), outcome in zip(batch, outcomes, strict=False):
+                if isinstance(outcome, ImapError):  # this one message was refused
+                    self._state.mark_message(src, fid, m["id"], name, mid, STATUS_FAILED,
+                                             error=str(outcome))
+                    fr.failed += 1
+                    if is_quota_error(outcome):  # ISC-99: out of space, stop this mailbox
+                        stop = outcome
+                        break
+                else:
+                    self._state.mark_message(src, fid, m["id"], name, mid, STATUS_DONE,
+                                             dest_uid=outcome, uidvalidity=uidvalidity)
+                    fr.appended += 1
+                self._progress.advance(self._key)
+            batch, batch_bytes = [], 0  # unattempted messages stay unrecorded: retried
+            if stop is not None:
+                for _, other, _e in pending:
+                    other.cancel()
+                self._stop(result, fp, stop)
+                return False
+            return True
+
         refill()
         while pending:
             msg, fut, est = pending.popleft()
@@ -855,32 +906,14 @@ class MailMigrator:
                 fr.failed += 1
                 self._progress.advance(self._key)
                 continue
-            try:
-                uid = dest.append(name, mime, imap_flags(msg), internal_date(msg),
-                                  message_id=mid)
-            except ImapError as exc:
-                self._state.mark_message(src, fid, gid, name, mid, STATUS_FAILED,
-                                         error=str(exc))
-                fr.failed += 1
-                if not is_quota_error(exc):  # one refused message must not halt a mailbox
-                    self._progress.advance(self._key)
-                    continue
-                for _, other, _e in pending:  # ISC-99: out of space, stop this mailbox
-                    other.cancel()
-                self._stop(result, fp, exc)
+            if batch and batch_bytes + len(mime) > APPEND_BATCH_BYTES and not flush():
                 return
-            except ImapConnectionError as exc:  # ISC-100: reconnect already failed once
-                self._state.mark_message(src, fid, gid, name, mid, STATUS_FAILED,
-                                         error=str(exc))
-                fr.failed += 1
-                for _, other, _e in pending:
-                    other.cancel()
-                self._stop(result, fp, exc)
+            batch.append((msg, mid, AppendItem(mime, tuple(imap_flags(msg)),
+                                               internal_date(msg), mid)))
+            batch_bytes += len(mime)
+            if len(batch) >= APPEND_BATCH and not flush():
                 return
-            self._state.mark_message(src, fid, gid, name, mid, STATUS_DONE,
-                                     dest_uid=uid, uidvalidity=uidvalidity)
-            fr.appended += 1
-            self._progress.advance(self._key)
+        flush()
 
     # -- verify ------------------------------------------------------------------------
 

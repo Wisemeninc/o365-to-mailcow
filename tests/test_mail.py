@@ -315,11 +315,25 @@ def test_interrupted_run_resumes_without_reappending_isc_101(env):
 
     with pytest.raises(Killed):
         migrator(cfg, state, world, graph, imap_cls=Dies).migrate()
-    assert len(world.folders["INBOX"]) == 1
-    assert state.done_message_ids(MAPPING.source, "f-inbox") == {"m2"}
+    # the batch died on the server: MULTIAPPEND is atomic, nothing stored, nothing recorded
+    assert world.folders["INBOX"] == []
+    assert state.done_message_ids(MAPPING.source, "f-inbox") == set()
     migrator(cfg, state, world, graph).migrate()
-    assert len(world.folders["INBOX"]) == 2  # only the missing one was appended
+    assert len(world.folders["INBOX"]) == 2
     assert state.done_message_ids(MAPPING.source, "f-inbox") == {"m1", "m2"}
+
+
+def test_batch_stored_but_unrecorded_is_found_by_message_id_on_resume(env):
+    """The kill window of a batch: the server kept it, the process died before the
+    marks. Every message with a Message-ID is found again by content, not re-sent."""
+    cfg, state, world, graph = env
+    FakeImap(world).ensure_folder("INBOX")
+    pre = FakeImap(world)
+    pre.append("INBOX", mime("<m1@x>", "one"), [], datetime.now(UTC))  # stored, unrecorded
+    res = migrator(cfg, state, world, graph).migrate()
+    inbox = next(f for f in res.folders if f.dest_name == "INBOX")
+    assert inbox.dedup_hits == 1 and inbox.appended == 1  # m2 (no Message-ID) appended
+    assert [s.message_id for s in world.folders["INBOX"]] == ["<m1@x>", None]
 
 
 def test_single_imap_connection_downloads_on_threads_isc_102(env):
@@ -569,3 +583,35 @@ def test_verify_lists_surplus_copies_with_uids_isc_190(env):
     lines, _ = __import__("o365_to_mailcow.report", fromlist=["verify_summary"]).verify_summary(
         {MAPPING.source: {"mail": __import__("dataclasses").asdict(v)}})
     assert any("1 surplus copy of migrated messages" in ln for ln in lines)
+
+
+def test_appends_go_out_in_batches_of_at_most_twenty_isc_193(env):
+    cfg, state, world, graph = env
+    from o365_to_mailcow import mail as mail_mod
+
+    n = mail_mod.APPEND_BATCH * 2 + 3
+    msgs = _many(n)
+    graph.routes[f"{U}/mailFolders/f-inbox/messages"] = msgs
+    for m in msgs:
+        graph.routes[f"{U}/messages/{m['id']}/$value"] = mime(m["internetMessageId"], m["id"])
+    res = migrator(cfg, state, world, graph).migrate()
+    inbox = next(f for f in res.folders if f.dest_name == "INBOX")
+    assert inbox.appended == n and inbox.failed == 0
+    assert world.batches == [mail_mod.APPEND_BATCH, mail_mod.APPEND_BATCH, 3]
+    assert len(state.done_message_ids(MAPPING.source, "f-inbox")) == n
+    uids = [state._row("SELECT dest_uid FROM messages WHERE graph_id=?", (m["id"],))[0]
+            for m in sorted(msgs, key=lambda m: m["id"])]
+    assert all(isinstance(u, int) for u in uids)
+
+
+def test_a_big_message_closes_the_batch_early(env, monkeypatch):
+    cfg, state, world, graph = env
+    from o365_to_mailcow import mail as mail_mod
+
+    monkeypatch.setattr(mail_mod, "APPEND_BATCH_BYTES", 100)
+    msgs = _many(4)
+    graph.routes[f"{U}/mailFolders/f-inbox/messages"] = msgs
+    for m in msgs:
+        graph.routes[f"{U}/messages/{m['id']}/$value"] = mime(m["internetMessageId"], "y" * 60)
+    migrator(cfg, state, world, graph).migrate()
+    assert world.batches == [1, 1, 1, 1]  # each ~80 bytes: two never fit under 100
