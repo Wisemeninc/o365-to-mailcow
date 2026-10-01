@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from o365_to_mailcow import config
 from o365_to_mailcow.config import (
     APP_SCOPES,
     ConfigError,
@@ -155,3 +156,31 @@ def test_example_config_parses_and_loads(tmp_path):
     cfg = load_config(str(target), env={"O365MIG_CLIENT_SECRET": "s3cret-value",
                                         "O365MIG_MAILCOW_API_KEY": "api-key-value"})
     assert cfg.mailboxes and any(m.aliases for m in cfg.mailboxes)
+
+
+# -- third review round ------------------------------------------------------------------
+
+@pytest.mark.parametrize("host, ok", [
+    ("mail.example.net", True), ("1mail.example.net", True), ("1.example.net", True),
+    ("xn--bcher-kva.example", True), ("mail.example.123", False), ("example.0x1", False),
+    ("0x7f.0.0.1", False), ("127.1", False), ("2130706433", False), ("127.0.0.1", False),
+    ("0177.0.0.1", False), ("localhost", False),  # the regex wants a dotted name
+])
+def test_valid_hostname_checks_the_last_label_and_inet_aton(host, ok):
+    assert config.valid_hostname(host) is ok
+
+
+def test_load_config_refuses_an_alias_used_by_another_mailbox(tmp_path):
+    rows = ("# source,destination,name,quota_mib,aliases\n"
+            "a@contoso.com,a@example.net,,,shared@example.net\n"
+            "b@contoso.com,b@example.net,,,shared@example.net\n")
+    csv_path = tmp_path / "m.csv"
+    csv_path.write_text(rows, encoding="utf-8")
+    p = tmp_path / "c.toml"
+    p.write_text('[microsoft]\ntenant_id = "t"\nclient_id = "c"\n'
+                 '[mailcow]\nhost = "mail.example.net"\n'
+                 f'[run]\nmailboxes_csv = "{csv_path}"\n', encoding="utf-8")
+    os.chmod(p, 0o600)
+    with pytest.raises(config.ConfigError, match="shared@example.net"):
+        config.load_config(str(p), env={"O365MIG_CLIENT_SECRET": "s" * 12,
+                                        "O365MIG_MAILCOW_API_KEY": "k" * 12})

@@ -90,8 +90,9 @@ Use this only if your tenant forbids application permissions.
      -AccessRights FullAccess -AutoMapping $false
    ```
 5. Set `auth_mode = "delegated"`. On the first run the tool prints a URL and a code; sign
-   in on any device. The token cache is stored in `state/msal_cache.bin` (mode 0600) so
-   later runs do not prompt again.
+   in on any device. The token cache is stored in `state/msal_cache_<id>.bin` (mode 0600,
+   `<id>` derived from the tenant, client and mailcow host, so a changed connection
+   starts signed out) and later runs do not prompt again.
 
 If sign-in fails with a policy error, a Conditional Access policy is probably blocking
 the **device code flow** (Conditions > *Authentication flows*). Exclude the administrator
@@ -222,7 +223,11 @@ was skipped, failed or mismatched), **2** configuration or sign-in error.
 Every run writes `state/reports/<UTC timestamp>.json` (per mailbox, per folder, per
 calendar and address book: counts, failures, skips, durations) and a log in
 `state/logs/`. Progress (done/total and items per minute per mailbox) is printed at
-least every 30 seconds.
+least every 30 seconds. The counter stays at `0/N` while a folder is being listed from
+Graph: each folder is listed completely (999 messages per request) before its messages
+are copied, so a 100 000-message Inbox shows `0/N` for a few minutes first, and a
+re-run after an interrupted run lists that folder again before it skips what was
+already copied.
 
 ### Web UI (optional)
 
@@ -260,10 +265,12 @@ services:
   Two rules protect the credentials: a saved mailcow host is only ever used with the API
   key saved *with* it, and saved tenant or client ids only with the client secret saved
   with them; the page can never pair a new host with a key from `.env` or the config
-  file. Changing the mailcow host or the tenant/client ids re-pairs the whole connection:
-  the client secret must be entered again in the same save (app mode) and any cached
-  delegated sign-in is discarded, so a page token alone can never redirect a migration
-  that uses your Microsoft credential. The "no IP address" rule on the host is defence in
+  file. Changing the mailcow host, the tenant/client ids or the sign-in mode re-pairs
+  the whole connection: the saved client secret is dropped and must be entered again in
+  the same save (app mode; delegated mode never stores one) and every cached sign-in
+  (`state/msal_cache*.bin`) is discarded, so a page token alone can never redirect a
+  migration that uses your Microsoft credential. Settings cannot be changed while a
+  job is running (HTTP 409). The "no IP address" rule on the host is defence in
   depth only (wildcard DNS names exist); the pairing rule is the control. Every change is logged with the
   field names. `o365mig web --lock-settings` makes the panel read-only for hardened
   setups; `--allow-host NAME` accepts an extra `Host` header value (loopback and the bind
@@ -410,8 +417,8 @@ still produce a few failures per run. If the container's address gets banned, un
 - `state/state.db` (mode 0600) is the idempotency ledger: identifiers, statuses, error
   summaries, app-password IDs. It never contains message content or credentials. Keep it
   between runs; deleting it makes the next run fall back to Message-ID checks.
-- In delegated mode, `state/msal_cache.bin` holds a refresh token with Full Access to
-  every migrated mailbox. **Delete it when the migration is finished.**
+- In delegated mode, `state/msal_cache_<id>.bin` holds a refresh token with Full Access
+  to every migrated mailbox. **Delete it when the migration is finished.**
 - App-password IDs are recorded *before* use; a crashed run's leftovers are deleted by
   the next `migrate` or by `cleanup`. Do not run `cleanup` while a `migrate` is running.
 - Secrets are read from the environment, never logged, never written to state or reports.

@@ -83,7 +83,7 @@ def test_app_mode_client_credentials_isc_22(tmp_path):
     assert app.kwargs["authority"] == "https://login.microsoftonline.com/tenant"
     assert app.kwargs["client_credential"] == "client-secret-value-123"
     assert app.calls == [("client", ["https://graph.microsoft.com/.default"])]
-    assert not (tmp_path / "state" / "msal_cache.bin").exists()  # nothing persisted
+    assert not list((tmp_path / "state").glob("msal_cache*.bin"))  # nothing persisted
 
 
 def test_delegated_device_code_prints_code_and_url_isc_23_24(tmp_path):
@@ -110,8 +110,11 @@ def test_msal_adds_offline_access_itself_isc_24():
 def test_delegated_cache_persisted_mode_0600_isc_25(tmp_path):
     cfg = make_config(tmp_path, auth_mode="delegated", client_secret=None)
     TokenProvider(cfg, out=io.StringIO()).get_token()
-    path = tmp_path / "state" / "msal_cache.bin"
-    assert path.is_file()
+    from o365_to_mailcow.config import connection_id
+
+    path = tmp_path / "state" / f"msal_cache_{connection_id(cfg)}.bin"
+    assert path.is_file()  # keyed by tenant|client|host: a new connection starts signed out
+    assert len(connection_id(cfg)) == 16
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     tp2 = TokenProvider(cfg, out=io.StringIO())
     assert tp2._cache.loaded == '{"AccessToken": {}}'

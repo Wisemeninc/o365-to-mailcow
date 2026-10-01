@@ -89,6 +89,7 @@ MAX_PARTIAL_CHARS = 65_536
 TAIL_LINES = 200
 MAX_JOBS_KEPT = 20
 JOB_COMMANDS = ("plan", "provision", "migrate", "verify", "cleanup")
+_SNAPSHOT_PLACEHOLDER = "<selection-snapshot>"
 JOB_OPTIONS = frozenset({"command", "dry_run", "only", "mailbox", "sample", "selection_digest",
                          "mail_since"})
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -124,7 +125,7 @@ def page_csp(nonce: str) -> str:
             "frame-ancestors 'none'")
 
 
-def _host_only(value: str) -> str:
+def host_only(value: str) -> str:
     """``host``, ``host:port``, ``[v6]`` or ``[v6]:port`` -> the bare host."""
     if value.startswith("["):
         return value[1:].partition("]")[0]
@@ -387,6 +388,9 @@ class WebApp:
         self._secrets = cli.SecretFilter()
         for value in (cfg.client_secret, cfg.mailcow_api_key, token):
             self._secrets.add(value)
+        for stale in (cfg.state_dir / "jobs").glob("selection-*.csv"):  # earlier process
+            with contextlib.suppress(OSError):
+                stale.unlink()
 
     def redact(self, text: str) -> str:
         return self._secrets.redact(text)
@@ -481,26 +485,37 @@ class WebApp:
             except ConfigError:
                 current = {}  # a broken file is replaced, never a dead end
             cur_ms, cur_mc = current.get("microsoft", {}), current.get("mailcow", {})
+            if self.running_job() is not None:
+                # a running job holds a sign-in in memory and would rewrite its cache file
+                raise HttpError(409, "a job is running; change the connection settings when "
+                                     "it has finished")
             ids_changed = (tenant_id, client_id) != (cur_ms.get("tenant_id"),
                                                      cur_ms.get("client_id"))
-            host_changed = bool(cur_mc.get("host")) and host != cur_mc.get("host")
-            # A change of the destination host re-pairs the *whole* connection: the
-            # Microsoft side must be proven again too, otherwise a token holder could keep
-            # the operator's Graph credential and point the migration at their own server.
-            if host_changed or ids_changed:
-                if auth_mode == "app" and client_secret is None:
-                    raise HttpError(400, "changing the mailcow host or the tenant/client ids "
-                                         "requires entering the client secret again")
-                self._discard_sign_ins()  # delegated: a human must sign in again
-            if client_secret is None and not cur_ms.get("client_secret") and auth_mode == "app":
+            saved_host = cur_mc.get("host") or self.cfg.mailcow_host or ""
+            host_changed = bool(saved_host) and host != saved_host
+            mode_changed = auth_mode != cur_ms.get("auth_mode", auth_mode)
+            # A change of the destination host, of the tenant/client ids or of the sign-in
+            # mode re-pairs the *whole* connection: the saved client secret never carries
+            # over, and every cached delegated sign-in is discarded, otherwise a token
+            # holder could keep the operator's Graph credential and point the migration
+            # at their own server.
+            repair = host_changed or ids_changed or mode_changed
+            if repair and auth_mode == "app" and client_secret is None:
+                raise HttpError(400, "changing the mailcow host, the tenant/client ids or the "
+                                     "sign-in mode requires entering the client secret again")
+            if client_secret is None and auth_mode == "app" and not cur_ms.get("client_secret"):
                 raise HttpError(400, "enter the client secret together with the tenant and "
                                      "client ids")
-            if client_secret is None:
-                client_secret = cur_ms.get("client_secret") if not ids_changed else None
+            if client_secret is None and not repair:
+                client_secret = cur_ms.get("client_secret")
+            if auth_mode != "app":
+                client_secret = None  # delegated mode stores no secret, ever
             if api_key is None:
                 if host_changed or not cur_mc.get("api_key"):
                     raise HttpError(400, "enter the mailcow API key together with the host")
                 api_key = cur_mc.get("api_key")
+            if repair:
+                self._discard_sign_ins()  # after every validation passed
 
             out_ms = {"tenant_id": tenant_id, "client_id": client_id, "auth_mode": auth_mode}
             if client_secret:
@@ -529,6 +544,9 @@ class WebApp:
                         path, ", ".join(changed) or "nothing", host)
             self._reload()
         return self.settings()
+
+    def _web_cache_path(self) -> Path:
+        return self.cfg.state_dir / f"msal_cache_web_{config_mod.connection_id(self.cfg)}.bin"
 
     def _discard_sign_ins(self) -> None:
         """Delete every MSAL token cache in the state directory (web and job caches), so a
@@ -561,8 +579,7 @@ class WebApp:
             result["graph_users"] = {"ok": None, "message": "checked after sign-in"}
         else:
             try:
-                cache = self.cfg.state_dir / "msal_cache_web.bin"
-                tokens = TokenProvider(self.cfg, cache_path=cache, out=self.out)
+                tokens = TokenProvider(self.cfg, cache_path=self._web_cache_path(), out=self.out)
                 tokens.get_token()
                 result["microsoft"] = {"ok": True, "message": "signed in (client credentials)"}
                 try:
@@ -590,8 +607,7 @@ class WebApp:
             tokens = self._tokens
         if tokens is None:  # built outside the lock: MSAL may contact the authority
             # own cache file: a page-started job's TokenProvider writes msal_cache.bin
-            tokens = TokenProvider(self.cfg, cache_path=self.cfg.state_dir / "msal_cache_web.bin",
-                                   out=self.out)
+            tokens = TokenProvider(self.cfg, cache_path=self._web_cache_path(), out=self.out)
             with self._lock:
                 self._tokens = tokens = self._tokens or tokens
         return tokens
@@ -645,7 +661,10 @@ class WebApp:
             return {"path": str(path), "rows": [], "digest": None}
         try:
             mappings = _read_mailboxes_csv(path)
-        except (ConfigError, OSError, ValueError, csv.Error) as exc:
+        except ConfigError as exc:  # e.g. an alias edited by hand into something invalid
+            raise HttpError(409, f"the saved selection is invalid; fix or re-save it: "
+                                 f"{clean(exc)[:300]}") from exc
+        except (OSError, ValueError, csv.Error) as exc:
             raise HttpError(500, f"cannot read {path}: {clean(exc)[:300]}") from exc
         rows = [{"source": m.source, "destination": m.destination, "name": m.name or "",
                  "quota_mib": m.quota_mib, "aliases": list(m.aliases)} for m in mappings]
@@ -657,15 +676,17 @@ class WebApp:
             raise HttpError(400, f"rows must be a list of at most {MAX_SELECTION_ROWS} rows")
         parsed: list[dict[str, Any]] = []
         sources: set[str] = set()
-        destinations: set[str] = set()
+        taken: dict[str, int] = {}  # destination or alias -> row that claims it
         for n, row in enumerate(rows, 1):
             entry = _selection_row(row, n)
             if entry["source"] in sources:
                 raise HttpError(400, f"row {n}: duplicate source {entry['source']}")
-            if entry["destination"] in destinations:
-                raise HttpError(400, f"row {n}: duplicate destination {entry['destination']}")
             sources.add(entry["source"])
-            destinations.add(entry["destination"])
+            for address in (entry["destination"], *entry["aliases"]):
+                if address in taken:
+                    raise HttpError(400, f"row {n}: {address} is already used by row "
+                                         f"{taken[address]} (as destination or alias)")
+                taken[address] = n
             parsed.append(entry)
         self._write_selection(parsed)
         return {"path": str(self.selection_path), "rows": parsed,
@@ -700,8 +721,9 @@ class WebApp:
 
     # -- jobs --------------------------------------------------------------------------
 
-    def _job_argv(self, body: object) -> tuple[str, list[str]]:
-        """Validated request -> ``cli.main`` arguments. Only these five options exist."""
+    def _job_argv(self, body: object) -> tuple[str, list[str], bytes | None]:
+        """Validated request -> ``cli.main`` arguments plus the selection bytes a
+        per-job snapshot is written from (``start_job`` substitutes its path)."""
         if not isinstance(body, dict):
             raise HttpError(400, "the body must be a JSON object")
         unknown = sorted(str(k) for k in set(body) - JOB_OPTIONS)
@@ -733,6 +755,7 @@ class WebApp:
         if isinstance(sample, bool) or not isinstance(sample, int) or not 0 <= sample <= MAX_SAMPLE:
             raise HttpError(400, f"sample must be an integer from 0 to {MAX_SAMPLE}")
         argv = ["--config", self.config_path] if self.config_path else []
+        snapshot: bytes | None = None
         if command != "cleanup":
             # page-started jobs act on the saved selection alone (never the config's own
             # list), and only on the exact bytes the operator confirmed: those are copied
@@ -749,13 +772,8 @@ class WebApp:
                                          "(F5) and start the job again")
                 raise HttpError(409, "the saved selection changed since the page loaded it; "
                                      "reload the selection and start the job again")
-            jobs_dir = self.cfg.state_dir / "jobs"
-            jobs_dir.mkdir(mode=0o700, exist_ok=True)
-            fd, snapshot = tempfile.mkstemp(prefix="selection-", suffix=".csv", dir=jobs_dir)
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(data)
-            os.chmod(snapshot, 0o600)
-            argv += ["--mailboxes", snapshot, "--mailboxes-only"]
+            argv += ["--mailboxes", _SNAPSHOT_PLACEHOLDER, "--mailboxes-only"]
+            snapshot = data
         elif self.selection_path.is_file():
             argv += ["--mailboxes", str(self.selection_path), "--mailboxes-only"]
         argv.append(command)
@@ -769,7 +787,7 @@ class WebApp:
             argv += ["--sample", str(sample)]
         if mail_since and command in ("plan", "migrate", "verify"):
             argv += ["--mail-since", mail_since]
-        return command, argv
+        return command, argv, snapshot
 
     def _running(self) -> Job | None:  # caller holds the lock
         return next((job for job in self._jobs.values() if job.running), None)
@@ -779,11 +797,14 @@ class WebApp:
             return self._running()
 
     def start_job(self, body: object) -> Job:
-        command, argv = self._job_argv(body)
-        with self._lock:
+        command, argv, data = self._job_argv(body)
+        with self._settings_lock, self._lock:  # settings cannot change under a starting job
             running = self._running()
             if running is not None:
                 raise HttpError(409, f"job {running.id} ({running.command}) is still running")
+            if data is not None:  # written only for a job that really starts
+                snapshot = self._write_snapshot(data)
+                argv = [snapshot if a == _SNAPSHOT_PLACEHOLDER else a for a in argv]
             self._seq += 1
             job = Job(secrets.token_hex(8), self._seq, command, argv, JobOutput(self.redact))
             finished = sorted((j for j in self._jobs.values() if not j.running),
@@ -800,6 +821,14 @@ class WebApp:
             log.info("job %s started: %s", job.id, " ".join(argv))
         return job
 
+    def _write_snapshot(self, data: bytes) -> str:
+        jobs_dir = self.cfg.state_dir / "jobs"
+        jobs_dir.mkdir(mode=0o700, exist_ok=True)
+        fd, snapshot = tempfile.mkstemp(prefix="selection-", suffix=".csv", dir=jobs_dir)
+        with os.fdopen(fd, "wb") as fh:  # mkstemp creates the file 0600
+            fh.write(data)
+        return snapshot
+
     def _run(self, job: Job) -> None:
         code = 1
         try:
@@ -810,6 +839,12 @@ class WebApp:
             log.error("job %s (%s) crashed: %s", job.id, job.command, exc.__class__.__name__)
             job.output.write(f"job failed: {exc.__class__.__name__}: {exc}\n")
         finally:
+            for i, arg in enumerate(job.args):  # the private selection snapshot, if any
+                if arg == "--mailboxes" and i + 1 < len(job.args):
+                    with contextlib.suppress(OSError):
+                        snap = Path(job.args[i + 1])
+                        if snap.parent == self.cfg.state_dir / "jobs":
+                            snap.unlink()
             job.output.close()  # before `finished`: a finished job's output is complete
             with self._lock:
                 job.exit_code = code
@@ -929,20 +964,15 @@ class Handler(BaseHTTPRequestHandler):
         if len(self.headers.get_all("Host") or []) > 1:
             raise HttpError(400, "duplicate Host header")
         host = (self.headers.get("Host") or "").strip().lower()
-        hostname = _host_only(host)
+        hostname = host_only(host)
         allowed = self.server.allowed_hosts
         if hostname and hostname not in allowed and not is_loopback(hostname):
             raise HttpError(421, "unexpected Host header")
         origin = self.headers.get("Origin")
         if origin and self.command != "GET":
             origin_authority = origin.split("://", 1)[-1].lower().rstrip("/")
-            origin_host = _host_only(origin_authority)
-            same_authority = host and origin_authority == host
-            if not same_authority and (origin_host not in allowed
-                                       and not is_loopback(origin_host)):
+            if origin_authority != host:  # the browser's Origin names the Host it used
                 raise HttpError(403, "cross-origin request refused")
-            if origin_host and is_loopback(origin_host) and host and origin_authority != host:
-                raise HttpError(403, "cross-origin request refused (port differs)")
 
     def _api(self, path: str, query: dict[str, list[str]], body: bytes) -> Response:
         app, method = self.server.app, self.command

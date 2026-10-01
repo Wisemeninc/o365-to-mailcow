@@ -1840,8 +1840,18 @@
       const buildSelection = () => {
         const rows = [];
         const problems = [];
-        const byDest = new Set();
+        const taken = new Map(); // destination or alias -> the source that claims it
         const destRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        // the same rule as the server: an address is one mailbox's destination or one
+        // mailbox's alias, never two things at once
+        const claim = (owner, address, what) => {
+          const lower = address.toLowerCase();
+          if (taken.has(lower)) {
+            problems.push(owner + ": " + what + " " + lower + " is already used by " + taken.get(lower));
+          } else {
+            taken.set(lower, owner);
+          }
+        };
 
         for (const row of state.rows) {
           if (!row.chk.checked) {
@@ -1887,12 +1897,9 @@
           }
 
           rows.push({ source, destination, name, quota_mib: quota, aliases });
-
-          const lower = destination.toLowerCase();
-          if (byDest.has(lower)) {
-            problems.push("duplicate destination " + destination);
-          } else {
-            byDest.add(lower);
+          claim(source, destination, "destination");
+          for (const alias of aliases) {
+            claim(source, alias, "alias");
           }
         }
 
@@ -1905,11 +1912,11 @@
             aliases: Array.isArray(row.aliases) ? row.aliases : [],
           };
           rows.push(copy);
-          const lower = copy.destination.toLowerCase();
-          if (byDest.has(lower)) {
-            problems.push("duplicate destination " + copy.destination);
-          } else {
-            byDest.add(lower);
+          claim(copy.source, copy.destination, "destination");
+          for (const alias of copy.aliases) {
+            if (isStr(alias)) {
+              claim(copy.source, alias, "alias");
+            }
           }
         }
 
@@ -1936,8 +1943,8 @@
 
         try {
           const saved = await api("PUT", "/api/selection", { body: { rows: built.rows } });
-          // the server answers with what it wrote; jobs must name that exact version
-          state.savedRows = built.rows;
+          // the server answers with what it wrote (normalised); jobs name that exact version
+          state.savedRows = validateSelection(saved).rows;
           state.selectionDigest = isObject(saved) && isStr(saved.digest) ? saved.digest : null;
           renderSaved();
           renderNotFound();

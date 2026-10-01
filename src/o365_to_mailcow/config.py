@@ -8,6 +8,7 @@ file's permissions are checked and a warning is emitted when it is readable by o
 from __future__ import annotations
 
 import csv
+import hashlib
 import logging
 import os
 import re
@@ -53,8 +54,8 @@ def valid_hostname(value: str) -> bool:
     hex labels (``0x7f.0.0.1``, ``127.0.0.0x1``), nothing ``inet_aton`` accepts."""
     if not _HOSTNAME.match(value):
         return False
-    labels = value.lower().split(".")
-    if any(label.isdigit() or label.startswith("0x") for label in labels):
+    last = value.lower().rsplit(".", 1)[-1]
+    if last.isdigit() or last.startswith("0x"):  # RFC 1123: the TLD is never all-numeric
         return False
     try:
         socket.inet_aton(value)
@@ -68,6 +69,13 @@ def valid_address(value: str) -> bool:
     local, _, domain = value.partition("@")
     return bool(local) and len(local) <= 64 and bool(_LOCAL_PART.match(local)) \
         and valid_hostname(domain)
+
+
+def connection_id(cfg: Config) -> str:
+    """Short digest naming the tenant/client/host triple, used to key the MSAL token
+    caches so a cached sign-in never serves a different connection."""
+    raw = f"{cfg.tenant_id}|{cfg.client_id}|{cfg.mailcow_host}".encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 
 def _bool(section: dict, key: str, default: bool) -> bool:

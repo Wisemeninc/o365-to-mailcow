@@ -722,9 +722,9 @@ def cmd_web(cfg: Config, opts: Options, bind: str, port: int, err: TextIO,
             lock_settings: bool = False, allowed_hosts: list[str] | None = None) -> int:
     """Serve the web UI until Ctrl-C (security model: see ``web.py``). Takes no state lock:
     each job started from the page runs ``main`` and takes it then."""
-    allowed_hosts = [h.rsplit(":", 1)[0] if h.count(":") == 1 else h
-                     for h in (allowed_hosts or [])]
     from . import web  # imported here because web imports this module
+
+    allowed_hosts = [web.host_only(h) for h in (allowed_hosts or [])]  # host, host:port, [v6]
 
     token = os.environ.get(web.ENV_TOKEN) or secrets.token_urlsafe(32)
     if len(token) < web.MIN_TOKEN_CHARS:

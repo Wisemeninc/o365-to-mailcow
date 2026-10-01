@@ -51,6 +51,7 @@ MESSAGE_EXPAND = f"singleValueExtendedProperties($filter=id eq '{SIZE_PROPERTY}'
 FOLDER_SIZE_PROPERTY = "Long 0x0E08"
 FOLDER_EXPAND = f"singleValueExtendedProperties($filter=id eq '{FOLDER_SIZE_PROPERTY}')"
 PAGE_SIZE = 100
+LIST_PAGE_SIZE = 999  # messages: Graph allows up to 1000 per page; 10x fewer round trips
 DOWNLOAD_WORKERS = 4
 PREFETCH_WINDOW = 4  # at most this many downloads queued; also bounded by a byte budget
 MIME_OVERHEAD = 1.4  # MAPI size -> rough MIME size (base64 attachments)
@@ -467,8 +468,8 @@ class MailMigrator:
     def _list_messages(self, folder_id: str) -> Iterator[dict]:
         return self._graph.iter_pages(
             self._user_path(f"mailFolders/{folder_id}/messages"),
-            params={"$select": MESSAGE_SELECT, "$top": PAGE_SIZE, "$expand": MESSAGE_EXPAND,
-                    **self._cutoff_filter()},
+            params={"$select": MESSAGE_SELECT, "$top": LIST_PAGE_SIZE,
+                    "$expand": MESSAGE_EXPAND, **self._cutoff_filter()},
             headers=PREFER_IMMUTABLE,
         )
 

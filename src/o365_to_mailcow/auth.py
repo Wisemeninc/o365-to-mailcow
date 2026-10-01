@@ -20,7 +20,7 @@ from pathlib import Path
 
 import msal
 
-from .config import Config
+from .config import Config, connection_id
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +36,9 @@ class TokenProvider:
         self._cfg = cfg
         self._scopes = cfg.scopes
         self._out = out or sys.stdout
-        self._cache_path = cache_path or (cfg.state_dir / "msal_cache.bin")
+        # one cache per tenant/client/host triple: a changed connection starts signed out
+        self._cache_path = cache_path or (
+            cfg.state_dir / f"msal_cache_{connection_id(cfg)}.bin")
         self._cache = msal.SerializableTokenCache()
         self._load_cache()
         if cfg.auth_mode == "app":

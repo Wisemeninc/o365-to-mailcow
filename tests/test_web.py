@@ -6,6 +6,7 @@ Graph and MSAL are faked, mailcow is recorded with ``responses``.
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import io
 import json
@@ -478,7 +479,7 @@ def test_selection_roundtrip_writes_a_0600_csv_the_cli_reads_isc_159(client, tmp
 
 @pytest.mark.parametrize("rows, fragment", [
     ([GOOD, {**GOOD, "source": "b@contoso.com", "destination": "A@Example.net"}],
-     "duplicate destination"),
+     "already used by row 1"),
     ([GOOD, {**GOOD, "destination": "b@example.net"}], "duplicate source"),
     ([{**GOOD, "source": "not-an-address"}], "source"),
     ([{**GOOD, "destination": "a,b@example.net"}], "destination"),
@@ -508,8 +509,8 @@ def test_selection_unreadable_file_is_reported(client):
     client.state_dir.mkdir(parents=True, exist_ok=True)
     client.selection.write_text("alice@contoso.com,alice@example.net,A,lots\n", encoding="utf-8")
     r = client.get("/api/selection")
-    assert r.status == 500
-    assert "quota" in r.json()["error"]
+    assert r.status == 409  # a hand-edited, invalid file: the page says to re-save it
+    assert "quota" in r.json()["error"] and "invalid" in r.json()["error"]
 
 
 # -- jobs ------------------------------------------------------------------------------
@@ -522,6 +523,9 @@ def test_job_runs_cli_main_and_captures_output_isc_160_161(client, monkeypatch):
         print("plan output line", file=stdout)
         stderr.write(f"leak {API_KEY} {CLIENT_SECRET} {TOKEN}\n")
         print("no trailing newline", end="", file=stdout)
+        snapshot = argv[argv.index("--mailboxes") + 1]
+        seen["snapshot_bytes"] = Path(snapshot).read_bytes()
+        seen["snapshot_mode"] = oct(Path(snapshot).stat().st_mode & 0o777)
         return 0
 
     monkeypatch.setattr(cli, "main", fake_main)
@@ -538,7 +542,8 @@ def test_job_runs_cli_main_and_captures_output_isc_160_161(client, monkeypatch):
     job = wait_job(client, job_id)
     argv = seen["argv"]
     snapshot = argv[argv.index("--mailboxes") + 1]  # a private copy of the confirmed bytes
-    assert Path(snapshot).read_bytes() == client.selection.read_bytes()
+    assert seen["snapshot_bytes"] == client.selection.read_bytes()
+    assert seen["snapshot_mode"] == "0o600" and not Path(snapshot).exists()
     assert argv == ["--config", str(client.conf), "--mailboxes", snapshot,
                     "--mailboxes-only", "plan", "--dry-run"]
     assert job["exit_code"] == 0 and job["running"] is False
@@ -571,10 +576,12 @@ def test_job_options_become_cli_arguments_isc_160(client, monkeypatch):
                                   "selection_digest": digest})
     job = wait_job(client, r.json()["id"])
     assert job["exit_code"] == 1
-    assert argvs[0][:2] == ["--config", str(client.conf)]
-    assert argvs[0][2] == "--mailboxes" and argvs[0][4:] == [
-        "--mailboxes-only", "verify", "--only", "mail", "--mailbox=alice@example.net",
-        "--sample", "5"]
+    snapshot = argvs[0][3]
+    assert snapshot.startswith(str(client.state_dir / "jobs" / "selection-"))
+    assert argvs[0] == ["--config", str(client.conf), "--mailboxes", snapshot,
+                        "--mailboxes-only", "verify", "--only", "mail",
+                        "--mailbox=alice@example.net", "--sample", "5"]
+    assert not Path(snapshot).exists()  # removed when the job ended
     r = client.post("/api/jobs", {"command": "migrate", "sample": 5,  # sample: verify only
                                   "selection_digest": digest})
     wait_job(client, r.json()["id"])
@@ -916,16 +923,17 @@ def test_host_change_requires_the_client_secret_again_and_drops_sign_ins(client,
                           "client_secret": "secret-one-value"},
             "mailcow": {"host": "mail.example.net", "api_key": "key-one-value"}}
     assert client.put("/api/settings", base).status == 200
-    (state / "msal_cache.bin").write_text("cached refresh token")
-    (state / "msal_cache_web.bin").write_text("cached refresh token")
+    (state / "msal_cache_0123456789abcdef.bin").write_text("cached refresh token")
+    (state / "msal_cache_web_0123456789abcdef.bin").write_text("cached refresh token")
     moved = {"microsoft": {"tenant_id": "t1", "client_id": "c1", "auth_mode": "app"},
              "mailcow": {"host": "sink.example.org", "api_key": "attacker-key-value"}}
     r = client.put("/api/settings", moved)
     assert r.status == 400 and b"client secret again" in r.body
     assert "sink.example.org" not in (state / "settings.toml").read_text()
+    assert len(list(state.glob("msal_cache*.bin"))) == 2  # a refused save keeps sign-ins
     moved["microsoft"]["client_secret"] = "secret-two-value"
     assert client.put("/api/settings", moved).status == 200
-    assert not (state / "msal_cache.bin").exists() and not (state / "msal_cache_web.bin").exists()
+    assert not list(state.glob("msal_cache*.bin"))
 
 
 def test_put_selection_returns_digest_and_job_accepts_it(client, monkeypatch):
@@ -937,8 +945,9 @@ def test_put_selection_returns_digest_and_job_accepts_it(client, monkeypatch):
 
     monkeypatch.setattr(cli, "main", fake_main)
     r = client.put("/api/selection", {"rows": [GOOD]})
-    assert r.status == 200 and isinstance(r.json()["digest"], str)
+    assert r.status == 200
     digest = r.json()["digest"]
+    assert digest == hashlib.sha256(client.selection.read_bytes()).hexdigest()
     r = client.post("/api/jobs", {"command": "plan", "dry_run": True, "only": None,
                                   "mailbox": None, "sample": 0, "selection_digest": digest})
     assert r.status == 202, r.body
@@ -947,7 +956,7 @@ def test_put_selection_returns_digest_and_job_accepts_it(client, monkeypatch):
     # the job read a private snapshot of the confirmed bytes, not the live file
     snapshot = argv[argv.index("--mailboxes") + 1]
     assert snapshot != str(client.selection) and "--mailboxes-only" in argv
-    assert oct(Path(snapshot).stat().st_mode & 0o777) == "0o600"
+    assert not Path(snapshot).exists()  # deleted once the job ended (it read it first)
 
 
 def test_job_without_a_saved_selection_is_refused(client):
@@ -974,3 +983,134 @@ def test_job_output_bytes_are_counted_after_truncation():
         out.write(f"summary line {i}\n")
     text = out.text()
     assert all(f"summary line {i}" in text for i in range(5))
+
+
+# -- third review round (delta re-review) ------------------------------------------------
+
+def _settings(tenant="t1", client_id="c1", mode="app", secret=None, host="mail.example.net",
+              key=None) -> dict:
+    ms = {"tenant_id": tenant, "client_id": client_id, "auth_mode": mode}
+    if secret is not None:
+        ms["client_secret"] = secret
+    mc = {"host": host}
+    if key is not None:
+        mc["api_key"] = key
+    return {"microsoft": ms, "mailcow": mc}
+
+
+def test_switching_the_sign_in_mode_never_carries_the_client_secret(client, tmp_path):
+    """BLOCKER: app -> delegated (new host, own key) -> app must not revive the saved secret."""
+    settings = tmp_path / "state" / "settings.toml"
+    assert client.put("/api/settings", _settings(secret="secret-one-value",
+                                                 key="key-one-value")).status == 200
+    assert "secret-one-value" in settings.read_text()
+    # delegated mode needs no secret, so a token holder can move the host with their own key
+    r = client.put("/api/settings", _settings(mode="delegated", host="sink.example.org",
+                                              key="attacker-key-value"))
+    assert r.status == 200, r.body
+    assert "secret-one-value" not in settings.read_text()  # gone, not merely hidden
+    # ... and switching back to app-only must demand the secret again
+    r = client.put("/api/settings", _settings(host="sink.example.org"))
+    assert r.status == 400 and b"client secret again" in r.body
+    assert "secret-one-value" not in settings.read_text()
+    assert "auth_mode = \"delegated\"" in settings.read_text()  # the refused save changed nothing
+
+
+def test_delegated_mode_stores_no_secret_even_when_one_is_sent(client, tmp_path):
+    settings = tmp_path / "state" / "settings.toml"
+    body = _settings(mode="delegated", secret="secret-one-value", key="key-one-value")
+    assert client.put("/api/settings", body).status == 200
+    assert "secret-one-value" not in settings.read_text()
+    # a plain mode switch (same ids, same host) still re-pairs: secret required
+    r = client.put("/api/settings", _settings())
+    assert r.status == 400 and b"sign-in mode" in r.body
+
+
+def test_settings_cannot_change_while_a_job_runs(client, monkeypatch, tmp_path):
+    release = threading.Event()
+    monkeypatch.setattr(cli, "main", lambda *a, **kw: (release.wait(10), 0)[1])
+    digest = _saved(client)
+    r = client.post("/api/jobs", {"command": "plan", "selection_digest": digest})
+    assert r.status == 202
+    try:
+        r = client.put("/api/settings", _settings(secret="secret-one-value", key="key-one"))
+        assert r.status == 409 and b"job is running" in r.body
+        assert not (tmp_path / "state" / "settings.toml").exists()
+    finally:
+        release.set()
+
+
+def test_msal_caches_are_keyed_by_connection(tmp_path, monkeypatch):
+    from o365_to_mailcow.auth import TokenProvider
+    from o365_to_mailcow.config import connection_id
+
+    a = make_config(tmp_path, mailcow_host="mail.example.net")
+    b = make_config(tmp_path, mailcow_host="sink.example.org")
+    assert connection_id(a) != connection_id(b)
+    monkeypatch.setattr("msal.ConfidentialClientApplication", lambda *a, **kw: object())
+    assert TokenProvider(a)._cache_path.name == f"msal_cache_{connection_id(a)}.bin"
+    assert TokenProvider(b)._cache_path.name == f"msal_cache_{connection_id(b)}.bin"
+    page = tmp_path / "index.html"
+    page.write_text(PAGE, encoding="utf-8")
+    app = web.WebApp(a, TOKEN, PAGE)
+    assert app._web_cache_path().name == f"msal_cache_web_{connection_id(a)}.bin"
+
+
+def test_stale_job_snapshots_are_removed_at_startup(tmp_path):
+    jobs = tmp_path / "state" / "jobs"
+    jobs.mkdir(parents=True)
+    stale = jobs / "selection-dead.csv"
+    stale.write_text("source,destination\n")
+    other = jobs / "keep.txt"
+    other.write_text("x")
+    web.WebApp(make_config(tmp_path), TOKEN, PAGE)
+    assert not stale.exists() and other.exists()
+
+
+def test_duplicate_host_header_is_refused(client):
+    conn = http.client.HTTPConnection("127.0.0.1", client.port, timeout=5)
+    conn.putrequest("GET", "/api/status", skip_host=True)
+    conn.putheader("Host", f"127.0.0.1:{client.port}")
+    conn.putheader("Host", "evil.example")
+    conn.putheader("Authorization", f"Bearer {TOKEN}")
+    conn.endheaders()
+    resp = conn.getresponse()
+    assert resp.status == 400
+    conn.close()
+
+
+@pytest.mark.parametrize("origin, status", [
+    ("http://127.0.0.1:{port}", 200), ("http://localhost:{port}", 403),
+    ("null", 403), ("http://evil.example", 403),
+])
+def test_origin_must_equal_the_host_authority(client, origin, status):
+    r = client.post("/api/mailcow/check", {"addresses": []},
+                    headers={"Origin": origin.format(port=client.port)})
+    assert r.status == status
+
+
+def test_selection_refuses_alias_collisions_across_rows(client):
+    a = dict(GOOD, aliases=["shared@example.net"])
+    b = dict(GOOD, source="bob@example.com", destination="bob@example.net",
+             aliases=["shared@example.net"])
+    r = client.put("/api/selection", {"rows": [a, b]})
+    assert r.status == 400 and b"row 2" in r.body and b"shared@example.net" in r.body
+    c = dict(GOOD, source="carol@example.com", destination="shared@example.net")
+    r = client.put("/api/selection", {"rows": [a, c]})
+    assert r.status == 400 and b"already used by row 1" in r.body
+    assert not client.selection.exists()
+
+
+def test_selection_with_an_invalid_saved_alias_is_a_409(client):
+    _saved(client)
+    text = client.selection.read_text()
+    client.selection.write_text(text.rstrip("\n") + "not-an-address\n")
+    r = client.get("/api/selection")
+    assert r.status == 409 and b"saved selection is invalid" in r.body
+
+
+def test_allow_host_accepts_bracketed_ipv6_with_port():
+    assert web.host_only("[::1]:8080") == "::1"
+    assert web.host_only("[::1]") == "::1"
+    assert web.host_only("ui.example.net:8080") == "ui.example.net"
+    assert web.host_only("ui.example.net") == "ui.example.net"
