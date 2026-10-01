@@ -539,7 +539,7 @@ def test_broken_dedupe_check_records_failed_never_appends_a_duplicate(env):
     assert inbox.failed == 1 and inbox.dedup_hits == 0 and inbox.appended == 1  # m2 only
     assert len(world.folders["INBOX"]) == 2  # the pre-existing copy + m2, no duplicate m1
     assert state.message_status(MAPPING.source, "f-inbox", "m1") == STATUS_FAILED
-    row_error = state._exec("SELECT error FROM messages WHERE graph_id=?", ("m1",)).fetchone()[0]
+    row_error = state._row("SELECT error FROM messages WHERE graph_id=?", ("m1",))[0]
     assert row_error.startswith("dedupe check failed: TypeError at ")
     # the next run retries it: m1 is not in the done set
     assert "m1" not in state.done_message_ids(MAPPING.source, "f-inbox")

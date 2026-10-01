@@ -67,17 +67,30 @@ class State:
     def close(self) -> None:
         self._conn.close()
 
-    def _exec(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+    # One connection is shared by every mailbox thread. The sqlite3 module is not
+    # thread-safe, so a statement is executed *and* its rows are read under the lock:
+    # fetching from a cursor while another thread runs a statement on the same connection
+    # returned garbage rows (a live run saw a COUNT(*) come back as None).
+
+    def _exec(self, sql: str, params: tuple = ()) -> None:
         with self._lock:
-            return self._conn.execute(sql, params)
+            self._conn.execute(sql, params)
+
+    def _rows(self, sql: str, params: tuple = ()) -> list[tuple]:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def _row(self, sql: str, params: tuple = ()) -> tuple | None:
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
 
     # -- messages ----------------------------------------------------------------------
 
     def message_status(self, mailbox: str, folder_id: str, graph_id: str) -> str | None:
-        row = self._exec(
+        row = self._row(
             "SELECT status FROM messages WHERE mailbox=? AND folder_id=? AND graph_id=?",
             (mailbox, folder_id, graph_id),
-        ).fetchone()
+        )
         return row[0] if row else None
 
     def mark_message(self, mailbox: str, folder_id: str, graph_id: str, folder: str,
@@ -91,25 +104,25 @@ class State:
 
     def folder_uidvalidity(self, mailbox: str, folder_id: str) -> int | None:
         """UIDVALIDITY last seen for a folder: folder_meta first, else the newest message."""
-        row = self._exec(
+        row = self._row(
             "SELECT uidvalidity FROM folder_meta WHERE mailbox=? AND folder_id=? "
             "AND uidvalidity IS NOT NULL",
             (mailbox, folder_id),
-        ).fetchone()
+        )
         if row:
             return row[0]
-        row = self._exec(
+        row = self._row(
             "SELECT uidvalidity FROM messages WHERE mailbox=? AND folder_id=? "
             "AND uidvalidity IS NOT NULL ORDER BY updated_at DESC LIMIT 1",
             (mailbox, folder_id),
-        ).fetchone()
+        )
         return row[0] if row else None
 
     def message_uidvalidity(self, mailbox: str, folder_id: str, graph_id: str) -> int | None:
-        row = self._exec(
+        row = self._row(
             "SELECT uidvalidity FROM messages WHERE mailbox=? AND folder_id=? AND graph_id=?",
             (mailbox, folder_id, graph_id),
-        ).fetchone()
+        )
         return row[0] if row else None
 
     def set_folder_meta(self, mailbox: str, folder_id: str, dest_name: str,
@@ -121,18 +134,18 @@ class State:
 
     def done_count_for_message_id(self, mailbox: str, folder_id: str, message_id: str) -> int:
         """How many source items with this Message-ID are already recorded done here."""
-        row = self._exec(
+        row = self._row(
             "SELECT COUNT(*) FROM messages WHERE mailbox=? AND folder_id=? "
             "AND message_id=? AND status=?",
             (mailbox, folder_id, message_id, STATUS_DONE),
-        ).fetchone()
+        )
         return int(row[0]) if row else 0
 
     def done_message_id_counts(self, mailbox: str, folder_id: str) -> dict[str, int]:
         """{Message-ID (lower-cased): number of source items recorded done} for a folder,
         with the destination UID of the newest row per Message-ID in ``_done_uid``."""
         out: dict[str, int] = {}
-        for mid, n in self._exec(
+        for mid, n in self._rows(
             "SELECT LOWER(message_id), COUNT(*) FROM messages WHERE mailbox=? AND folder_id=? "
             "AND status=? AND message_id IS NOT NULL GROUP BY LOWER(message_id)",
             (mailbox, folder_id, STATUS_DONE),
@@ -142,14 +155,14 @@ class State:
 
     def done_dest_uids(self, mailbox: str, folder_id: str) -> set[int]:
         """Destination UIDs this tool recorded for its own appends into a folder."""
-        return {int(r[0]) for r in self._exec(
+        return {int(r[0]) for r in self._rows(
             "SELECT dest_uid FROM messages WHERE mailbox=? AND folder_id=? AND status=? "
             "AND dest_uid IS NOT NULL", (mailbox, folder_id, STATUS_DONE))}
 
     def message_counts_by_folder_id(self, mailbox: str) -> dict[str, dict[str, int]]:
         """{folder_id: {status: count}} for one mailbox (verify keys on the source folder)."""
         out: dict[str, dict[str, int]] = {}
-        for folder_id, status, n in self._exec(
+        for folder_id, status, n in self._rows(
             "SELECT folder_id, status, COUNT(*) FROM messages WHERE mailbox=? "
             "GROUP BY folder_id, status",
             (mailbox,),
@@ -159,7 +172,7 @@ class State:
 
     def done_message_ids(self, mailbox: str, folder_id: str) -> set[str]:
         return {
-            r[0] for r in self._exec(
+            r[0] for r in self._rows(
                 "SELECT graph_id FROM messages WHERE mailbox=? AND folder_id=? AND status=?",
                 (mailbox, folder_id, STATUS_DONE),
             )
@@ -174,7 +187,7 @@ class State:
         )
 
     def app_passwords(self) -> list[tuple[str, str]]:
-        return [(r[0], r[1]) for r in self._exec("SELECT mailbox, mailcow_id FROM app_passwords")]
+        return [(r[0], r[1]) for r in self._rows("SELECT mailbox, mailcow_id FROM app_passwords")]
 
     def forget_app_password(self, mailbox: str, mailcow_id: str) -> None:
         self._exec(
@@ -184,7 +197,7 @@ class State:
     def message_counts(self, mailbox: str) -> dict[str, dict[str, int]]:
         """{folder: {status: count}} for one mailbox."""
         out: dict[str, dict[str, int]] = {}
-        for folder, status, n in self._exec(
+        for folder, status, n in self._rows(
             "SELECT folder, status, COUNT(*) FROM messages WHERE mailbox=? GROUP BY folder, status",
             (mailbox,),
         ):
@@ -192,10 +205,10 @@ class State:
         return out
 
     def get_delta(self, mailbox: str, folder_id: str) -> str | None:
-        row = self._exec(
+        row = self._row(
             "SELECT delta_link FROM folder_delta WHERE mailbox=? AND folder_id=?",
             (mailbox, folder_id),
-        ).fetchone()
+        )
         return row[0] if row else None
 
     def set_delta(self, mailbox: str, folder_id: str, delta_link: str) -> None:
@@ -211,8 +224,8 @@ class State:
             return cur.rowcount
 
     def get_kv(self, mailbox: str, key: str) -> str | None:
-        row = self._exec("SELECT value FROM kv WHERE mailbox=? AND key=?",
-                         (mailbox, key)).fetchone()
+        row = self._row("SELECT value FROM kv WHERE mailbox=? AND key=?",
+                         (mailbox, key))
         return row[0] if row else None
 
     def set_kv(self, mailbox: str, key: str, value: str | None) -> None:
@@ -228,7 +241,7 @@ class State:
 
     def collection_slugs(self, mailbox: str, kind: str) -> dict[str, str]:
         return {
-            r[0]: r[1] for r in self._exec(
+            r[0]: r[1] for r in self._rows(
                 "SELECT source_id, slug FROM collections WHERE mailbox=? AND kind=?",
                 (mailbox, kind),
             )
@@ -243,11 +256,11 @@ class State:
     # -- events ------------------------------------------------------------------------
 
     def event_last_modified(self, mailbox: str, calendar: str, uid: str) -> str | None:
-        row = self._exec(
+        row = self._row(
             "SELECT last_modified FROM events "
             "WHERE mailbox=? AND calendar=? AND uid=? AND status=?",
             (mailbox, calendar, uid, STATUS_DONE),
-        ).fetchone()
+        )
         return row[0] if row else None
 
     def mark_event(self, mailbox: str, calendar: str, uid: str, last_modified: str | None,
@@ -259,7 +272,7 @@ class State:
 
     def event_counts(self, mailbox: str) -> dict[str, dict[str, int]]:
         out: dict[str, dict[str, int]] = {}
-        for cal, status, n in self._exec(
+        for cal, status, n in self._rows(
             "SELECT calendar, status, COUNT(*) FROM events "
             "WHERE mailbox=? GROUP BY calendar, status",
             (mailbox,),
@@ -270,10 +283,10 @@ class State:
     # -- contacts ----------------------------------------------------------------------
 
     def contact_last_modified(self, mailbox: str, graph_id: str) -> str | None:
-        row = self._exec(
+        row = self._row(
             "SELECT last_modified FROM contacts WHERE mailbox=? AND graph_id=? AND status=?",
             (mailbox, graph_id, STATUS_DONE),
-        ).fetchone()
+        )
         return row[0] if row else None
 
     def mark_contact(self, mailbox: str, graph_id: str, book: str, last_modified: str | None,
@@ -285,7 +298,7 @@ class State:
 
     def contact_counts(self, mailbox: str) -> dict[str, dict[str, int]]:
         out: dict[str, dict[str, int]] = {}
-        for book, status, n in self._exec(
+        for book, status, n in self._rows(
             "SELECT book, status, COUNT(*) FROM contacts WHERE mailbox=? GROUP BY book, status",
             (mailbox,),
         ):

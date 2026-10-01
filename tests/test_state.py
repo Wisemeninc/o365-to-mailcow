@@ -96,3 +96,46 @@ def test_thread_safe_writes(tmp_path):
         t.join()
     assert len(s.done_message_ids("a@x", "f")) == 200
     s.close()
+
+
+def test_concurrent_reads_and_writes_from_many_threads_are_consistent(tmp_path):
+    """The sqlite3 module is not thread-safe: rows must be fetched under the same lock
+    as the statement. A live run saw COUNT(*) come back as None from a racing cursor."""
+    import threading
+
+    from o365_to_mailcow.state import STATUS_DONE, State
+
+    st = State(tmp_path / "s.db")
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def writer(mb: str) -> None:
+        i = 0
+        while not stop.is_set():
+            st.mark_message(mb, "f", f"g{i}", "INBOX", f"<{i}@{mb}>", STATUS_DONE,
+                            dest_uid=i, uidvalidity=1)
+            i += 1
+
+    def reader(mb: str) -> None:
+        try:
+            while not stop.is_set():
+                n = st.done_count_for_message_id(mb, "f", "<0@" + mb + ">")
+                assert isinstance(n, int)
+                ids = st.done_message_ids(mb, "f")
+                assert all(isinstance(g, str) for g in ids)
+                st.message_counts_by_folder_id(mb)
+                st.done_message_id_counts(mb, "f")
+        except BaseException as exc:  # noqa: BLE001 - collected for the assertion
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(f"m{k}",)) for k in range(3)]
+    threads += [threading.Thread(target=reader, args=(f"m{k}",)) for k in range(3)]
+    for t in threads:
+        t.start()
+    import time
+    time.sleep(1.0)
+    stop.set()
+    for t in threads:
+        t.join(10)
+    st.close()
+    assert errors == []
