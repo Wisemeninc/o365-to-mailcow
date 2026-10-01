@@ -236,9 +236,9 @@ def test_message_id_hit_marks_done_without_append_isc_48(env):
     assert inbox_res.dedup_hits == 1 and inbox_res.appended == 1
     assert len(world.folders["INBOX"]) == 2  # pre-existing + m2 only
     assert state.message_status(MAPPING.source, "f-inbox", "m1") == STATUS_DONE
-    # one index per non-empty folder, never a SEARCH per message (ISC-189); m2 has no
+    # one candidate: below the index threshold it is a single SEARCH (ISC-189); m2 has no
     # Message-ID and is never looked up (ISC-98)
-    assert indexed == ["INBOX"] and searched == []
+    assert indexed == [] and searched == ["<m1@x>"]
 
 
 def test_message_id_hit_with_different_content_is_appended_not_skipped(env):
@@ -484,3 +484,88 @@ def test_prefetch_budget_limits_queued_downloads(env):
     res = migrator(cfg, state, world, graph).migrate()
     inbox = next(f for f in res.folders if f.dest_name == "INBOX")
     assert inbox.appended == 6  # every message still arrives, just not all queued at once
+
+
+# -- ISC-189: index above the threshold, fail closed on a broken dedupe check ----------
+
+def _many(n: int) -> list[dict]:
+    return [{"id": f"x{i}", "internetMessageId": f"<x{i}@x>", "isRead": True,
+             "receivedDateTime": "2024-01-02T03:04:05Z"} for i in range(n)]
+
+
+def test_many_candidates_in_a_non_empty_folder_use_one_index_not_searches(env):
+    cfg, state, world, graph = env
+    from o365_to_mailcow import mail as mail_mod
+
+    n = mail_mod.INDEX_THRESHOLD + 5
+    msgs = _many(n)
+    graph.routes[f"{U}/mailFolders/f-inbox/messages"] = msgs
+    for m in msgs:
+        graph.routes[f"{U}/messages/{m['id']}/$value"] = mime(m["internetMessageId"], m["id"])
+    world.folders["INBOX"] = []
+    world.uidvalidity["INBOX"] = 7
+    # three of them already sit in the destination, byte-identical
+    pre = FakeImap(world)
+    for m in msgs[:3]:
+        pre.append("INBOX", mime(m["internetMessageId"], m["id"]), [], datetime.now(UTC))
+    searched: list[str] = []
+
+    class Recording(FakeImap):
+        def search_message_id(self, folder, message_id):
+            searched.append(message_id)
+            return super().search_message_id(folder, message_id)
+
+    res = migrator(cfg, state, world, graph, imap_cls=Recording).migrate()
+    inbox = next(f for f in res.folders if f.dest_name == "INBOX")
+    assert world.indexed == ["INBOX"] and searched == []
+    assert inbox.dedup_hits == 3 and inbox.appended == n - 3
+    assert len(world.folders["INBOX"]) == n  # no duplicate of the three
+
+
+def test_broken_dedupe_check_records_failed_never_appends_a_duplicate(env):
+    """A Message-ID hit whose content check throws is neither appended (that made
+    duplicates on the live run) nor dropped: failed, reported, retried next time."""
+    cfg, state, world, graph = env
+    world.folders["INBOX"] = []
+    world.uidvalidity["INBOX"] = 7
+    FakeImap(world).append("INBOX", mime("<m1@x>", "one"), [], datetime.now(UTC))
+
+    class Broken(FakeImap):
+        def fetch_message(self, folder, uid):
+            raise TypeError("boom")
+
+    res = migrator(cfg, state, world, graph, imap_cls=Broken).migrate()
+    inbox = next(f for f in res.folders if f.dest_name == "INBOX")
+    assert inbox.failed == 1 and inbox.dedup_hits == 0 and inbox.appended == 1  # m2 only
+    assert len(world.folders["INBOX"]) == 2  # the pre-existing copy + m2, no duplicate m1
+    assert state.message_status(MAPPING.source, "f-inbox", "m1") == STATUS_FAILED
+    row_error = state._exec("SELECT error FROM messages WHERE graph_id=?", ("m1",)).fetchone()[0]
+    assert row_error.startswith("dedupe check failed: TypeError at ")
+    # the next run retries it: m1 is not in the done set
+    assert "m1" not in state.done_message_ids(MAPPING.source, "f-inbox")
+
+
+def test_verify_lists_surplus_copies_with_uids_isc_190(env):
+    """More copies at the destination than source items recorded: verify names them
+    (Message-ID, every UID, which UIDs this tool appended) so the operator can expunge."""
+    cfg, state, world, graph = env
+    world.folders["INBOX"] = []
+    world.uidvalidity["INBOX"] = 7
+    # a copy that was already there (not the tool's), e.g. from an earlier manual import
+    FakeImap(world).append("INBOX", mime("<m1@x>", "one"), [], datetime.now(UTC))
+    migrator(cfg, state, world, graph).migrate()  # dedupe should catch it ...
+    stored = [s for s in world.folders["INBOX"] if s.message_id == "<m1@x>"]
+    assert len(stored) == 1
+    # ... but simulate the duplicate an earlier buggy run appended
+    dup = FakeImap(world).append("INBOX", mime("<m1@x>", "one"), [], datetime.now(UTC))
+    state.mark_message(MAPPING.source, "f-inbox", "m1", "INBOX", "<m1@x>", STATUS_DONE,
+                       dest_uid=dup, uidvalidity=7)
+    v = migrator(cfg, state, world, graph).verify()
+    inbox = next(f for f in v.folders if f.dest_name == "INBOX")
+    assert inbox.mismatch and inbox.imap_count == 3 and inbox.expected == 2
+    assert inbox.surplus_total == 1
+    assert inbox.surplus == [{"message_id": "<m1@x>", "uids": [1, 3], "tool_uids": [3]}]
+    assert world.indexed == ["INBOX"]
+    lines, _ = __import__("o365_to_mailcow.report", fromlist=["verify_summary"]).verify_summary(
+        {MAPPING.source: {"mail": __import__("dataclasses").asdict(v)}})
+    assert any("1 surplus copy of migrated messages" in ln for ln in lines)

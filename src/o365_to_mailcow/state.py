@@ -128,6 +128,24 @@ class State:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    def done_message_id_counts(self, mailbox: str, folder_id: str) -> dict[str, int]:
+        """{Message-ID (lower-cased): number of source items recorded done} for a folder,
+        with the destination UID of the newest row per Message-ID in ``_done_uid``."""
+        out: dict[str, int] = {}
+        for mid, n in self._exec(
+            "SELECT LOWER(message_id), COUNT(*) FROM messages WHERE mailbox=? AND folder_id=? "
+            "AND status=? AND message_id IS NOT NULL GROUP BY LOWER(message_id)",
+            (mailbox, folder_id, STATUS_DONE),
+        ):
+            out[mid] = n
+        return out
+
+    def done_dest_uids(self, mailbox: str, folder_id: str) -> set[int]:
+        """Destination UIDs this tool recorded for its own appends into a folder."""
+        return {int(r[0]) for r in self._exec(
+            "SELECT dest_uid FROM messages WHERE mailbox=? AND folder_id=? AND status=? "
+            "AND dest_uid IS NOT NULL", (mailbox, folder_id, STATUS_DONE))}
+
     def message_counts_by_folder_id(self, mailbox: str) -> dict[str, dict[str, int]]:
         """{folder_id: {status: count}} for one mailbox (verify keys on the source folder)."""
         out: dict[str, dict[str, int]] = {}

@@ -17,6 +17,7 @@ import logging
 import re
 import secrets
 import time
+import traceback
 import unicodedata
 from collections import deque
 from collections.abc import Callable, Iterator
@@ -25,6 +26,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email import message_from_bytes, policy
 from email.parser import BytesHeaderParser
+from pathlib import Path
 from urllib.parse import quote
 
 from dateutil import parser as dtparser
@@ -51,6 +53,8 @@ MESSAGE_EXPAND = f"singleValueExtendedProperties($filter=id eq '{SIZE_PROPERTY}'
 FOLDER_SIZE_PROPERTY = "Long 0x0E08"
 FOLDER_EXPAND = f"singleValueExtendedProperties($filter=id eq '{FOLDER_SIZE_PROPERTY}')"
 PAGE_SIZE = 100
+INDEX_THRESHOLD = 200  # candidates below this use one SEARCH each instead of an index
+SURPLUS_LIMIT = 2000  # surplus copies listed per folder in the verify report
 LIST_PAGE_SIZE = 999  # messages: Graph allows up to 1000 per page; 10x fewer round trips
 DOWNLOAD_WORKERS = 4
 PREFETCH_WINDOW = 4  # at most this many downloads queued; also bounded by a byte budget
@@ -157,6 +161,10 @@ class FolderVerify:
     expected: int
     mismatch: bool
     note: str | None = None
+    # destination copies beyond the source items recorded for a Message-ID: each entry
+    # {"message_id", "uids" (all copies, ascending), "tool_uids" (appended by this tool)}
+    surplus: list[dict] = field(default_factory=list)
+    surplus_total: int = 0
 
 
 @dataclass
@@ -657,14 +665,11 @@ class MailMigrator:
             return
 
         try:
-            index: dict[str, list[int]] = {}
-            if count_at_start > 0 and messages:
-                # one header FETCH per folder, not one SEARCH per message (ISC-189)
-                self._progress.phase(self._key, f"indexing {name}: 0/{count_at_start}")
-                index = dest.message_id_index(name, lambda n, total: self._progress.phase(
-                    self._key, f"indexing {name}: {n}/{total}"))
+            lookup = self._message_id_lookup(dest, name, messages, done, forced,
+                                             count_at_start)
             todo = self._select_todo(dest, fp, fr, messages, done, forced,
-                                     count_at_start, uidvalidity, index)
+                                     count_at_start, uidvalidity, lookup)
+            lookup = None  # the index (tens of MB for a big folder) is not needed any more
         except (ImapError, ImapConnectionError) as exc:
             fr.error = str(exc)
             self._stop(result, fp, exc)
@@ -684,12 +689,32 @@ class MailMigrator:
         if new_link and not result.stopped and fr.failed == 0:
             self._state.set_delta(src, fid, new_link)
 
+    def _message_id_lookup(self, dest: ImapDestination, name: str, messages: list[dict],
+                           done: set[str], forced: bool, count_at_start: int,
+                           ) -> Callable[[str], list[int]]:
+        """How ``_select_todo`` asks the destination folder for a Message-ID. An empty
+        folder answers nothing; a handful of candidates use one SEARCH each; a resumed
+        or re-checked folder with many candidates is indexed once with chunked header
+        FETCHes (ISC-189) and every lookup is then local."""
+        if count_at_start == 0:
+            return lambda mid: []
+        candidates = sum(1 for m in messages if valid_message_id(m.get("internetMessageId"))
+                         and (forced or m["id"] not in done))
+        if candidates == 0:
+            return lambda mid: []
+        if candidates < INDEX_THRESHOLD:
+            return lambda mid: dest.search_message_id(name, mid)
+        self._progress.phase(self._key, f"indexing {name}: 0/{count_at_start}")
+        index = dest.message_id_index(name, lambda n, total: self._progress.phase(
+            self._key, f"indexing {name}: {n}/{total}"))
+        return lambda mid: index.get(mid.lower(), [])
+
     def _select_todo(self, dest: ImapDestination, fp: FolderPlan, fr: FolderResult,
                      messages: list[dict], done: set[str], forced: bool,
                      count_at_start: int, uidvalidity: int,
-                     index: dict[str, list[int]] | None = None) -> list[dict]:
+                     lookup: Callable[[str], list[int]] | None = None) -> list[dict]:
         src, fid, name = self._src, fp.folder_id, fp.dest_name
-        index = index or {}
+        lookup = lookup or (lambda mid: dest.search_message_id(name, mid))
         todo: list[dict] = []
         for n, msg in enumerate(messages, 1):
             fr.listed += 1
@@ -715,7 +740,7 @@ class MailMigrator:
                         todo.append(msg)
                     self._progress.advance(self._key)
                     continue
-                if index.get(mid.lower()):
+                if lookup(mid):
                     fr.already_done += 1
                     self._progress.advance(self._key)
                     continue
@@ -729,27 +754,37 @@ class MailMigrator:
             # ISC-48/98: only messages with a Message-ID, only if the folder had content
             if mid and gid not in done and count_at_start > 0:
                 try:
-                    verdict = self._dedupe(dest, fp, fr, msg, mid, uidvalidity, index)
+                    verdict = self._dedupe(dest, fp, fr, msg, mid, uidvalidity, lookup)
                 except ImapConnectionError:
                     raise
-                except Exception as exc:  # noqa: BLE001 - a dedupe problem never loses mail
-                    log.warning("%s: dedupe check failed for a message in %r (%s); appending",
-                                src, name, exc.__class__.__name__)
-                    verdict = "append"
+                except Exception as exc:  # noqa: BLE001 - neither a duplicate nor a loss
+                    # A message the destination may already hold is never appended on a
+                    # guess (that made duplicates) nor dropped: it is recorded as failed,
+                    # shown by verify, and retried by the next migrate.
+                    frame = traceback.extract_tb(exc.__traceback__)[-1]
+                    where = f"{Path(frame.filename).name}:{frame.lineno}"
+                    error = f"dedupe check failed: {exc.__class__.__name__} at {where}"
+                    log.warning("%s: %s for a message in %r; recorded as failed, not "
+                                "appended", src, error, name)
+                    self._state.mark_message(src, fid, gid, name, mid, STATUS_FAILED,
+                                             error=error)
+                    fr.failed += 1
+                    self._progress.advance(self._key)
+                    continue
                 if verdict != "append":
                     continue
             todo.append(msg)
         return todo
 
     def _dedupe(self, dest: ImapDestination, fp: FolderPlan, fr: FolderResult, msg: dict,
-                mid: str, uidvalidity: int, index: dict[str, list[int]]) -> str:
-        """Message-ID hit at the destination (from the folder's index, built before this
-        run appended anything): count it as already migrated only when a destination copy
-        really is this message (content compared) and the destination holds more copies
-        than source items already recorded for this Message-ID. Anything else is
-        appended. Returns "done", "skipped" or "append"."""
+                mid: str, uidvalidity: int, lookup: Callable[[str], list[int]]) -> str:
+        """Message-ID hit at the destination (``lookup``: the folder's index, built before
+        this run appended anything, or a SEARCH): count it as already migrated only when
+        a destination copy really is this message (content compared) and the destination
+        holds more copies than source items already recorded for this Message-ID.
+        Anything else is appended. Returns "done", "skipped" or "append"."""
         src, fid, name, gid = self._src, fp.folder_id, fp.dest_name, msg["id"]
-        uids = index.get(mid.lower(), [])
+        uids = lookup(mid)
         already = self._state.done_count_for_message_id(src, fid, mid)
         if len(uids) <= already:
             return "append"
@@ -887,16 +922,42 @@ class MailMigrator:
                                 else ""))
                     note = (note + "; " if note else "") + extra
                 expected = graph_total - skipped - failed
-                out.folders.append(FolderVerify(
+                fv = FolderVerify(
                     dest_name=fp.dest_name, graph_total=graph_total, done=done, failed=failed,
                     skipped=skipped, imap_count=imap_count, expected=expected,
                     mismatch=imap_count != expected, note=note,
-                ))
+                )
+                if imap_count > expected and done:
+                    try:
+                        self._surplus_copies(dest, fp, fv)
+                    except (ImapError, ImapConnectionError) as exc:
+                        fv.note = (fv.note + "; " if fv.note else "") + f"surplus check: {exc}"
+                out.folders.append(fv)
             if sample > 0:
                 self._sample(dest, plan, sample, out)
         finally:
             dest.close()
         return out
+
+    def _surplus_copies(self, dest: ImapDestination, fp: FolderPlan, fv: FolderVerify) -> None:
+        """More messages at the destination than expected: name the Message-IDs that have
+        more destination copies than source items recorded done, with every copy's UID
+        and which of them this tool appended (ISC-190). The operator removes them with
+        ``doveadm``; this tool never deletes."""
+        self._progress.phase(self._key, f"indexing {fp.dest_name} for surplus copies")
+        try:
+            index = dest.message_id_index(fp.dest_name)
+        finally:
+            self._progress.phase(self._key, "")
+        recorded = self._state.done_message_id_counts(self._src, fp.folder_id)
+        own = self._state.done_dest_uids(self._src, fp.folder_id)
+        for mid, uids in sorted(index.items()):
+            n = recorded.get(mid, 0)
+            if n and len(uids) > n:
+                fv.surplus_total += len(uids) - n
+                if len(fv.surplus) < SURPLUS_LIMIT:
+                    fv.surplus.append({"message_id": mid, "uids": list(uids),
+                                       "tool_uids": [u for u in uids if u in own]})
 
     def _sample(self, dest: ImapDestination, plan: MailPlan, n: int, out: MailVerify) -> None:
         pool = [(fp.dest_name, gid) for fp in plan.folders if not fp.skip

@@ -466,6 +466,10 @@ class WebApp:
                 return None
             if len(value) > 1000 or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
                 raise HttpError(400, f"{what} has an invalid value")
+            try:
+                value.encode("utf-8")  # lone surrogates cannot be written to the file
+            except UnicodeEncodeError as exc:
+                raise HttpError(400, f"{what} has an invalid value") from exc
             return value.strip()
 
         tenant_id = ident(ms.get("tenant_id"), "microsoft.tenant_id")
@@ -511,8 +515,10 @@ class WebApp:
             if auth_mode != "app":
                 client_secret = None  # delegated mode stores no secret, ever
             if api_key is None:
-                if host_changed or not cur_mc.get("api_key"):
-                    raise HttpError(400, "enter the mailcow API key together with the host")
+                if host_changed or ids_changed or not cur_mc.get("api_key"):
+                    raise HttpError(400, "enter the mailcow API key together with the host "
+                                         "(required again when the host or the tenant/client "
+                                         "ids change)")
                 api_key = cur_mc.get("api_key")
             if repair:
                 self._discard_sign_ins()  # after every validation passed
@@ -606,7 +612,7 @@ class WebApp:
         with self._lock:
             tokens = self._tokens
         if tokens is None:  # built outside the lock: MSAL may contact the authority
-            # own cache file: a page-started job's TokenProvider writes msal_cache.bin
+            # own cache file: a job's TokenProvider writes msal_cache_<connection>.bin
             tokens = TokenProvider(self.cfg, cache_path=self._web_cache_path(), out=self.out)
             with self._lock:
                 self._tokens = tokens = self._tokens or tokens
@@ -668,6 +674,13 @@ class WebApp:
             raise HttpError(500, f"cannot read {path}: {clean(exc)[:300]}") from exc
         rows = [{"source": m.source, "destination": m.destination, "name": m.name or "",
                  "quota_mib": m.quota_mib, "aliases": list(m.aliases)} for m in mappings]
+        taken: set[str] = set()
+        for n, row in enumerate(rows, 1):
+            for address in (row["destination"], *row["aliases"]):
+                if address in taken:
+                    raise HttpError(409, f"the saved selection is invalid; fix or re-save "
+                                         f"it: row {n}: {address} is used twice")
+                taken.add(address)
         return {"path": str(path), "rows": rows, "digest": self._selection_digest()}
 
     def save_selection(self, body: object) -> dict[str, Any]:
@@ -842,8 +855,8 @@ class WebApp:
             for i, arg in enumerate(job.args):  # the private selection snapshot, if any
                 if arg == "--mailboxes" and i + 1 < len(job.args):
                     with contextlib.suppress(OSError):
-                        snap = Path(job.args[i + 1])
-                        if snap.parent == self.cfg.state_dir / "jobs":
+                        snap = Path(job.args[i + 1]).resolve()
+                        if snap.parent == (self.cfg.state_dir / "jobs").resolve():
                             snap.unlink()
             job.output.close()  # before `finished`: a finished job's output is complete
             with self._lock:

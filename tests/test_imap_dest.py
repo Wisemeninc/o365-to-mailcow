@@ -34,6 +34,7 @@ class Factory:
             c.append.return_value = b"[APPENDUID 42 17] Append completed."
             c.search.return_value = [5]
             c.fetch.return_value = {5: {b"BODY[]": b"raw", b"SEQ": 1}}
+            c.use_uid = True
         self.created = 0
         self.kwargs: list[dict] = []
 
@@ -168,39 +169,58 @@ def test_class_has_no_destructive_methods_isc_55():
 
 # -- ISC-189: per-folder Message-ID index -----------------------------------------------
 
-def test_message_id_index_fetches_headers_in_chunks_read_only():
+def test_message_id_index_fetches_by_sequence_range_without_search_all():
+    """ISC-189. No SEARCH ALL: its one-line reply breaks imaplib's 1 MB line limit at
+    ~150k UIDs; sequence ranges answer one line per message."""
     from o365_to_mailcow import imap_dest
 
     f = Factory()
     d = make(f)
     c = f.clients[0]
-    uids = list(range(1, imap_dest.INDEX_CHUNK + 3))  # two chunks
-    c.search.return_value = uids
+    exists = imap_dest.INDEX_CHUNK + 2  # two chunks
+    c.select_folder.return_value = {b"EXISTS": exists, b"UIDVALIDITY": 42}
     hdr = b"BODY[HEADER.FIELDS (MESSAGE-ID)]"
+    ranges: list[str] = []
 
-    def fetch(chunk, fields):
-        assert fields == ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"]
+    def fetch(messages, fields):
+        assert c.use_uid is False  # sequence numbers while indexing
+        assert fields == ["UID", "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"]
+        ranges.append(messages)
+        lo, hi = (int(x) for x in messages.split(":"))
         out = {}
-        for uid in chunk:
-            if uid == 2:
-                out[uid] = {hdr: b"Message-ID:\r\n <Folded@Example.ORG>\r\n\r\n"}  # folded
-            elif uid == 3:
-                out[uid] = {hdr: b"\r\n"}  # no Message-ID
+        for seq in range(lo, hi + 1):
+            uid = seq * 10  # UIDs differ from sequence numbers
+            if seq == 2:
+                out[seq] = {b"UID": uid, hdr: b"Message-ID:\r\n <Folded@Example.ORG>\r\n\r\n"}
+            elif seq == 3:
+                out[seq] = {b"UID": uid, hdr: b"\r\n"}  # no Message-ID
+            elif seq == 4:
+                out[seq] = {b"UID": uid, hdr: b"Message-ID: (note) <c@x>\r\nMessage-ID: <d@x>\r\n"}
             else:
-                out[uid] = {hdr: f"Message-ID: <m{uid % 4}@x>\r\n\r\n".encode()}
+                out[seq] = {b"UID": uid, hdr: f"Message-ID: <m{seq % 4}@x>\r\n\r\n".encode()}
         return out
 
     c.fetch.side_effect = fetch
     seen: list[tuple[int, int]] = []
     index = d.message_id_index("INBOX", lambda n, total: seen.append((n, total)))
     c.select_folder.assert_called_with("INBOX", readonly=True)
-    c.search.assert_called_with("ALL")
-    assert c.fetch.call_count == 2
-    assert index["<folded@example.org>"] == [2]
-    assert 3 not in {u for uids in index.values() for u in uids}
-    assert index["<m1@x>"][:2] == [1, 5]  # ordered by UID
-    assert seen == [(imap_dest.INDEX_CHUNK, len(uids)), (len(uids), len(uids))]
+    c.search.assert_not_called()
+    assert ranges == [f"1:{imap_dest.INDEX_CHUNK}", f"{imap_dest.INDEX_CHUNK + 1}:{exists}"]
+    assert c.use_uid is True  # restored for APPEND/FETCH by UID afterwards
+    assert index["<folded@example.org>"] == [20]
+    assert index["<c@x>"] == [40] and index["<d@x>"] == [40]  # comment, second header
+    assert 30 not in {u for uids in index.values() for u in uids}
+    assert index["<m1@x>"][:2] == [10, 50]  # UIDs, ascending
+    assert seen == [(imap_dest.INDEX_CHUNK, exists), (exists, exists)]
     assert used_methods(f) <= set(ALLOWED)
+
+
+def test_message_id_index_of_an_empty_folder_fetches_nothing():
+    f = Factory()
+    d = make(f)
+    f.clients[0].select_folder.return_value = {b"EXISTS": 0}
+    assert d.message_id_index("Empty") == {}
+    f.clients[0].fetch.assert_not_called()
 
 
 @pytest.mark.parametrize("item, expected", [
@@ -209,8 +229,23 @@ def test_message_id_index_fetches_headers_in_chunks_read_only():
     ({b"BODY[HEADER.FIELDS (MESSAGE-ID)]": b"Subject: no id\r\n"}, None),
     ({b"SEQ": 1}, None),
     ({b"BODY[HEADER.FIELDS (MESSAGE-ID)]": b"Message-ID: broken@no-brackets\r\n"}, None),
+    ({b"BODY[HEADER.FIELDS (MESSAGE-ID)]": b"Message-ID : <obsolete@x>\r\n"}, "<obsolete@x>"),
+    ({b"BODY[HEADER.FIELDS (MESSAGE-ID)]": b"Message-ID: (c1) (c2) <two@x>\r\n"}, "<two@x>"),
 ])
 def test_header_message_id_parsing(item, expected):
     from o365_to_mailcow.imap_dest import header_message_id
 
     assert header_message_id(item) == expected
+
+
+@pytest.mark.parametrize("data, what", [
+    ({}, "absent"), ({5: {b"BODY[]": None, b"SEQ": 1}}, "NIL"),
+])
+def test_fetch_message_without_a_body_is_an_error_not_empty_bytes(data, what):
+    from o365_to_mailcow.imap_dest import ImapError
+
+    f = Factory()
+    d = make(f)
+    f.clients[0].fetch.return_value = data
+    with pytest.raises(ImapError, match=what):
+        d.fetch_message("INBOX", 5)

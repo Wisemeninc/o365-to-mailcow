@@ -319,6 +319,13 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
                 if f["mismatch"]:
                     problem(f"mail {f['dest_name']}: expected {f['expected']}, "
                             f"IMAP has {f['imap_count']}")
+                if f.get("surplus_total"):
+                    shown = f.get("surplus") or []
+                    lines.append(f"      {f['surplus_total']} surplus cop"
+                                 f"{'y' if f['surplus_total'] == 1 else 'ies'} of migrated "
+                                 f"messages ({len(shown)} listed in the report JSON with "
+                                 "every copy's UID; 'tool_uids' are this tool's appends). "
+                                 "Remove with doveadm expunge; this tool never deletes.")
                 if f.get("note"):
                     lines.append(f"      note: {f['note']}")
             for sk in mail.get("skipped_folders", []):

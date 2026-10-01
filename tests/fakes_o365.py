@@ -160,6 +160,7 @@ class ImapWorld:
     quota_after: int | None = None  # APPEND NO [OVERQUOTA] after this many appends
     appends: int = 0
     append_threads: set[str] = field(default_factory=set)
+    indexed: list[str] = field(default_factory=list)  # folders indexed by Message-ID
 
 
 class FakeImap:
@@ -197,6 +198,7 @@ class FakeImap:
         return bool(self.search_message_id(folder, message_id))
 
     def message_id_index(self, folder: str, on_progress=None) -> dict[str, list[int]]:
+        self.world.indexed.append(folder)
         index: dict[str, list[int]] = {}
         for s in self.world.folders.get(folder, []):
             if s.message_id:

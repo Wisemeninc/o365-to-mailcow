@@ -51,7 +51,7 @@ _LOCAL_PART = re.compile(r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(\.[A-Za-z0-9!#$%&'*+
 
 def valid_hostname(value: str) -> bool:
     """RFC 1123 host name that is not an address literal in any spelling: no numeric or
-    hex labels (``0x7f.0.0.1``, ``127.0.0.0x1``), nothing ``inet_aton`` accepts."""
+    hex last label (``127.0.0.0x1``, ``example.123``), nothing ``inet_aton`` accepts."""
     if not _HOSTNAME.match(value):
         return False
     last = value.lower().rsplit(".", 1)[-1]

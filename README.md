@@ -184,7 +184,7 @@ docker compose up -d web                    # the web UI (see below) does all of
 | `plan` | Lists folders with message counts and sizes, calendars, contact folders, skipped items; checks that each destination mailbox exists | nothing (Graph reads, mailcow `get` calls) |
 | `provision` | Creates destination mailboxes that do not exist (domain must exist), then their aliases; writes initial passwords to a 0600 file | mailcow `add/mailbox`, `add/alias` |
 | `migrate` | Creates a temporary app password per mailbox, migrates mail, calendars and contacts, deletes the app password. Re-runs copy only what is new or changed | IMAP APPEND, DAV MKCALENDAR/MKCOL/PUT, app password add/delete |
-| `verify` | Per folder: messages Graph lists, skipped, failed, expected, IMAP count (notes when Graph's raw item count differs). Per calendar/address book: Graph count vs DAV count. Prints every skipped and failed category | app password add/delete only |
+| `verify` | Per folder: messages Graph lists, skipped, failed, expected, IMAP count (notes when Graph's raw item count differs). When a folder holds *more* than expected, it names the surplus copies of migrated messages (Message-ID, every copy's UID, which UIDs this tool appended) in the report JSON so you can `doveadm expunge` them; the tool itself never deletes. Per calendar/address book: Graph count vs DAV count. Prints every skipped and failed category | app password add/delete only |
 | `cleanup` | Deletes every app password named `o365-migration-*` for the configured mailboxes plus any recorded in state | app password delete |
 | `web` | Serves the local web UI: connections, tenant list, selection, and all of the commands above with live output | what the started commands write |
 
@@ -273,8 +273,10 @@ services:
   (`state/msal_cache*.bin`) is discarded, so a page token alone can never redirect a
   migration that uses your Microsoft credential. Settings cannot be changed while a
   job is running (HTTP 409). The "no IP address" rule on the host is defence in
-  depth only (wildcard DNS names exist); the pairing rule is the control. Every change is logged with the
-  field names. `o365mig web --lock-settings` makes the panel read-only for hardened
+  depth only (wildcard DNS names exist); the pairing rule is the control. Every change is
+  logged with the field names. Behind a reverse proxy, pass the browser's `Host` header
+  through unchanged (`proxy_set_header Host $http_host;` in nginx): a non-GET request's
+  `Origin` must match the `Host` the page was loaded from. `o365mig web --lock-settings` makes the panel read-only for hardened
   setups; `--allow-host NAME` accepts an extra `Host` header value (loopback and the bind
   address are always accepted; anything else is refused to defeat DNS rebinding).
 - **Token.** Every API call needs the token from that URL. It is new at every start, or
@@ -419,8 +421,9 @@ still produce a few failures per run. If the container's address gets banned, un
 - `state/state.db` (mode 0600) is the idempotency ledger: identifiers, statuses, error
   summaries, app-password IDs. It never contains message content or credentials. Keep it
   between runs; deleting it makes the next run fall back to Message-ID checks.
-- In delegated mode, `state/msal_cache_<id>.bin` holds a refresh token with Full Access
-  to every migrated mailbox. **Delete it when the migration is finished.**
+- In delegated mode, `state/msal_cache*.bin` (one per connection, for jobs and for the
+  web page) holds a refresh token with Full Access to every migrated mailbox. **Delete
+  them when the migration is finished.**
 - App-password IDs are recorded *before* use; a crashed run's leftovers are deleted by
   the next `migrate` or by `cleanup`. Do not run `cleanup` while a `migrate` is running.
 - Secrets are read from the environment, never logged, never written to state or reports.

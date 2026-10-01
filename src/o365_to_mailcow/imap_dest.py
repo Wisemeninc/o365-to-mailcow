@@ -1,8 +1,9 @@
 """Destination IMAP connection (Dovecot in mailcow), write-only in the append sense.
 
 Only these IMAP commands are ever issued (ISC-54): LOGIN, LIST, CREATE, SUBSCRIBE,
-STATUS, SELECT/EXAMINE, SEARCH, APPEND, FETCH (verify sampling only), LOGOUT. The
-class deliberately has no way to STORE flags, EXPUNGE or DELETE (ISC-55).
+STATUS, SELECT/EXAMINE, SEARCH, APPEND, FETCH (Message-ID index and verify sampling,
+always BODY.PEEK), LOGOUT. The class deliberately has no way to STORE flags, EXPUNGE or
+DELETE (ISC-55).
 
 Folder names are passed to imapclient as ``str``; imapclient encodes them to modified
 UTF-7 and decodes LIST results back (ISC-40).
@@ -25,8 +26,10 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _APPENDUID = re.compile(rb"\[APPENDUID (\d+) (\d+)\]", re.IGNORECASE)
-_HEADER_MID = re.compile(rb"^message-id:[ \t]*(<[^>]*>)", re.IGNORECASE | re.MULTILINE)
-INDEX_CHUNK = 2000  # UIDs per FETCH when indexing a folder's Message-IDs
+# "Message-ID: <id>", the obsolete "Message-ID : <id>" and a comment before the id
+_HEADER_MID = re.compile(rb"^message-id[ \t]*:[ \t]*(?:\([^)]*\)[ \t]*)*(<[^>]*>)",
+                         re.IGNORECASE | re.MULTILINE)
+INDEX_CHUNK = 2000  # messages per FETCH when indexing a folder's Message-IDs
 CONNECTION_ERRORS = (IMAPClientAbortError, OSError)
 
 
@@ -173,22 +176,31 @@ class ImapDestination:
                          on_progress: Callable[[int, int], None] | None = None,
                          ) -> dict[str, list[int]]:
         """Lower-cased Message-ID -> UIDs of every message in ``folder``: one EXAMINE and
-        chunked ``FETCH BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]`` calls. Built once per
-        non-empty folder; a resumed run then checks each source message locally instead
-        of running one SEARCH per message against the whole folder (ISC-189)."""
+        chunked ``FETCH <seq range> (UID BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])`` calls by
+        message sequence number. No ``SEARCH ALL``: its single-line reply exceeds
+        imaplib's 1 MB line limit at roughly 150 000 UIDs. A resumed run checks each
+        source message locally instead of running one SEARCH per message (ISC-189)."""
         def op(c: IMAPClient) -> dict[str, list[int]]:
-            c.select_folder(folder, readonly=True)
-            uids = sorted(int(u) for u in c.search("ALL"))
+            info = c.select_folder(folder, readonly=True)
+            exists = int(info.get(b"EXISTS", 0) or 0)
             index: dict[str, list[int]] = {}
-            for i in range(0, len(uids), INDEX_CHUNK):
-                chunk = uids[i:i + INDEX_CHUNK]
-                data = c.fetch(chunk, ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"])
-                for uid, item in data.items():
-                    mid = header_message_id(item)
-                    if mid:
-                        index.setdefault(mid, []).append(int(uid))
-                if on_progress:
-                    on_progress(min(i + INDEX_CHUNK, len(uids)), len(uids))
+            c.use_uid = False  # sequence ranges: every reply is one line per message
+            try:
+                for start in range(1, exists + 1, INDEX_CHUNK):
+                    end = min(start + INDEX_CHUNK - 1, exists)
+                    data = c.fetch(f"{start}:{end}",
+                                   ["UID", "BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"])
+                    for item in data.values():
+                        uid = item.get(b"UID")
+                        for mid in header_message_ids(item):
+                            if isinstance(uid, int):
+                                index.setdefault(mid, []).append(uid)
+                    if on_progress:
+                        on_progress(end, exists)
+            finally:
+                c.use_uid = True
+            for uids in index.values():
+                uids.sort()
             return index
         return self._call(op, f"FETCH headers {folder!r}")
 
@@ -234,26 +246,38 @@ class ImapDestination:
         return int(m.group(2)) if m else None
 
     def fetch_message(self, folder: str, uid: int) -> bytes:
-        """FETCH BODY.PEEK[] of one message (verify sampling only; does not set \\Seen)."""
+        """FETCH BODY.PEEK[] of one message (dedupe comparison and verify sampling; does
+        not set \\Seen). A missing message or a NIL body is an ``ImapError``, never an
+        empty byte string: the callers compare content, and "" would read as "different"
+        and produce a duplicate copy."""
         def op(c: IMAPClient) -> bytes:
             c.select_folder(folder, readonly=True)
             data = c.fetch([uid], ["BODY.PEEK[]"])
-            item = data.get(uid) or {}
-            return bytes(item.get(b"BODY[]", b""))
+            item = data.get(uid)
+            body = item.get(b"BODY[]") if item else None
+            if not isinstance(body, bytes):
+                raise ImapError(f"FETCH {folder!r} uid {uid}: no message body returned "
+                                f"({'absent' if item is None else 'NIL'})")
+            return body
         return self._call(op, f"FETCH {folder!r}")
 
 
-def header_message_id(item: dict) -> str | None:
-    """The ``<msg-id>`` of a fetched ``HEADER.FIELDS (MESSAGE-ID)`` item, lower-cased
-    (IMAP SEARCH compares headers case-insensitively, so does this index), or None."""
+def header_message_ids(item: dict) -> list[str]:
+    """Every ``<msg-id>`` of a fetched ``HEADER.FIELDS (MESSAGE-ID)`` item, lower-cased
+    (IMAP SEARCH compares headers case-insensitively, so does this index). A message
+    carrying two Message-ID headers is indexed under both."""
     for key, value in item.items():
         if isinstance(key, bytes) and key.upper().startswith(b"BODY[HEADER.FIELDS") \
                 and isinstance(value, bytes):
             unfolded = re.sub(rb"\r?\n[ \t]+", b" ", value)
-            m = _HEADER_MID.search(unfolded)
-            if m:
-                return m.group(1).decode("latin-1").strip().lower()
-    return None
+            return [m.decode("latin-1").strip().lower() for m in _HEADER_MID.findall(unfolded)]
+    return []
+
+
+def header_message_id(item: dict) -> str | None:
+    """First Message-ID of a fetched header item, or None."""
+    ids = header_message_ids(item)
+    return ids[0] if ids else None
 
 
 def _short(exc: BaseException) -> str:
