@@ -227,7 +227,8 @@ class RunReport:
 
     def __init__(self, command: str, state_dir: Path, dry_run: bool = False,
                  now: Callable[[], datetime] = lambda: datetime.now(UTC),
-                 redactor: Callable[[str], str] | None = None) -> None:
+                 redactor: Callable[[str], str] | None = None,
+                 scope: dict[str, Any] | None = None) -> None:
         self._now = now
         self._redact = redactor or (lambda text: text)
         self._state_dir = Path(state_dir)
@@ -241,6 +242,8 @@ class RunReport:
             "started": started.isoformat(),
             "mailboxes": {},
         }
+        if scope is not None:  # what this run was narrowed to (--only/--mailbox/--mail-since)
+            self.data["scope"] = dict(scope)
 
     def mailbox(self, source: str, destination: str) -> None:
         with self._lock:

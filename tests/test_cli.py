@@ -529,3 +529,19 @@ def test_provision_creates_aliases_for_hosted_domains_only(world, config, mailco
     assert "old@example.net: exists -> bob@example.net" in out  # already an alias
     assert "bob@other.tld: skipped, domain other.tld" in out  # not hosted in mailcow
     assert "alice@example.net: skipped, a mailbox" in out    # an existing mailbox
+
+
+def _newest_report(tmp_path) -> dict:
+    reports = sorted((tmp_path / "state" / "reports").glob("*.json"),
+                     key=lambda p: p.stat().st_mtime_ns)
+    return json.loads(reports[-1].read_text())
+
+
+def test_report_records_the_per_run_scope(world, config, mailcow, tmp_path):
+    assert cli.main(["--config", config(), "plan"]) == 0
+    assert _newest_report(tmp_path)["scope"] == {"only": None, "mailbox": None,
+                                                 "mail_since": None}
+    assert cli.main(["--config", config(), "--only", "mail", "--mailbox", "alice@contoso.com",
+                     "--mail-since", "2024-01-01", "plan"]) == 0
+    assert _newest_report(tmp_path)["scope"] == {"only": "mail", "mailbox": "alice@contoso.com",
+                                                 "mail_since": "2024-01-01"}

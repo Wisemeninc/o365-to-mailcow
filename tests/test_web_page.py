@@ -142,6 +142,7 @@ def test_uses_every_contract_route() -> None:
         "/api/jobs",
         "/output",
         "/api/reports/latest",
+        "/api/overview",
     ]
     missing = [route for route in required if route not in SCRIPT_TEXT]
     assert not missing, "Script is missing required route markers: " + ", ".join(missing)
@@ -152,13 +153,14 @@ def test_page_behaviour_markers() -> None:
         "textContent",
         "sessionStorage",
         "history.replaceState",
-        "confirm(",
+        "showModal(",
         "beforeunload",
         '"PUT"',
         '"POST"',
     ]
     missing = [marker for marker in markers if marker not in SCRIPT_TEXT]
     assert not missing, "Script is missing behavior markers: " + ", ".join(missing)
+    assert "confirm(" not in SCRIPT_TEXT, "Script must use the run sheet, never confirm()"
 
     assert "prefers-color-scheme" in PAGE_TEXT, "CSS must include prefers-color-scheme"
 
@@ -191,32 +193,71 @@ def test_expected_controls_exist() -> None:
         "opt-sample",
         "job-output",
         "btn-full-output",
-        "report-body",
+        "steps",
+        "outcome",
+        "mailboxes-panel",
+        "detail-view",
+        "job-view",
+        "job-progress",
+        "run-sheet",
+        "run-form",
+        "sheet-start",
+        "sheet-cancel",
+        "opt-mailbox",
+        "opt-since",
+        "opt-dry",
+        "btn-conn-toggle",
+        "hdr-job",
+        "settings-section",
+        "tenant-section",
     }
     missing_ids = sorted(required_ids.difference(ids))
     assert not missing_ids, "Missing required ids: " + ", ".join(missing_ids)
 
-    run_pairs = {
-        (attrs.get("data-command", ""), attrs.get("data-dry", ""))
-        for tag, attrs in TAGS
-        if tag == "button" and "data-command" in attrs and "data-dry" in attrs
+    commands = {
+        attrs["data-command"] for tag, attrs in TAGS if tag == "button" and "data-command" in attrs
     }
-    expected_pairs = {
-        ("plan", "1"),
-        ("provision", "1"),
-        ("provision", "0"),
-        ("migrate", "1"),
-        ("migrate", "0"),
-        ("verify", "0"),
-        ("cleanup", "0"),
-    }
-    assert run_pairs == expected_pairs, (
-        "Run button command/dry pairs mismatch; "
-        f"got {sorted(run_pairs)}, expected {sorted(expected_pairs)}"
+    expected_commands = {"plan", "provision", "migrate", "verify", "cleanup"}
+    assert commands == expected_commands, (
+        "Run button commands mismatch; "
+        f"got {sorted(commands)}, expected {sorted(expected_commands)}"
     )
+    dry_buttons = [attrs for tag, attrs in TAGS if tag == "button" and "data-dry" in attrs]
+    assert not dry_buttons, "Run buttons must not carry data-dry; the run sheet chooses dry runs"
 
-    job_output_tags = [tag for tag, attrs in TAGS if attrs.get("id") == "job-output"]
-    assert job_output_tags == ["pre"], "Element #job-output must be a <pre>"
+    def tags_with_id(element_id: str) -> list[str]:
+        return [tag for tag, attrs in TAGS if attrs.get("id") == element_id]
+
+    assert tags_with_id("job-output") == ["pre"], "Element #job-output must be a <pre>"
+    assert tags_with_id("run-sheet") == ["dialog"], "Element #run-sheet must be a <dialog>"
+    assert tags_with_id("job-progress") == ["progress"], "#job-progress must be a <progress>"
+
+    run_form = [attrs for _, attrs in TAGS if attrs.get("id") == "run-form"]
+    assert run_form and run_form[0].get("method") == "dialog", '#run-form must have method="dialog"'
+
+    hdr_job = [attrs for _, attrs in TAGS if attrs.get("id") == "hdr-job"]
+    assert hdr_job and hdr_job[0].get("role") == "status", '#hdr-job must have role="status"'
+
+    live = [attrs for _, attrs in TAGS if "aria-live" in attrs]
+    assert len(live) >= 5, f"Expected at least five aria-live regions, found {len(live)}"
+
+
+def test_cancel_is_the_run_sheets_default_button() -> None:
+    """Enter in a field of the run sheet submits with the form's first submit button, so that
+    button must be Cancel: a run starts only from an explicit press of Start."""
+    start = next(i for i, (_, attrs) in enumerate(TAGS) if attrs.get("id") == "run-form")
+    submits = [
+        attrs
+        for tag, attrs in TAGS[start:]
+        if (tag == "button" and attrs.get("type", "submit") == "submit")
+        or (tag == "input" and attrs.get("type") in ("submit", "image"))
+    ]
+    assert [attrs.get("id") for attrs in submits] == ["sheet-cancel", "sheet-start"], (
+        "The run sheet must have exactly Cancel then Start as its submit buttons"
+    )
+    assert submits[0].get("value") == "cancel", "The first submit button must cancel"
+    assert submits[1].get("value") == "start", "Only #sheet-start may carry the start value"
+    assert 'returnValue !== "start"' in SCRIPT_TEXT, "A run must require the start value"
 
 
 def test_size_encoding_and_no_markers() -> None:

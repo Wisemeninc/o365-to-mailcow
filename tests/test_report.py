@@ -138,3 +138,13 @@ def test_progress_phase_is_shown_while_the_counter_cannot_move():
     assert out.getvalue().splitlines()[-1] == "[a@x mail] 10/100 items, 10/min"
     p.finish("a@x mail")
     assert out.getvalue().splitlines()[-1].endswith("(finished)")
+
+
+def test_run_report_records_the_scope_only_when_given(tmp_path):
+    now = datetime(2026, 9, 30, 20, 15, 0, tzinfo=UTC)
+    scope = {"only": "mail", "mailbox": "a@x", "mail_since": "2025-01-01"}
+    data = json.loads(RunReport("verify", tmp_path, now=lambda: now, scope=scope).write(0)
+                      .read_text())
+    assert data["scope"] == scope
+    plain = json.loads(RunReport("verify", tmp_path, now=lambda: now).write(0).read_text())
+    assert "scope" not in plain

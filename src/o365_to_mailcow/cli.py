@@ -248,8 +248,11 @@ class Runner:
         self.secret_filter = secret_filter
         self.out = sys.stdout if out is None else out
         self.err = sys.stderr if err is None else err
+        # the per-run narrowing only: a mail cutoff from the config file is the norm
+        scope = {"only": opts.only, "mailbox": opts.mailbox,
+                 "mail_since": opts.mail_since.isoformat() if opts.mail_since else None}
         self.report = RunReport(opts.command, cfg.state_dir, dry_run=opts.dry_run,
-                                redactor=secret_filter.redact)
+                                redactor=secret_filter.redact, scope=scope)
         self.progress = Progress(self.err)
         self._tokens: TokenProvider | None = None
         self._state: State | None = None

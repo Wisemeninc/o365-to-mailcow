@@ -240,8 +240,24 @@ these phases before the counter moves.
 `o365mig web` serves a local page for the work around the commands: list the tenant's
 mailboxes, pick the ones to migrate, set destination address, display name and quota per
 mailbox, check which destinations exist in mailcow, save the list, start `plan`,
-`provision`, `migrate`, `verify` and `cleanup`, watch their output and read the latest
-report.
+`provision`, `migrate`, `verify` and `cleanup`, watch them run and read what they found.
+
+A strip of six steps (Connect, Select, Provision, Migrate, Verify, Clean up) shows how far
+the migration is, from the newest real run of each command. Under it one outcome line says
+what the latest report means ("28 items have not arrived in mailcow") and offers the next
+step. The mailbox table shows per mailbox and per kind (mail, calendar, contacts) what was
+counted or copied; "Details" opens one mailbox: its counts on both sides, the folders where
+they differ, folders skipped by rule, the sample check, the tool's own problem lines and the
+raw report data. A run limited to one mailbox, one kind or a date is marked as partial: it
+never turns a step green on its own. Every run starts from a sheet that lists the saved
+mailboxes it acts on, offers only the options that apply to that command (one mailbox,
+mail/calendar/contacts, mail since a date, the verify sample) and, for provision and
+migrate, a dry-run switch; nothing starts until you press its Start button. (`cleanup`
+reads the saved list when it starts and also covers mailboxes with app passwords recorded
+by earlier runs; the sheet says so.) While a `migrate` runs the page shows items done of the
+total, the rate and an estimate of the time left, and a card per mailbox; the other commands
+print no item counts, so they show only the last lines of the log. The job runs on the
+server, so closing the page does not stop it.
 
 ```sh
 docker compose up -d web
@@ -303,8 +319,8 @@ services:
   `source,destination,name,quota_mib` format as `--mailboxes`) and every command it starts
   runs with `--mailboxes` pointing at that file **and `--mailboxes-only`**, so a job
   started from the page acts on the saved selection alone, never on the config's own
-  `mailboxes = [...]`. The confirmation names the number of saved mailboxes, and a job is
-  refused if the saved selection changed after the page loaded it.
+  `mailboxes = [...]`. The run sheet lists the saved mailboxes the job will act on, and a
+  job is refused if the saved selection changed after the page loaded it.
 - **One command at a time.** Commands run inside the web container and take the same
   state lock as `docker compose run`, so a page-started run and a CLI run never overlap.
   Stopping the web container stops a running command; start it again to resume, exactly as

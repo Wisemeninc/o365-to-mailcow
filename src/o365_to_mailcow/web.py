@@ -2,7 +2,9 @@
 
 A standard-library HTTP server with one embedded page and a small JSON API: list the
 tenant's mailboxes, check which exist in mailcow, save the mailbox list, start commands,
-watch their output and read the latest report. It is meant for the operator's own machine.
+watch their output (with live per-mailbox progress) and read the reports, raw or summarised
+for the page (``/api/overview``: the newest run of each step plus the latest report, judged by
+``summary.py``). It is meant for the operator's own machine.
 
 Security model
 --------------
@@ -21,10 +23,15 @@ Security model
   ``X-Frame-Options: DENY``.
 * **Surface.** The page is the only file served. Everything else is a fixed route table;
   unknown paths are 404, methods other than GET/POST/PUT 405, bodies over 1 MiB 413. The
-  only file the server writes is ``<state_dir>/mailboxes.csv``.
+  server writes only ``<state_dir>/mailboxes.csv``, ``settings.toml`` and per-job selection
+  snapshots; reports are only read (``/api/reports/latest``, ``/api/overview``, a finished
+  job's outcome): opened with ``O_NOFOLLOW``, regular files of at most ``MAX_REPORT_BYTES``
+  only, at most ``MAX_REPORTS_SCANNED`` files per overview or outcome lookup, and the
+  overview caches what it learned per file (name, mtime, size) so polling re-reads nothing.
 * **Secrets.** Responses never carry the client secret, the mailcow API key or the token:
-  ``/api/status`` lists only non-secret settings, and upstream error messages and job
-  output pass through a redactor that knows all three (on top of the ``SecretFilter``
+  ``/api/status`` lists only non-secret settings, and upstream error messages, job output,
+  job outcomes and every string of ``/api/overview`` pass through a redactor that knows all
+  three (on top of the ``SecretFilter``
   inside ``cli.main``).
 * **Jobs.** One at a time, in a background thread, through ``cli.main`` with the server's
   config file and the saved selection, so the page can do nothing the CLI cannot.
@@ -68,6 +75,7 @@ from .config import Config, ConfigError, _read_mailboxes_csv, valid_address
 from .graph import GraphClient, GraphError
 from .mailcow import MailcowApi, MailcowError
 from .report import clean
+from .summary import summarize_report, summarize_with_step, unreadable_summary
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +96,13 @@ MAX_LINE_CHARS = 4_000
 MAX_PARTIAL_CHARS = 65_536
 TAIL_LINES = 200
 MAX_JOBS_KEPT = 20
+MAX_REPORTS_SCANNED = 200  # report files considered per overview / job-outcome lookup
+MAX_REPORT_BYTES = 64 * 1024 * 1024  # a bigger report file is unreadable, never read
+MTIME_TOLERANCE_SECONDS = 1.0  # file times can lag the clock (coarse kernel clock, FAT/SMB)
+MAX_SCOPES = 6_000  # progress scopes tracked per job; new ones beyond this are ignored
+MAX_SCOPES_SHOWN = 600
+STEP_COMMANDS = ("provision", "migrate", "verify", "cleanup")
+SCOPE_KINDS = ("mail", "calendar", "contacts")
 JOB_COMMANDS = ("plan", "provision", "migrate", "verify", "cleanup")
 _SNAPSHOT_PLACEHOLDER = "<selection-snapshot>"
 JOB_OPTIONS = frozenset({"command", "dry_run", "only", "mailbox", "sample", "selection_digest",
@@ -117,6 +132,12 @@ _LOCAL = r"(?![#./-])[a-z0-9!#$%&'*+/=?^_`{|}~.-]{1,64}"
 _LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 _ADDRESS = re.compile(_LOCAL + r"@(?:" + _LABEL + r"\.)+" + _LABEL)
 _JOB_PATH = re.compile(r"/api/jobs/([A-Za-z0-9_-]{1,64})(/output)?")
+# One line of report.Progress._line (plus " (finished)" from Progress.finish). Anchored, with
+# bounded repetitions and ASCII digits only: it runs inside the migration's own print calls.
+_PROGRESS_LINE = re.compile(
+    r"\[(?P<mailbox>[^\s\[\]]{1,320}) (?P<kind>mail|calendar|contacts)\] "
+    r"(?P<done>[0-9]{1,15})/(?P<total>[0-9]{1,15}) items, (?P<rate>[0-9]{1,15})/min"
+    r"(?: \((?P<phase>.{1,4000})\))?")
 
 
 def page_csp(nonce: str) -> str:
@@ -278,6 +299,7 @@ class JobOutput:
         self._lines: deque[str] = deque(maxlen=max_lines)
         self._dropped = 0
         self._partial = ""
+        self._scopes: dict[tuple[str, str], dict[str, Any]] = {}
         self._lock = threading.Lock()
 
     def write(self, text: str) -> int:
@@ -316,6 +338,39 @@ class JobOutput:
             self._dropped += 1
         self._lines.append(line)
         self._bytes += size
+        if line.startswith("["):
+            # never let a progress line break the print() of the migration that wrote it;
+            # no logging here either: the job's log handler writes into this very object
+            with contextlib.suppress(Exception):
+                self._track_progress(line)
+
+    def _track_progress(self, line: str) -> None:  # caller holds the lock
+        """Latest numbers per (mailbox, kind) from the tool's own progress lines."""
+        match = _PROGRESS_LINE.fullmatch(line)
+        if match is None:
+            return
+        key = (clean(match["mailbox"])[:300], match["kind"])
+        if key not in self._scopes and len(self._scopes) >= MAX_SCOPES:
+            return
+        phase = match["phase"] or ""
+        finished = phase == "finished"
+        self._scopes[key] = {
+            "mailbox": key[0], "kind": key[1], "done": int(match["done"]),
+            "total": int(match["total"]), "rate": int(match["rate"]),
+            "phase": "" if finished else clean(phase)[:300], "finished": finished}
+
+    def progress(self) -> dict[str, Any] | None:
+        """Sums over all scopes plus the first ``MAX_SCOPES_SHOWN`` of them; ``None`` until
+        the job printed its first progress line."""
+        with self._lock:
+            scopes = [dict(scope) for scope in self._scopes.values()]
+        if not scopes:
+            return None
+        scopes.sort(key=lambda s: (s["mailbox"], SCOPE_KINDS.index(s["kind"])))
+        return {"done": sum(s["done"] for s in scopes), "total": sum(s["total"] for s in scopes),
+                "rate": sum(s["rate"] for s in scopes if not s["finished"]),
+                "scopes": scopes[:MAX_SCOPES_SHOWN],
+                "more_scopes": max(len(scopes) - MAX_SCOPES_SHOWN, 0)}
 
     def tail(self, n: int = TAIL_LINES) -> list[str]:
         with self._lock:
@@ -338,17 +393,24 @@ class Job:
     args: list[str]
     output: JobOutput
     started: str = field(default_factory=_now)
+    created: float = field(default_factory=time.time)  # precise; `started` is per second
     finished: str | None = None
     exit_code: int | None = None
+    outcome: dict[str, str] | None = None  # headline of the report the job wrote, once done
 
     @property
     def running(self) -> bool:
         return self.finished is None
 
+    @property
+    def dry_run(self) -> bool:
+        return "--dry-run" in self.args
+
     def summary(self) -> dict[str, Any]:
         return {"id": self.id, "command": self.command, "args": list(self.args),
                 "started": self.started, "finished": self.finished,
-                "exit_code": self.exit_code}
+                "exit_code": self.exit_code, "dry_run": self.dry_run,
+                "outcome": dict(self.outcome) if self.outcome else None}
 
 
 # -- application -----------------------------------------------------------------------
@@ -383,6 +445,9 @@ class WebApp:
         self._lock = threading.Lock()  # guards jobs, the tenant cache and the token provider
         self._jobs: dict[str, Job] = {}
         self._seq = 0
+        self._report_cache_lock = threading.Lock()  # guards the two overview caches below
+        self._report_cache: dict[tuple[str, int, int], _ReportMeta] = {}
+        self._latest_summary: tuple[tuple[str, int, int], dict[str, Any]] | None = None
         self._tenant: tuple[float, dict[str, Any]] | None = None
         self._tokens: TokenProvider | None = None
         self._secrets = cli.SecretFilter()
@@ -859,9 +924,38 @@ class WebApp:
                         if snap.parent == (self.cfg.state_dir / "jobs").resolve():
                             snap.unlink()
             job.output.close()  # before `finished`: a finished job's output is complete
+            outcome = self._job_outcome(job)  # before `finished` too: an outcome is final
             with self._lock:
+                job.outcome = outcome
                 job.exit_code = code
                 job.finished = _now()
+
+    def _job_outcome(self, job: Job) -> dict[str, str] | None:
+        """Headline of the report ``job`` wrote: the newest one of its command whose
+        ``started`` is not before the job was created. Strict, so a job that wrote no report
+        (lock held, bad arguments) never inherits the one before it. Never raises: the job
+        thread must always get to record its exit code."""
+        try:
+            for report_file, data in self._reports(MAX_REPORTS_SCANNED):
+                # written before the job existed: neither this file nor any older one is its
+                # report (the tolerance only covers file times that lag the clock)
+                if report_file.mtime < job.created - MTIME_TOLERANCE_SECONDS:
+                    return None
+                if not isinstance(data, dict) or data.get("command") != job.command:
+                    continue
+                started = data.get("started")
+                if not isinstance(started, str):
+                    continue
+                with contextlib.suppress(ValueError, OverflowError):
+                    stamp = datetime.fromisoformat(started)
+                    if stamp.tzinfo is not None and stamp.timestamp() >= job.created:
+                        headline = summarize_report(data)["headline"]
+                        return {"level": headline["level"],
+                                "text": self.redact(headline["text"])}
+        except Exception as exc:  # e.g. an unreadable reports directory
+            log.warning("job %s (%s): could not read its report: %s", job.id, job.command,
+                        exc.__class__.__name__)
+        return None
 
     def _job(self, job_id: str) -> Job:
         with self._lock:
@@ -878,7 +972,8 @@ class WebApp:
         job = self._job(job_id)
         with self._lock:  # state first, then output: "not running" implies complete output
             detail = {**job.summary(), "running": job.running}
-        return {**detail, "output_tail": job.output.tail(TAIL_LINES)}
+        return {**detail, "output_tail": job.output.tail(TAIL_LINES),
+                "progress": job.output.progress()}
 
     def job_output(self, job_id: str) -> str:
         return self._job(job_id).output.text()
@@ -890,24 +985,178 @@ class WebApp:
         of one command (``?command=verify``)."""
         if command is not None and command not in JOB_COMMANDS:
             raise HttpError(400, f"command must be one of {', '.join(JOB_COMMANDS)}")
-        candidates: list[tuple[float, str, Path]] = []
+        for _, data in self._reports():
+            if command is None or (isinstance(data, dict) and data.get("command") == command):
+                return data
+        raise HttpError(404, "no report found")
+
+    def overview(self) -> dict[str, Any]:
+        """The page's start screen: one entry per step plus the summary of the newest file.
+
+        Per step, real (non-dry-run) reports are scanned newest first: a full run decides
+        the step, and so does a partial run (``--only``/``--mailbox``/``--mail-since``) that
+        found problems; a clean partial run is only a fallback for when nothing older
+        decides, so a narrow green check cannot hide an older failing full one. A step filled
+        from a report older than an unreadable file says so instead of showing it as current.
+        Reads at most ``MAX_REPORTS_SCANNED`` files, stops once every step is decided, and
+        remembers per file what it learned, so a poll without new reports reads nothing.
+        Every string is redacted on the way out."""
+        files = self._report_files()[:MAX_REPORTS_SCANNED]
+        decided: dict[str, dict[str, Any] | None] = dict.fromkeys(STEP_COMMANDS)
+        fallback: dict[str, dict[str, Any]] = {}
+        latest: dict[str, Any] | None = None
+        newer_unreadable = False
+        with self._report_cache_lock:
+            self._prune_report_cache({f.key for f in files})
+            for n, report_file in enumerate(files):
+                meta = self._report_meta(report_file, newest=n == 0)
+                if n == 0:
+                    cached = self._latest_summary
+                    latest = (cached[1] if meta.readable and cached is not None
+                              and cached[0] == report_file.key else unreadable_summary())
+                if not meta.readable:
+                    newer_unreadable = True
+                    continue
+                command = meta.command
+                if command not in decided or decided[command] is not None or meta.dry_run:
+                    continue
+                step = _stale(meta.step) if newer_unreadable else dict(meta.step)
+                if not meta.partial or meta.level in ("warn", "bad"):
+                    decided[command] = step  # a full run, or a partial one that found problems
+                elif command not in fallback:
+                    fallback[command] = step  # a clean partial run: only if nothing else
+                if all(value is not None for value in decided.values()):
+                    break
+        steps = {command: decided[command] or fallback.get(command)
+                 for command in STEP_COMMANDS}
+        return self._redact_tree({"steps": steps, "latest": latest})
+
+    def _prune_report_cache(self, keys: set[tuple[str, int, int]]) -> None:
+        """Forget files that are gone, changed or no longer among the newest ones."""
+        for key in [key for key in self._report_cache if key not in keys]:
+            del self._report_cache[key]
+        if self._latest_summary is not None and self._latest_summary[0] not in keys:
+            self._latest_summary = None
+
+    def _report_meta(self, report_file: _ReportFile, newest: bool) -> _ReportMeta:
+        """What the overview needs from one file, from the cache when the file is unchanged;
+        the newest file's full summary is kept too (caller holds the cache lock)."""
+        meta = self._report_cache.get(report_file.key)
+        have_summary = (self._latest_summary is not None
+                        and self._latest_summary[0] == report_file.key)
+        if meta is not None and (not newest or not meta.readable or have_summary):
+            return meta
+        data = self._read_report(report_file.path)
+        if data is _UNAVAILABLE:
+            # not cached: a permission or descriptor problem can clear up without the
+            # file's name, mtime or size (the cache key) changing
+            return _ReportMeta(readable=False)
+        if data is _UNREADABLE:
+            meta = _ReportMeta(readable=False)
+        else:
+            summary, step = summarize_with_step(data)
+            meta = _ReportMeta(readable=True, command=summary["command"],
+                               dry_run=summary["dry_run"], partial=summary["partial"],
+                               level=summary["headline"]["level"], step=step)
+            if newest:
+                self._latest_summary = (report_file.key, summary)
+        self._report_cache[report_file.key] = meta
+        return meta
+
+    def _redact_tree(self, value: Any) -> Any:
+        """Every string inside ``value`` (dicts and lists, recursively) through ``redact``."""
+        if isinstance(value, str):
+            return self.redact(value)
+        if isinstance(value, dict):
+            return {key: self._redact_tree(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._redact_tree(item) for item in value]
+        return value
+
+    def _report_files(self) -> list[_ReportFile]:
+        """``<state_dir>/reports/*.json`` that are regular files (no symlinks), newest first
+        by modification time, then by name."""
+        candidates: list[tuple[float, str, _ReportFile]] = []
         for path in (self.cfg.state_dir / "reports").glob("*.json"):
             try:
                 st = path.lstat()
             except OSError:
                 continue
             if stat.S_ISREG(st.st_mode):
-                candidates.append((st.st_mtime, path.name, path))
-        for _, _, path in sorted(candidates, reverse=True):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:  # e.g. cut short by a crash
-                log.warning("skipping unreadable report %s: %s", path.name,
-                            exc.__class__.__name__)
-                continue
-            if command is None or (isinstance(data, dict) and data.get("command") == command):
-                return data
-        raise HttpError(404, "no report found")
+                candidates.append((st.st_mtime, path.name, _ReportFile(
+                    path, st.st_mtime, (path.name, st.st_mtime_ns, st.st_size))))
+        return [report_file for _, _, report_file in sorted(candidates, reverse=True)]
+
+    def _reports(self, limit: int | None = None) -> Iterable[tuple[_ReportFile, Any]]:
+        """``(file, parsed JSON)`` of the report files, newest first; unreadable files are
+        skipped but count towards ``limit``, the number of files considered at most."""
+        for report_file in self._report_files()[:limit]:
+            data = self._read_report(report_file.path)
+            if data is not _UNREADABLE and data is not _UNAVAILABLE:
+                yield report_file, data
+
+    def _read_report(self, path: Path) -> Any:
+        """The parsed report, ``_UNAVAILABLE`` when the file could not be opened or read
+        (or is too large), ``_UNREADABLE`` when its content is not JSON."""
+        try:
+            raw = _read_report_bytes(path)
+        except OSError as exc:
+            log.warning("skipping unreadable report %s: %s", clean(path.name)[:200],
+                        exc.__class__.__name__)
+            return _UNAVAILABLE
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (ValueError, RecursionError) as exc:  # e.g. cut short by a crash
+            log.warning("skipping unreadable report %s: %s", clean(path.name)[:200],
+                        exc.__class__.__name__)
+            return _UNREADABLE
+
+
+_UNREADABLE = object()  # marks a report file whose content could not be parsed
+_UNAVAILABLE = object()  # marks a report file that could not be opened or read right now
+
+
+def _read_report_bytes(path: Path) -> bytes:
+    """The file's bytes, read through one descriptor: a symlink or anything but a regular
+    file of at most ``MAX_REPORT_BYTES`` (checked on the descriptor, so a file swapped in
+    after ``lstat`` gains nothing) raises ``OSError``. ``O_NONBLOCK``: a FIFO swapped in
+    cannot hang the request."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(path, flags)
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{path.name} is not a regular file")
+        if st.st_size > MAX_REPORT_BYTES:
+            raise OSError(f"{path.name} is larger than {MAX_REPORT_BYTES} bytes")
+        data = fh.read(MAX_REPORT_BYTES + 1)
+    if len(data) > MAX_REPORT_BYTES:  # grew while being read
+        raise OSError(f"{path.name} is larger than {MAX_REPORT_BYTES} bytes")
+    return data
+
+
+def _stale(step: dict[str, Any] | None) -> dict[str, Any]:
+    """A step whose report is older than a report file that could not be read."""
+    return {**(step or {}), "level": "unknown", "text": "A newer report could not be read"}
+
+
+@dataclass(frozen=True)
+class _ReportFile:
+    path: Path
+    mtime: float
+    key: tuple[str, int, int]  # (name, st_mtime_ns, st_size): the overview cache key
+
+
+@dataclass(frozen=True)
+class _ReportMeta:
+    """What the overview keeps per report file between requests (small on purpose)."""
+
+    readable: bool
+    command: str = ""
+    dry_run: bool = False
+    partial: bool = False
+    level: str = "unknown"
+    step: dict[str, Any] = field(default_factory=dict)
 
 
 # -- HTTP ------------------------------------------------------------------------------
@@ -1016,6 +1265,9 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 return json_response(200, app.list_jobs())
             return json_response(202, {"id": app.start_job(_parse_json(body)).id})
+        if path == "/api/overview":
+            _allow(method, "GET")
+            return json_response(200, app.overview())
         if path == "/api/reports/latest":
             _allow(method, "GET")
             command = (query.get("command") or [None])[-1]

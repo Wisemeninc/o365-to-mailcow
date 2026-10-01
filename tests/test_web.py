@@ -26,6 +26,9 @@ from o365_to_mailcow import __version__, cli, web
 from o365_to_mailcow.auth import AuthError
 from o365_to_mailcow.config import MailboxMapping, load_config
 from o365_to_mailcow.graph import GraphError
+from o365_to_mailcow.mail import FolderVerify, MailVerify
+from o365_to_mailcow.report import Progress, RunReport, _plain
+from o365_to_mailcow.summary import summarize_report
 
 API = "https://mail.example.net/api/v1/"
 TOKEN = "web-token-" + "Q" * 33
@@ -159,6 +162,7 @@ def client(tmp_path, conf, graph):
     thread.start()
     c = Client(srv.server_address[1])
     c.state_dir = tmp_path / "state"
+    c.server = srv
     c.selection = tmp_path / "state" / "mailboxes.csv"
     c.conf = conf
     yield c
@@ -194,6 +198,7 @@ def test_api_requires_the_bearer_token_isc_156(client, header, monkeypatch):
     headers = {"Authorization": header} if header else {}
     for method, path, body in (("GET", "/api/status", None), ("GET", "/api/selection", None),
                                ("POST", "/api/jobs", {"command": "plan"}),
+                               ("GET", "/api/overview", None),
                                ("GET", "/api/nonexistent", None)):
         r = client.request(method, path, body, token=None, headers=headers)
         assert r.status == 401, (method, path)
@@ -229,6 +234,9 @@ def test_page_is_served_with_a_fresh_csp_nonce_isc_163(client):
     ("DELETE", "/api/selection", TOKEN, None),
     ("PUT", "/api/selection", TOKEN, b"{not json"),
     ("GET", "/api/reports/latest", TOKEN, None),
+    ("GET", "/api/overview", TOKEN, None),
+    ("GET", "/api/overview", None, None),
+    ("POST", "/api/overview", TOKEN, None),
 ])
 def test_security_headers_on_every_response_isc_163(client, method, path, token, raw):
     assert_security_headers(client.request(method, path, token=token, raw=raw))
@@ -255,7 +263,8 @@ def test_other_methods_are_405(client, method):
 
 def test_known_path_with_wrong_method_is_405(client):
     for method, path in (("PUT", "/api/status"), ("POST", "/"), ("GET", "/api/mailcow/check"),
-                         ("PUT", "/api/jobs")):
+                         ("PUT", "/api/jobs"), ("POST", "/api/overview"),
+                         ("PUT", "/api/overview")):
         r = client.request(method, path, {})
         assert r.status == 405, (method, path)
 
@@ -559,7 +568,10 @@ def test_job_runs_cli_main_and_captures_output_isc_160_161(client, monkeypatch):
         assert secret not in out.body.decode() and secret not in json.dumps(job)
     listing = client.get("/api/jobs").json()
     assert [j["id"] for j in listing] == [job_id]
-    assert set(listing[0]) == {"id", "command", "args", "started", "finished", "exit_code"}
+    assert set(listing[0]) == {"id", "command", "args", "started", "finished", "exit_code",
+                               "dry_run", "outcome"}
+    assert listing[0]["dry_run"] is True and listing[0]["outcome"] is None  # wrote no report
+    assert job["progress"] is None  # plan prints no progress lines
 
 
 def _saved(client) -> str:
@@ -1114,3 +1126,478 @@ def test_allow_host_accepts_bracketed_ipv6_with_port():
     assert web.host_only("[::1]") == "::1"
     assert web.host_only("ui.example.net:8080") == "ui.example.net"
     assert web.host_only("ui.example.net") == "ui.example.net"
+
+
+# -- overview, job outcome and progress (web UI redesign) -----------------------------------
+
+ANNA = "anna@example.com"
+FULL = {"only": None, "mailbox": None, "mail_since": None}  # what cli.Runner records
+
+
+def _write_report(state_dir: Path, name: str, data: object, mtime: float) -> Path:
+    reports = state_dir / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    path = reports / name
+    path.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
+    os.utime(path, (mtime, mtime))
+    return path
+
+
+def _verify_report(imap: int, exit_code: int, started: str = "2026-10-01T01:00:00+00:00",
+                   dry_run: bool = False) -> dict:
+    mail = MailVerify(ANNA, [FolderVerify("INBOX", 10, 10, 0, 0, imap, 10, imap != 10)])
+    return {"command": "verify", "dry_run": dry_run, "started": started, "scope": FULL,
+            "finished": "2026-10-01T02:00:00+00:00", "duration_s": 3.0, "exit_code": exit_code,
+            "mailboxes": {ANNA: {"destination": "anna@example.net", "status": "ok",
+                                 "errors": [], "mail": _plain(mail)}}}
+
+
+def _migrate_report(copied: int, dry_run: bool) -> dict:
+    folder = {"folder_id": "f", "dest_name": "INBOX", "listed": copied, "appended": copied,
+              "already_done": 0, "dedup_hits": 0, "failed": 0, "skipped_too_large": 0,
+              "would_append": copied if dry_run else 0, "error": None}
+    return {"command": "migrate", "dry_run": dry_run, "started": "2026-10-01T00:00:00+00:00",
+            "scope": FULL,
+            "finished": "2026-10-01T00:30:00+00:00", "duration_s": 1.0, "exit_code": 0,
+            "mailboxes": {ANNA: {"destination": "anna@example.net", "status": "ok",
+                                 "errors": [], "mail": {"folders": [folder],
+                                                        "skipped_folders": [], "errors": [],
+                                                        "stopped": False}}}}
+
+
+def test_overview_without_reports_is_all_null(client):
+    r = client.get("/api/overview")
+    assert r.status == 200
+    assert r.json() == {"steps": {"provision": None, "migrate": None, "verify": None,
+                                  "cleanup": None}, "latest": None}
+    assert_security_headers(r)
+
+
+def test_overview_steps_use_the_newest_real_run_of_each_command(client):
+    state = client.state_dir
+    _write_report(state, "1.json", _verify_report(10, 0), 1_000)
+    _write_report(state, "2.json", _verify_report(7, 1), 2_000)  # newest real verify
+    _write_report(state, "3.json", _migrate_report(5, dry_run=False), 3_000)
+    _write_report(state, "4.json", _migrate_report(99, dry_run=True), 4_000)  # dry run: no step
+    _write_report(state, "5.json", {"command": "cleanup", "dry_run": False, "exit_code": 0,
+                                    "mailboxes": {"anna@example.net": {
+                                        "errors": [], "deleted_app_passwords": 2}}}, 5_000)
+    _write_report(state, "0.json", "{cut short", 500)  # unreadable and oldest: skipped
+    (state / "reports" / "7.json").symlink_to(state / "reports" / "1.json")  # never followed
+    _write_report(state, "8.json", {"command": "plan", "dry_run": True, "exit_code": 0,
+                                    "mailboxes": {}}, 5_500)
+    data = client.get("/api/overview").json()
+    steps = data["steps"]
+    assert steps["provision"] is None
+    assert steps["verify"] == {"started": "2026-10-01T01:00:00+00:00",
+                               "finished": "2026-10-01T02:00:00+00:00", "exit_code": 1,
+                               "level": "warn", "text": "3 items missing"}
+    assert steps["migrate"]["text"] == "5 items copied" and steps["migrate"]["level"] == "ok"
+    assert steps["cleanup"]["text"] == "2 deleted"
+    raw_latest = client.get("/api/reports/latest").json()
+    assert raw_latest["command"] == "plan"  # the newest readable regular file, dry run or not
+    assert data["latest"] == summarize_report(raw_latest)
+
+
+def test_overview_with_only_garbage_reports(client):
+    _write_report(client.state_dir, "1.json", "not json", 1_000)
+    _write_report(client.state_dir, "2.json", json.dumps([1, 2, 3]), 2_000)
+    data = client.get("/api/overview").json()
+    assert all(step is None for step in data["steps"].values())
+    assert data["latest"]["headline"] == {"level": "unknown", "text": "Run ended", "detail": ""}
+
+
+def test_overview_reads_at_most_200_report_files(client, monkeypatch):
+    for i in range(250):  # plan reports never complete the steps, so the scan cannot stop
+        _write_report(client.state_dir, f"{i:04d}.json",
+                      {"command": "plan", "dry_run": True, "mailboxes": {}}, 1_000 + i)
+    reads: list[str] = []
+    original = web.WebApp._read_report
+
+    def counting(self, path):
+        reads.append(path.name)
+        return original(self, path)
+
+    monkeypatch.setattr(web.WebApp, "_read_report", counting)
+    data = client.get("/api/overview").json()
+    assert len(reads) == web.MAX_REPORTS_SCANNED == 200
+    assert reads[0] == "0249.json"  # newest first
+    assert data["latest"]["command"] == "plan"
+
+
+def test_overview_stops_reading_once_every_step_is_known(client, monkeypatch):
+    state = client.state_dir
+    _write_report(state, "1.json", {"command": "plan", "mailboxes": {}}, 1_000)
+    _write_report(state, "2.json", _verify_report(10, 0), 2_000)
+    _write_report(state, "3.json", _migrate_report(1, False), 3_000)
+    _write_report(state, "4.json", {"command": "provision", "dry_run": False, "exit_code": 0,
+                                    "mailboxes": {ANNA: {"errors": [],
+                                                         "provision": "created"}}}, 4_000)
+    _write_report(state, "5.json", {"command": "cleanup", "dry_run": False, "exit_code": 0,
+                                    "mailboxes": {}}, 5_000)
+    reads: list[str] = []
+    original = web.WebApp._read_report
+    monkeypatch.setattr(web.WebApp, "_read_report",
+                        lambda self, path: reads.append(path.name) or original(self, path))
+    steps = client.get("/api/overview").json()["steps"]
+    assert steps["provision"]["text"] == "1 created, 0 existed"
+    assert reads == ["5.json", "4.json", "3.json", "2.json"]  # 1.json is never read
+
+
+def _progress_lines(clock: dict) -> tuple[web.JobOutput, Progress]:
+    out = web.JobOutput(lambda t: t)
+    return out, Progress(out=out, interval=1e9, clock=lambda: clock["t"])  # forced prints only
+
+
+def test_progress_parses_exactly_what_report_progress_prints():
+    """Guard: the printer (report.Progress) and the parser (JobOutput) cannot drift apart."""
+    clock = {"t": 0.0}
+    out, p = _progress_lines(clock)
+    assert out.progress() is None
+    p.start(f"{ANNA} mail", 150_374)
+    p.start(f"{ANNA} calendar", 40)
+    p.start("ben@example.com contacts", 12)
+    clock["t"] = 60.0
+    p.advance(f"{ANNA} mail", 310)
+    p.phase(f"{ANNA} mail", "indexing Inbox: 800/3000 (pass 2)")
+    p.advance(f"{ANNA} calendar", 40)
+    p.advance("ben@example.com contacts", 12)
+    p.maybe_print(force=True)
+    p.finish("ben@example.com contacts")
+    printed = out.tail(10)
+    assert printed == [
+        f"[{ANNA} mail] 310/150374 items, 310/min (indexing Inbox: 800/3000 (pass 2))",
+        f"[{ANNA} calendar] 40/40 items, 40/min",
+        "[ben@example.com contacts] 12/12 items, 12/min",
+        "[ben@example.com contacts] 12/12 items, 12/min (finished)",
+    ]
+    assert out.progress() == {
+        "done": 362, "total": 150_426, "rate": 350,  # the finished scope adds no rate
+        "scopes": [
+            {"mailbox": ANNA, "kind": "mail", "done": 310, "total": 150_374, "rate": 310,
+             "phase": "indexing Inbox: 800/3000 (pass 2)", "finished": False},
+            {"mailbox": ANNA, "kind": "calendar", "done": 40, "total": 40, "rate": 40,
+             "phase": "", "finished": False},
+            {"mailbox": "ben@example.com", "kind": "contacts", "done": 12, "total": 12,
+             "rate": 12, "phase": "", "finished": True},
+        ],
+        "more_scopes": 0,
+    }
+
+
+def test_progress_ignores_lines_that_do_not_match():
+    out = web.JobOutput(lambda t: t)
+    lines = [
+        "2026-10-01 01:00:00 INFO o365mig 0.1.0 migrate: 1 mailbox(es)",
+        "[anna@example.com mail] 5/10 items, 3/min trailing",
+        "[anna@example.com email] 5/10 items, 3/min",
+        "[anna@example.com mail] 5/10 items",
+        "[] 5/10 items, 3/min",
+        "[",
+        "[anna@example.com mail] 99999999999999999999/1 items, 0/min",
+        "[anna@example.com mail] \u0663/10 items, 0/min",
+        "[anna@example.com mail] 5/10 items, 3/min (" + "x" * 5000 + ")",
+    ]
+    for line in lines:
+        out.write(line + "\n")
+    assert out.progress() is None
+    assert len(out.tail(100)) == len(lines)  # all stored as ordinary output
+
+
+def test_progress_parsing_can_never_break_a_write(monkeypatch):
+    def boom(self, line):
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr(web.JobOutput, "_track_progress", boom)
+    out = web.JobOutput(lambda t: t)
+    assert out.write("[anna@example.com mail] 1/2 items, 1/min\n") > 0
+    assert out.tail(1) == ["[anna@example.com mail] 1/2 items, 1/min"]
+
+
+def test_progress_is_parsed_after_redaction_and_cleaning():
+    out = web.JobOutput(lambda t: t.replace("hunter2", "***"))
+    out.write("[anna@example.com mail] 1/2 items, 1/min (listing hunter2\u202e)\n")
+    scope = out.progress()["scopes"][0]
+    assert scope["phase"] == "listing ***"
+
+
+def test_progress_scopes_are_capped():
+    out = web.JobOutput(lambda t: t)
+    for i in range(web.MAX_SCOPES + 1):  # the last one is ignored
+        out.write(f"[user{i:05d}@example.com mail] 1/2 items, 1/min\n")
+    out.write("[user00000@example.com mail] 2/2 items, 0/min (finished)\n")  # known: updated
+    progress = out.progress()
+    assert len(progress["scopes"]) == web.MAX_SCOPES_SHOWN == 600
+    assert progress["more_scopes"] == web.MAX_SCOPES - 600
+    assert progress["done"] == web.MAX_SCOPES + 1 and progress["total"] == 2 * web.MAX_SCOPES
+    assert progress["rate"] == web.MAX_SCOPES - 1
+    assert progress["scopes"][0] == {"mailbox": "user00000@example.com", "kind": "mail",
+                                     "done": 2, "total": 2, "rate": 0, "phase": "",
+                                     "finished": True}
+
+
+def _fake_report_main(state_dir: Path, imap: int, *, progress: bool = False, code: int = 1):
+    def fake_main(argv=None, *, stdout=None, stderr=None):
+        if progress:
+            stderr.write(f"[{ANNA} mail] 7/10 items, 7/min (finished)\n")
+        rep = RunReport("verify", state_dir)
+        rep.mailbox(ANNA, "anna@example.net")
+        rep.set(ANNA, "mail", MailVerify(ANNA, [FolderVerify("INBOX", 10, 10, 0, 0, imap, 10,
+                                                             imap != 10)]))
+        rep.set(ANNA, "status", "ok")
+        rep.write(code)
+        return code
+    return fake_main
+
+
+def test_job_outcome_is_the_headline_of_the_report_it_wrote(client, monkeypatch):
+    monkeypatch.setattr(cli, "main", _fake_report_main(client.state_dir, 7, progress=True))
+    digest = _saved(client)
+    job = wait_job(client, client.post("/api/jobs", {"command": "verify",
+                                                     "selection_digest": digest}).json()["id"])
+    assert job["exit_code"] == 1 and job["dry_run"] is False
+    assert job["outcome"] == {"level": "warn", "text": "3 items have not arrived in mailcow"}
+    assert job["progress"]["scopes"][0]["finished"] is True
+    assert client.get("/api/jobs").json()[0]["outcome"] == job["outcome"]
+    overview = client.get("/api/overview").json()
+    assert overview["steps"]["verify"]["text"] == "3 items missing"
+    for body in (json.dumps(job), json.dumps(overview), client.get("/api/jobs").body.decode()):
+        for secret in SECRETS:
+            assert secret not in body
+
+
+def test_job_outcome_ignores_reports_older_than_the_job(client, monkeypatch):
+    old = _write_report(client.state_dir, "20200101T000000Z.json",
+                        _verify_report(10, 0, started="2020-01-01T00:00:00+00:00"), 1_000)
+    recent_mtime = _write_report(client.state_dir, "20200101T000001Z.json",
+                                 _verify_report(10, 0, started="2020-01-01T00:00:01+00:00"),
+                                 time.time() + 60)  # touched later, but started long ago
+    monkeypatch.setattr(cli, "main", lambda argv, **kw: 0)
+    digest = _saved(client)
+    job = wait_job(client, client.post("/api/jobs", {"command": "verify",
+                                                     "selection_digest": digest}).json()["id"])
+    assert job["exit_code"] == 0 and job["outcome"] is None
+    assert old.exists() and recent_mtime.exists()
+
+
+def test_job_outcome_of_another_command_is_not_taken(client, monkeypatch):
+    def fake_main(argv=None, *, stdout=None, stderr=None):
+        RunReport("plan", client.state_dir).write(0)
+        return 0
+
+    monkeypatch.setattr(cli, "main", fake_main)
+    digest = _saved(client)
+    job = wait_job(client, client.post("/api/jobs", {"command": "verify",
+                                                     "selection_digest": digest}).json()["id"])
+    assert job["outcome"] is None
+
+
+def test_garbage_report_leaves_the_outcome_null(client, monkeypatch):
+    def fake_main(argv=None, *, stdout=None, stderr=None):
+        _write_report(client.state_dir, "garbage.json", "{not json", time.time())
+        return 1
+
+    monkeypatch.setattr(cli, "main", fake_main)
+    digest = _saved(client)
+    job = wait_job(client, client.post("/api/jobs", {"command": "migrate", "dry_run": True,
+                                                     "selection_digest": digest}).json()["id"])
+    assert job["exit_code"] == 1 and job["outcome"] is None and job["dry_run"] is True
+
+
+def test_a_crashing_summary_never_stops_the_job_from_finishing(client, monkeypatch):
+    def broken(report):
+        raise RuntimeError(f"summary bug {API_KEY}")
+
+    monkeypatch.setattr(cli, "main", _fake_report_main(client.state_dir, 10, code=0))
+    monkeypatch.setattr(web, "summarize_report", broken)
+    digest = _saved(client)
+    job = wait_job(client, client.post("/api/jobs", {"command": "verify",
+                                                     "selection_digest": digest}).json()["id"])
+    assert job["exit_code"] == 0 and job["finished"] and job["outcome"] is None
+    assert API_KEY not in json.dumps(job)
+
+
+# -- review-gate follow-up: partial runs, cache, unreadable files, redaction -------------------
+
+PARTIAL = {"only": "mail", "mailbox": ANNA, "mail_since": None}
+
+
+def _with_scope(data: dict, scope: dict | None) -> dict:
+    data = dict(data)
+    if scope is None:
+        data.pop("scope", None)
+    else:
+        data["scope"] = scope
+    return data
+
+
+def test_a_newer_clean_partial_verify_does_not_hide_a_failing_full_one(client):
+    _write_report(client.state_dir, "1.json", _verify_report(7, 1), 1_000)  # full, failing
+    _write_report(client.state_dir, "2.json", _with_scope(_verify_report(10, 0), PARTIAL),
+                  2_000)  # newer, narrow, clean
+    data = client.get("/api/overview").json()
+    assert data["steps"]["verify"]["level"] == "warn"
+    assert data["steps"]["verify"]["text"] == "3 items missing"
+    assert data["latest"]["partial"] is True and data["latest"]["scope"] == "mail only · 1 mailbox"
+    assert data["latest"]["headline"]["text"] == "Everything that was checked has arrived"
+
+
+def test_a_newer_partial_verify_with_problems_decides_the_step(client):
+    _write_report(client.state_dir, "1.json", _verify_report(10, 0), 1_000)  # full, clean
+    _write_report(client.state_dir, "2.json", _with_scope(_verify_report(8, 1), PARTIAL), 2_000)
+    step = client.get("/api/overview").json()["steps"]["verify"]
+    assert step["level"] == "warn" and step["text"] == "2 items missing"
+
+
+def test_only_partial_runs_fall_back_to_the_newest_one_in_grey(client):
+    older = _with_scope(_verify_report(10, 0, started="2026-09-01T00:00:00+00:00"), PARTIAL)
+    _write_report(client.state_dir, "1.json", older, 1_000)
+    _write_report(client.state_dir, "2.json", _with_scope(_verify_report(10, 0), PARTIAL), 2_000)
+    _write_report(client.state_dir, "3.json", _with_scope(_verify_report(10, 0), None), 500)
+    step = client.get("/api/overview").json()["steps"]["verify"]
+    assert step == {"started": "2026-10-01T01:00:00+00:00",
+                    "finished": "2026-10-01T02:00:00+00:00", "exit_code": 0,
+                    "level": "unknown", "text": "Partial check passed"}
+
+
+def test_a_legacy_report_with_one_kind_counts_as_partial(client):
+    _write_report(client.state_dir, "1.json", _with_scope(_verify_report(10, 0), None), 1_000)
+    data = client.get("/api/overview").json()
+    assert data["latest"]["partial"] is True and data["latest"]["scope"] == "mail only"
+    assert data["steps"]["verify"]["text"] == "Partial check passed"
+
+
+def test_an_unreadable_newer_report_marks_older_steps_and_latest(client):
+    _write_report(client.state_dir, "1.json", _verify_report(7, 1), 1_000)
+    _write_report(client.state_dir, "2.json", "{cut short", 2_000)
+    data = client.get("/api/overview").json()
+    assert data["steps"]["verify"] == {"started": "2026-10-01T01:00:00+00:00",
+                                       "finished": "2026-10-01T02:00:00+00:00",
+                                       "exit_code": 1, "level": "unknown",
+                                       "text": "A newer report could not be read"}
+    assert data["latest"]["headline"]["text"] == "The newest report could not be read"
+    assert data["latest"]["headline"]["level"] == "unknown"
+    assert client.get("/api/reports/latest").json()["command"] == "verify"  # still skips it
+
+
+def _count_reads(monkeypatch) -> list[str]:
+    reads: list[str] = []
+    original = web._read_report_bytes
+
+    def counting(path):
+        reads.append(path.name)
+        return original(path)
+
+    monkeypatch.setattr(web, "_read_report_bytes", counting)
+    return reads
+
+
+def test_overview_caches_per_file_and_rereads_changes(client, monkeypatch):
+    _write_report(client.state_dir, "1.json", _verify_report(7, 1), 1_000)
+    path = _write_report(client.state_dir, "2.json", _migrate_report(3, False), 2_000)
+    _write_report(client.state_dir, "3.json", "garbage", 500)  # unreadable results are cached
+    reads = _count_reads(monkeypatch)
+    first = client.get("/api/overview").json()
+    assert sorted(reads) == ["1.json", "2.json", "3.json"]
+    reads.clear()
+    assert client.get("/api/overview").json() == first
+    assert reads == []  # nothing changed: nothing read
+    path.write_text(json.dumps(_migrate_report(4, False)), encoding="utf-8")
+    os.utime(path, (2_001, 2_001))
+    second = client.get("/api/overview").json()
+    assert reads == ["2.json"] and second["steps"]["migrate"]["text"] == "4 items copied"
+    assert second["latest"]["headline"]["text"] == "Migrate finished: 4 items copied"
+
+
+def test_a_report_that_cannot_be_opened_is_retried_not_cached(client, monkeypatch):
+    """Permissions can be fixed without the name, mtime or size changing (chmod only moves
+    ctime), so a file that could not be opened must be tried again on the next overview."""
+    _write_report(client.state_dir, "1.json", _verify_report(10, 0), 1_000)
+    real = web._read_report_bytes
+
+    def denied(path):
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(web, "_read_report_bytes", denied)
+    first = client.get("/api/overview").json()
+    assert first["latest"]["headline"]["text"] == "The newest report could not be read"
+    assert first["steps"]["verify"] is None
+    monkeypatch.setattr(web, "_read_report_bytes", real)
+    second = client.get("/api/overview").json()
+    assert second["steps"]["verify"]["text"] == "Everything arrived"
+    assert second["latest"]["headline"]["level"] == "ok"
+
+
+def test_overview_cache_is_pruned_to_the_current_files(client):
+    app_paths = [_write_report(client.state_dir, f"{i}.json", _verify_report(10, 0), 1_000 + i)
+                 for i in range(3)]
+    client.get("/api/overview")
+    app = _app_of(client)
+    assert {key[0] for key in app._report_cache} == {"0.json", "1.json", "2.json"}
+    app_paths[2].unlink()
+    client.get("/api/overview")
+    assert {key[0] for key in app._report_cache} == {"0.json", "1.json"}
+    assert app._latest_summary[0][0] == "1.json"
+
+
+def _app_of(client) -> web.WebApp:
+    return client.server.app
+
+
+def test_oversize_report_is_skipped_without_being_read(client, monkeypatch):
+    monkeypatch.setattr(web, "MAX_REPORT_BYTES", 100)
+    _write_report(client.state_dir, "1.json", _verify_report(10, 0), 1_000)  # > 100 bytes
+    assert client.get("/api/reports/latest").status == 404
+    data = client.get("/api/overview").json()
+    assert data["latest"]["headline"]["text"] == "The newest report could not be read"
+    assert data["steps"]["verify"] is None
+
+
+def test_report_reads_never_follow_a_symlink(client, tmp_path):
+    secret = tmp_path / "elsewhere.json"
+    secret.write_text(json.dumps(_verify_report(10, 0)), encoding="utf-8")
+    link = client.state_dir / "reports" / "x.json"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(secret)
+    with pytest.raises(OSError):  # the lstat/read race: a link swapped in after lstat
+        web._read_report_bytes(link)
+    fifo = client.state_dir / "reports" / "fifo.json"
+    os.mkfifo(fifo)
+    with pytest.raises(OSError):  # not a regular file on the descriptor, and no hang
+        web._read_report_bytes(fifo)
+    assert client.get("/api/reports/latest").status == 404
+
+
+def test_a_job_without_a_report_never_inherits_the_previous_one(client, monkeypatch):
+    monkeypatch.setattr(cli, "main", _fake_report_main(client.state_dir, 7))
+    digest = _saved(client)
+    first = wait_job(client, client.post("/api/jobs", {"command": "verify",
+                                                       "selection_digest": digest}).json()["id"])
+    assert first["outcome"]["level"] == "warn"
+    monkeypatch.setattr(cli, "main", lambda argv, **kw: 2)  # e.g. the state lock was held
+    second = wait_job(client, client.post("/api/jobs", {"command": "verify",
+                                                        "selection_digest": digest}).json()["id"])
+    assert second["exit_code"] == 2 and second["outcome"] is None
+
+
+def test_secrets_in_reports_never_leave_through_overview_or_outcome(client, monkeypatch):
+    leaky = _verify_report(7, 1)
+    leaky["mailboxes"][ANNA]["errors"] = [f"boom {CLIENT_SECRET} {API_KEY} {TOKEN}"]
+    leaky["mailboxes"][ANNA]["status"] = "failed"
+    _write_report(client.state_dir, "1.json", {"command": f"x{API_KEY}", "exit_code": 1,
+                                               "mailboxes": {}}, 1_000)
+    _write_report(client.state_dir, "2.json", leaky, 2_000)  # newest: its errors are shown
+    body = client.get("/api/overview").body.decode()
+    assert "boom *** *** ***" in body
+    for secret in SECRETS:
+        assert secret not in body
+
+    def leaking_summary(report):
+        return {"headline": {"level": "bad", "text": f"oops {CLIENT_SECRET}"}}
+
+    monkeypatch.setattr(cli, "main", _fake_report_main(client.state_dir, 10, code=0))
+    monkeypatch.setattr(web, "summarize_report", leaking_summary)
+    digest = _saved(client)
+    job = wait_job(client, client.post("/api/jobs", {"command": "verify",
+                                                     "selection_digest": digest}).json()["id"])
+    assert job["outcome"] == {"level": "bad", "text": "oops ***"}
