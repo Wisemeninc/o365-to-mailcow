@@ -120,3 +120,21 @@ def test_verify_missing_mailbox_and_errors_are_problems():
     entry = {"a@x": {"destination": "a@y", "status": "missing", "errors": ["gone"]}}
     lines, problems = verify_summary(entry)
     assert problems == 2 and "does not exist in mailcow" in "\n".join(lines)
+
+
+def test_progress_phase_is_shown_while_the_counter_cannot_move():
+    out = io.StringIO()
+    clock = {"t": 0.0}
+    p = Progress(out=out, interval=30.0, clock=lambda: clock["t"])
+    p.start("a@x mail", 100)
+    p.phase("a@x mail", "listing Inbox: 5000")
+    clock["t"] = 31.0
+    assert p.maybe_print(force=True)
+    assert "[a@x mail] 0/100 items, 0/min (listing Inbox: 5000)" in out.getvalue()
+    p.phase("a@x mail", "")
+    p.advance("a@x mail", 10)
+    clock["t"] = 62.0
+    p.maybe_print(force=True)
+    assert out.getvalue().splitlines()[-1] == "[a@x mail] 10/100 items, 10/min"
+    p.finish("a@x mail")
+    assert out.getvalue().splitlines()[-1].endswith("(finished)")

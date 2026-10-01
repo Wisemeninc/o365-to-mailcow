@@ -25,6 +25,8 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _APPENDUID = re.compile(rb"\[APPENDUID (\d+) (\d+)\]", re.IGNORECASE)
+_HEADER_MID = re.compile(rb"^message-id:[ \t]*(<[^>]*>)", re.IGNORECASE | re.MULTILINE)
+INDEX_CHUNK = 2000  # UIDs per FETCH when indexing a folder's Message-IDs
 CONNECTION_ERRORS = (IMAPClientAbortError, OSError)
 
 
@@ -167,6 +169,29 @@ class ImapDestination:
     def has_message_id(self, folder: str, message_id: str) -> bool:
         return bool(self.search_message_id(folder, message_id))
 
+    def message_id_index(self, folder: str,
+                         on_progress: Callable[[int, int], None] | None = None,
+                         ) -> dict[str, list[int]]:
+        """Lower-cased Message-ID -> UIDs of every message in ``folder``: one EXAMINE and
+        chunked ``FETCH BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]`` calls. Built once per
+        non-empty folder; a resumed run then checks each source message locally instead
+        of running one SEARCH per message against the whole folder (ISC-189)."""
+        def op(c: IMAPClient) -> dict[str, list[int]]:
+            c.select_folder(folder, readonly=True)
+            uids = sorted(int(u) for u in c.search("ALL"))
+            index: dict[str, list[int]] = {}
+            for i in range(0, len(uids), INDEX_CHUNK):
+                chunk = uids[i:i + INDEX_CHUNK]
+                data = c.fetch(chunk, ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"])
+                for uid, item in data.items():
+                    mid = header_message_id(item)
+                    if mid:
+                        index.setdefault(mid, []).append(int(uid))
+                if on_progress:
+                    on_progress(min(i + INDEX_CHUNK, len(uids)), len(uids))
+            return index
+        return self._call(op, f"FETCH headers {folder!r}")
+
     def append(self, folder: str, mime: bytes, flags: list[str],
                internal_date: datetime, message_id: str | None = None) -> int | None:
         """APPEND the message byte-for-byte; return the UID from APPENDUID if present.
@@ -216,6 +241,19 @@ class ImapDestination:
             item = data.get(uid) or {}
             return bytes(item.get(b"BODY[]", b""))
         return self._call(op, f"FETCH {folder!r}")
+
+
+def header_message_id(item: dict) -> str | None:
+    """The ``<msg-id>`` of a fetched ``HEADER.FIELDS (MESSAGE-ID)`` item, lower-cased
+    (IMAP SEARCH compares headers case-insensitively, so does this index), or None."""
+    for key, value in item.items():
+        if isinstance(key, bytes) and key.upper().startswith(b"BODY[HEADER.FIELDS") \
+                and isinstance(value, bytes):
+            unfolded = re.sub(rb"\r?\n[ \t]+", b" ", value)
+            m = _HEADER_MID.search(unfolded)
+            if m:
+                return m.group(1).decode("latin-1").strip().lower()
+    return None
 
 
 def _short(exc: BaseException) -> str:

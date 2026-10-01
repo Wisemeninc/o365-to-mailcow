@@ -164,3 +164,53 @@ def test_class_has_no_destructive_methods_isc_55():
     names = {n.lower() for n in dir(ImapDestination)}
     for bad in ("expunge", "delete", "store", "move", "rename"):
         assert not any(bad in n for n in names), bad
+
+
+# -- ISC-189: per-folder Message-ID index -----------------------------------------------
+
+def test_message_id_index_fetches_headers_in_chunks_read_only():
+    from o365_to_mailcow import imap_dest
+
+    f = Factory()
+    d = make(f)
+    c = f.clients[0]
+    uids = list(range(1, imap_dest.INDEX_CHUNK + 3))  # two chunks
+    c.search.return_value = uids
+    hdr = b"BODY[HEADER.FIELDS (MESSAGE-ID)]"
+
+    def fetch(chunk, fields):
+        assert fields == ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"]
+        out = {}
+        for uid in chunk:
+            if uid == 2:
+                out[uid] = {hdr: b"Message-ID:\r\n <Folded@Example.ORG>\r\n\r\n"}  # folded
+            elif uid == 3:
+                out[uid] = {hdr: b"\r\n"}  # no Message-ID
+            else:
+                out[uid] = {hdr: f"Message-ID: <m{uid % 4}@x>\r\n\r\n".encode()}
+        return out
+
+    c.fetch.side_effect = fetch
+    seen: list[tuple[int, int]] = []
+    index = d.message_id_index("INBOX", lambda n, total: seen.append((n, total)))
+    c.select_folder.assert_called_with("INBOX", readonly=True)
+    c.search.assert_called_with("ALL")
+    assert c.fetch.call_count == 2
+    assert index["<folded@example.org>"] == [2]
+    assert 3 not in {u for uids in index.values() for u in uids}
+    assert index["<m1@x>"][:2] == [1, 5]  # ordered by UID
+    assert seen == [(imap_dest.INDEX_CHUNK, len(uids)), (len(uids), len(uids))]
+    assert used_methods(f) <= set(ALLOWED)
+
+
+@pytest.mark.parametrize("item, expected", [
+    ({b"BODY[HEADER.FIELDS (MESSAGE-ID)]": b"Message-ID: <A@B>\r\n"}, "<a@b>"),
+    ({b"BODY[HEADER.FIELDS (MESSAGE-ID)]": b"message-id:<x@y>\r\n"}, "<x@y>"),
+    ({b"BODY[HEADER.FIELDS (MESSAGE-ID)]": b"Subject: no id\r\n"}, None),
+    ({b"SEQ": 1}, None),
+    ({b"BODY[HEADER.FIELDS (MESSAGE-ID)]": b"Message-ID: broken@no-brackets\r\n"}, None),
+])
+def test_header_message_id_parsing(item, expected):
+    from o365_to_mailcow.imap_dest import header_message_id
+
+    assert header_message_id(item) == expected

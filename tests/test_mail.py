@@ -219,9 +219,14 @@ def test_message_id_hit_marks_done_without_append_isc_48(env):
     world.uidvalidity["INBOX"] = 7
     # a true earlier copy of m1 (same MIME) already sits in the destination
     FakeImap(world).append("INBOX", mime("<m1@x>", "one"), [], datetime.now(UTC))
+    indexed: list[str] = []
     searched: list[str] = []
 
     class Recording(FakeImap):
+        def message_id_index(self, folder, on_progress=None):
+            indexed.append(folder)
+            return super().message_id_index(folder, on_progress)
+
         def search_message_id(self, folder, message_id):
             searched.append(message_id)
             return super().search_message_id(folder, message_id)
@@ -231,7 +236,9 @@ def test_message_id_hit_marks_done_without_append_isc_48(env):
     assert inbox_res.dedup_hits == 1 and inbox_res.appended == 1
     assert len(world.folders["INBOX"]) == 2  # pre-existing + m2 only
     assert state.message_status(MAPPING.source, "f-inbox", "m1") == STATUS_DONE
-    assert searched == ["<m1@x>"]  # m2 has no Message-ID: never searched (ISC-98)
+    # one index per non-empty folder, never a SEARCH per message (ISC-189); m2 has no
+    # Message-ID and is never looked up (ISC-98)
+    assert indexed == ["INBOX"] and searched == []
 
 
 def test_message_id_hit_with_different_content_is_appended_not_skipped(env):

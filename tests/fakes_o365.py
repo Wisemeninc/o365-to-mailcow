@@ -196,6 +196,16 @@ class FakeImap:
     def has_message_id(self, folder: str, message_id: str) -> bool:
         return bool(self.search_message_id(folder, message_id))
 
+    def message_id_index(self, folder: str, on_progress=None) -> dict[str, list[int]]:
+        index: dict[str, list[int]] = {}
+        for s in self.world.folders.get(folder, []):
+            if s.message_id:
+                index.setdefault(s.message_id.lower(), []).append(s.uid)
+        if on_progress:
+            on_progress(len(self.world.folders.get(folder, [])),
+                        len(self.world.folders.get(folder, [])))
+        return index
+
     def append(self, folder: str, mime: bytes, flags: list[str],
                internal_date: datetime, message_id: str | None = None) -> int | None:
         import threading

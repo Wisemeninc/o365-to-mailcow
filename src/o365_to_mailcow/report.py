@@ -126,6 +126,9 @@ class NullProgress:
     def advance(self, key: str, n: int = 1) -> None:
         """Record ``n`` processed items."""
 
+    def phase(self, key: str, text: str) -> None:
+        """Describe what ``key`` is doing while ``done`` cannot move (listing, indexing)."""
+
     def finish(self, key: str) -> None:
         """Mark ``key`` complete."""
 
@@ -140,6 +143,7 @@ class Progress(NullProgress):
         self._clock = clock
         self._lock = threading.Lock()
         self._scopes: dict[str, dict[str, float]] = {}
+        self._phases: dict[str, str] = {}
         self._last_print = clock()
 
     def start(self, key: str, total: int) -> None:
@@ -161,19 +165,30 @@ class Progress(NullProgress):
             scope["done"] += n
         self.maybe_print()
 
+    def phase(self, key: str, text: str) -> None:
+        with self._lock:
+            if text:
+                self._phases[key] = text
+            else:
+                self._phases.pop(key, None)
+        self.maybe_print()
+
     def finish(self, key: str) -> None:
         with self._lock:
             scope = self._scopes.get(key)
             if scope is None:
                 return
             scope["finished"] = 1
+            self._phases.pop(key, None)
             line = self._line(key, scope)
         print(f"{line} (finished)", file=self._out, flush=True)
 
     def _line(self, key: str, scope: dict[str, float]) -> str:
         elapsed = max(self._clock() - scope["started"], 1e-9)
         rate = scope["done"] / elapsed * 60.0
-        return f"[{key}] {int(scope['done'])}/{int(scope['total'])} items, {rate:.0f}/min"
+        line = f"[{key}] {int(scope['done'])}/{int(scope['total'])} items, {rate:.0f}/min"
+        phase = self._phases.get(key)
+        return f"{line} ({phase})" if phase else line
 
     def maybe_print(self, force: bool = False) -> bool:
         """Print all active scopes if ``interval`` elapsed (or ``force``)."""

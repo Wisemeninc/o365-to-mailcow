@@ -223,11 +223,13 @@ was skipped, failed or mismatched), **2** configuration or sign-in error.
 Every run writes `state/reports/<UTC timestamp>.json` (per mailbox, per folder, per
 calendar and address book: counts, failures, skips, durations) and a log in
 `state/logs/`. Progress (done/total and items per minute per mailbox) is printed at
-least every 30 seconds. The counter stays at `0/N` while a folder is being listed from
-Graph: each folder is listed completely (999 messages per request) before its messages
-are copied, so a 100 000-message Inbox shows `0/N` for a few minutes first, and a
-re-run after an interrupted run lists that folder again before it skips what was
-already copied.
+least every 30 seconds. The counter stays at `0/N` while a folder is being prepared,
+and the line then says what is happening: `(listing Inbox: 45000)` while the folder is
+listed from Graph (999 messages per request, the whole folder before the first copy),
+`(indexing Inbox: 20000/60000)` while the Message-IDs already in the destination folder
+are read (a re-run into a folder that already holds mail), `(checking Inbox: n/N)` while
+the listing is compared with the state. A 100 000-message Inbox spends a few minutes in
+these phases before the counter moves.
 
 ### Web UI (optional)
 

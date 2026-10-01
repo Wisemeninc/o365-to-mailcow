@@ -646,19 +646,31 @@ class MailMigrator:
                     stored_link = None
             if not stored_link:
                 new_link = self._initial_delta_link(fid)
-                messages = list(self._list_messages(fid))
+                messages = []
+                for msg in self._list_messages(fid):
+                    messages.append(msg)
+                    if len(messages) % 5000 == 0:
+                        self._progress.phase(self._key, f"listing {name}: {len(messages)}")
         except GraphError as exc:
             fr.error = str(exc)
             result.errors.append(f"{fp.source_path}: listing failed: {exc}")
             return
 
         try:
+            index: dict[str, list[int]] = {}
+            if count_at_start > 0 and messages:
+                # one header FETCH per folder, not one SEARCH per message (ISC-189)
+                self._progress.phase(self._key, f"indexing {name}: 0/{count_at_start}")
+                index = dest.message_id_index(name, lambda n, total: self._progress.phase(
+                    self._key, f"indexing {name}: {n}/{total}"))
             todo = self._select_todo(dest, fp, fr, messages, done, forced,
-                                     count_at_start, uidvalidity)
+                                     count_at_start, uidvalidity, index)
         except (ImapError, ImapConnectionError) as exc:
             fr.error = str(exc)
             self._stop(result, fp, exc)
             return
+        finally:
+            self._progress.phase(self._key, "")
         if (stored_link and not fr.delta_reset) or self._cfg.mail_since is not None:
             # a delta pass only touches what changed, and a cutoff lists only newer mail; the
             # plan total (all items) would otherwise make the run look like "0 of N"
@@ -674,11 +686,15 @@ class MailMigrator:
 
     def _select_todo(self, dest: ImapDestination, fp: FolderPlan, fr: FolderResult,
                      messages: list[dict], done: set[str], forced: bool,
-                     count_at_start: int, uidvalidity: int) -> list[dict]:
+                     count_at_start: int, uidvalidity: int,
+                     index: dict[str, list[int]] | None = None) -> list[dict]:
         src, fid, name = self._src, fp.folder_id, fp.dest_name
+        index = index or {}
         todo: list[dict] = []
-        for msg in messages:
+        for n, msg in enumerate(messages, 1):
             fr.listed += 1
+            if n % 5000 == 0:
+                self._progress.phase(self._key, f"checking {name}: {n}/{len(messages)}")
             gid = msg["id"]
             mid = valid_message_id(msg.get("internetMessageId"))
             if gid in done:
@@ -699,7 +715,7 @@ class MailMigrator:
                         todo.append(msg)
                     self._progress.advance(self._key)
                     continue
-                if dest.has_message_id(name, mid):
+                if index.get(mid.lower()):
                     fr.already_done += 1
                     self._progress.advance(self._key)
                     continue
@@ -713,7 +729,7 @@ class MailMigrator:
             # ISC-48/98: only messages with a Message-ID, only if the folder had content
             if mid and gid not in done and count_at_start > 0:
                 try:
-                    verdict = self._dedupe(dest, fp, fr, msg, mid, uidvalidity)
+                    verdict = self._dedupe(dest, fp, fr, msg, mid, uidvalidity, index)
                 except ImapConnectionError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - a dedupe problem never loses mail
@@ -726,13 +742,14 @@ class MailMigrator:
         return todo
 
     def _dedupe(self, dest: ImapDestination, fp: FolderPlan, fr: FolderResult, msg: dict,
-                mid: str, uidvalidity: int) -> str:
-        """Message-ID hit at the destination: count it as already migrated only when a
-        destination copy really is this message (content compared) and the destination
-        holds more copies than source items already recorded for this Message-ID.
-        Anything else is appended. Returns "done", "skipped" or "append"."""
+                mid: str, uidvalidity: int, index: dict[str, list[int]]) -> str:
+        """Message-ID hit at the destination (from the folder's index, built before this
+        run appended anything): count it as already migrated only when a destination copy
+        really is this message (content compared) and the destination holds more copies
+        than source items already recorded for this Message-ID. Anything else is
+        appended. Returns "done", "skipped" or "append"."""
         src, fid, name, gid = self._src, fp.folder_id, fp.dest_name, msg["id"]
-        uids = dest.search_message_id(name, mid)
+        uids = index.get(mid.lower(), [])
         already = self._state.done_count_for_message_id(src, fid, mid)
         if len(uids) <= already:
             return "append"
