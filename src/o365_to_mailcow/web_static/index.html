@@ -667,10 +667,15 @@
     if (state.job) {
       state.job.polling = false;
     }
+    if ($("run-sheet").open) {
+      state.sheet = null; // nothing may start from a sheet the rejection closed
+      $("run-sheet").close();
+    }
     $("token-section").hidden = false;
     $("app").hidden = true;
     showError("The token was rejected. Paste the current token.");
     updateRunButtons();
+    $("token-input").focus();
   };
 
   const api = async (method, path, opts = {}) => {
@@ -855,7 +860,7 @@
     if (data.running_job !== undefined && data.running_job !== null) {
       const id = String(data.running_job.id);
       if (!(state.job && state.job.id === id && state.job.polling)) {
-        attachJob(id, data.running_job.command);
+        attachJob(id, data.running_job.command, true); // known to be running: its end changes the results
       }
     }
 
@@ -1013,7 +1018,7 @@
     ]);
 
     if (state.job && state.job.running && !state.job.polling) {
-      attachJob(state.job.id, state.job.command);
+      attachJob(state.job.id, state.job.command, true);
     }
 
     scheduleStatusPoll();
@@ -1947,10 +1952,11 @@
     if (p) {
       const done = Math.max(0, p.done);
       const total = Math.max(0, p.total);
-      $("job-count").textContent = fmtN(done) + " of " + fmtN(total) + " items " + (dry ? "counted" : "copied");
+      $("job-count").textContent = fmtN(done) + " of " + fmtN(total) + " items " + (dry ? "counted" : "processed");
       // time left counts only scopes still running: a finished one that stopped short has no rate
       const active = arr(p.scopes).filter((s) => isObject(s) && s.finished !== true && isNum(s.done) && isNum(s.total));
-      const left = p.more_scopes > 0 ? total - done : active.reduce((sum, s) => sum + Math.max(0, s.total - s.done), 0);
+      const left = isNum(p.remaining) ? Math.max(0, p.remaining)
+        : active.reduce((sum, s) => sum + Math.max(0, s.total - s.done), 0);
       $("job-rate").textContent = d.running && isNum(p.rate) && p.rate > 0 && left > 0
         ? fmtN(p.rate) + " items per minute · about " + fmtEta(left / p.rate) + " left at this rate" : "";
       const bar = $("job-progress");
@@ -1986,8 +1992,10 @@
       }
     }
     $("job-cards").replaceChildren(...cards);
-    $("job-more").textContent = "and " + fmtN(more) + " more mailboxes";
-    $("job-more").hidden = more === 0;
+    const omitted = p && isNum(p.more_scopes) && p.more_scopes > 0 ? p.more_scopes : 0;
+    $("job-more").textContent = [more > 0 ? "and " + fmtN(more) + " more mailboxes" : "",
+      omitted > 0 ? fmtN(omitted) + " more progress entries are not listed" : ""].filter(Boolean).join("; ");
+    $("job-more").hidden = more === 0 && omitted === 0;
   };
 
   const renderJob = (d) => {
@@ -2036,11 +2044,12 @@
     if (!state.job) {
       return;
     }
-    const sawRunning = state.job.sawRunning;
+    const changed = state.job.sawRunning || state.job.fresh;
+    state.job.fresh = false;
     state.job.running = false;
     state.job.polling = false;
     updateRunButtons();
-    if (sawRunning) {
+    if (changed) {
       loadJobs().catch(reportError);
       reloadResults();
       loadStatus().catch(reportError);
@@ -2084,10 +2093,14 @@
         // the server no longer knows the job (it was restarted): stop at once
         state.job.polling = false;
         state.job.running = false;
-        renderHeaderJob();
-        showError("Job #" + state.job.id + " is no longer known to the server (it was restarted); the run's state is on disk and a new run resumes it.");
-        $("btn-resume").hidden = false;
+        $("job-title").textContent = cmdName(state.job.command) + ": no longer tracked";
+        $("job-state").textContent = "The server restarted and no longer knows this job. Its state is on disk; a new run resumes it.";
+        $("job-rate").textContent = "";
+        $("btn-job-close").hidden = false; // watching again would only meet the same 404
         updateRunButtons();
+        loadJobs().catch(reportError);
+        reloadResults();
+        loadStatus().catch(reportError);
         return;
       }
       state.job.failures += 1;
@@ -2104,7 +2117,7 @@
     }
   };
 
-  const attachJob = (id, command = "") => {
+  const attachJob = (id, command = "", fresh = false) => {
     const gen = ++state.jobGen;
     state.job = {
       id,
@@ -2112,6 +2125,7 @@
       running: true,
       polling: true,
       sawRunning: false,
+      fresh, // started from this page just now: its end changes the results
       failures: 0,
       localStart: Date.now(),
     };
@@ -2132,6 +2146,10 @@
   };
 
   const startJob = async (command, dryRun, opts) => {
+    if (state.authFailed || !isConfigured()) {
+      setMsg($("run-msg"), "Enter the connection settings first.", "error");
+      return;
+    }
     if (state.dirty) {
       setMsg($("run-msg"), "Save the selection first.", "error");
       return;
@@ -2175,7 +2193,7 @@
         "ok",
       );
       state.starting = false;
-      attachJob(id, command);
+      attachJob(id, command, true);
       loadJobs().catch(reportError);
     } catch (err) {
       if (err && err.status === 409) {
@@ -2242,8 +2260,8 @@
 
     const items = list.slice(0, 10).map((j) => {
       const id = String(j.id);
-      const running = (j.finished === null || j.finished === undefined) &&
-        (j.exit_code === null || j.exit_code === undefined);
+      // like the server's Job.running: the exit code is recorded shortly before `finished`
+      const running = j.finished === null || j.finished === undefined;
       const outcome = isObject(j.outcome) && isStr(j.outcome.text) ? j.outcome : null;
       const phrase = running ? el("span", { className: "lv-warn", text: "running" })
         : outcome ? levelText("span", outcome.level, outcome.text)
@@ -2262,6 +2280,7 @@
       });
       view.addEventListener("click", () => {
         attachJob(id, j.command);
+        $("job-title").focus();
       });
       return el("li", {}, [
         el("div", {}, [el("span", {}, [el("span", { className: "strong", text: cmdName(j.command) }), " · ", phrase]),
@@ -2281,7 +2300,8 @@
 
   $("btn-resume").addEventListener("click", () => {
     if (state.job) {
-      attachJob(state.job.id, state.job.command);
+      attachJob(state.job.id, state.job.command, state.job.fresh || state.job.sawRunning);
+      $("job-title").focus();
     }
   });
 
@@ -2536,11 +2556,8 @@
 
   const loadOverview = async () => {
     const route = "/api/overview";
-    const data = await api("GET", route, { allow404: true });
-    if (data === null) {
-      // an older server without the overview: show the "No runs yet" state
-      state.overview = { steps: {}, latest: null };
-    } else {
+    try {
+      const data = await api("GET", route);
       if (!isObject(data) || !isObject(data.steps)) {
         throw badResponse(route);
       }
@@ -2564,6 +2581,14 @@
         }
       }
       state.overview = { steps, latest };
+      state.overviewError = "";
+    } catch (err) {
+      if (err && err.unauthorized) {
+        throw err;
+      }
+      // results that could not be loaded must not read as "No runs yet"
+      state.overview = null;
+      state.overviewError = err instanceof Error ? err.message : String(err);
     }
     renderMailboxes();
     if (state.detail) {
@@ -2607,7 +2632,7 @@
     ];
     for (const cmd of STEP_CMDS) {
       const s = ov ? ov.steps[cmd] : null;
-      const item = { name: cmdName(cmd), cls: "todo", text: "Not run yet" };
+      const item = { name: cmdName(cmd), cls: "todo", text: state.overviewError ? "Could not be loaded" : "Not run yet" };
       if (s) {
         const l = lvl(s.level);
         item.cls = l === "ok" ? "done" : l === "warn" ? "attn" : l === "bad" ? "attn bad" : "todo";
@@ -2651,7 +2676,9 @@
       if (dry) {
         return [sheet("Migrate…", "migrate")];
       }
-      return level === "ok" ? [sheet("Verify…", "verify")] : level === "bad" ? [sheet("Migrate again…", "migrate")] : [];
+      // warnings (too large, a dropped photo) do not block the next step: verify counts them
+      return level === "ok" || level === "warn" ? [sheet("Verify…", "verify")]
+        : level === "bad" ? [sheet("Migrate again…", "migrate")] : [];
     }
     if (cmd === "verify") {
       if (level === "warn") {
@@ -2681,7 +2708,10 @@
     let meta = "";
     let actions = [];
     if (!latest) {
-      if (!isConfigured()) {
+      if (state.overviewError) {
+        head = "The results could not be loaded";
+        detail = state.overviewError;
+      } else if (!isConfigured()) {
         detail = "Enter the connection settings to begin.";
         actions = [{ label: "Edit connections", run: () => setConnOpen(true, true) }];
       } else if (state.savedRows.length === 0) {
@@ -2983,7 +3013,8 @@
 
   const sheetRows = () => {
     const pick = $("opt-mailbox").value;
-    return pick ? state.savedRows.filter((r) => r.source === pick) : state.savedRows;
+    // the CLI's --mailbox matches a source or a destination address: list every mapping it selects
+    return pick ? state.savedRows.filter((r) => r.source === pick || r.destination === pick) : state.savedRows;
   };
 
   const renderSheet = () => {
@@ -3017,7 +3048,9 @@
     if (!Object.prototype.hasOwnProperty.call(SHEET, command)) {
       return;
     }
-    const msg = state.dirty ? "Save the selection first."
+    const msg = state.authFailed ? "Paste the current token first."
+      : !isConfigured() ? "Enter the connection settings first."
+      : state.dirty ? "Save the selection first."
       : isJobRunning() ? "A job is already running."
         : command !== "cleanup" && state.savedRows.length === 0
           ? "The saved selection is empty: load the tenant list, tick mailboxes and save." : "";

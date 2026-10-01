@@ -1273,6 +1273,7 @@ def test_progress_parses_exactly_what_report_progress_prints():
     ]
     assert out.progress() == {
         "done": 362, "total": 150_426, "rate": 350,  # the finished scope adds no rate
+        "remaining": 150_064,  # unfinished scopes only: 150374 - 310, plus 0 for the calendar
         "scopes": [
             {"mailbox": ANNA, "kind": "mail", "done": 310, "total": 150_374, "rate": 310,
              "phase": "indexing Inbox: 800/3000 (pass 2)", "finished": False},
@@ -1296,7 +1297,7 @@ def test_progress_ignores_lines_that_do_not_match():
         "[",
         "[anna@example.com mail] 99999999999999999999/1 items, 0/min",
         "[anna@example.com mail] \u0663/10 items, 0/min",
-        "[anna@example.com mail] 5/10 items, 3/min (" + "x" * 5000 + ")",
+        "[anna@example.com mail] 5/10 items, 3/min (" + "x" * 20_000 + ")",  # beyond bound
     ]
     for line in lines:
         out.write(line + "\n")
@@ -1345,7 +1346,7 @@ def _fake_report_main(state_dir: Path, imap: int, *, progress: bool = False, cod
         rep.set(ANNA, "mail", MailVerify(ANNA, [FolderVerify("INBOX", 10, 10, 0, 0, imap, 10,
                                                              imap != 10)]))
         rep.set(ANNA, "status", "ok")
-        rep.write(code)
+        print(f"report: {rep.write(code)}", file=stderr)  # as cli.main does in its finally
         return code
     return fake_main
 
@@ -1438,7 +1439,8 @@ def test_a_newer_clean_partial_verify_does_not_hide_a_failing_full_one(client):
     data = client.get("/api/overview").json()
     assert data["steps"]["verify"]["level"] == "warn"
     assert data["steps"]["verify"]["text"] == "3 items missing"
-    assert data["latest"]["partial"] is True and data["latest"]["scope"] == "mail only · 1 mailbox"
+    assert data["latest"]["partial"] is True
+    assert data["latest"]["scope"] == "mail only · one mailbox address"
     assert data["latest"]["headline"]["text"] == "Everything that was checked has arrived"
 
 
@@ -1601,3 +1603,217 @@ def test_secrets_in_reports_never_leave_through_overview_or_outcome(client, monk
     job = wait_job(client, client.post("/api/jobs", {"command": "verify",
                                                      "selection_digest": digest}).json()["id"])
     assert job["outcome"] == {"level": "bad", "text": "oops ***"}
+
+
+# -- cross-vendor review: outcome ownership, progress robustness, redaction order ------------
+
+def _run_job(client, monkeypatch, main) -> dict:
+    monkeypatch.setattr(cli, "main", main)
+    digest = _saved(client)
+    return wait_job(client, client.post("/api/jobs", {"command": "verify",
+                                                      "selection_digest": digest}).json()["id"])
+
+
+def test_outcome_comes_from_the_named_report_not_the_newest(client, monkeypatch):
+    def main(argv=None, *, stdout=None, stderr=None):
+        own = RunReport("verify", client.state_dir)
+        own.mailbox(ANNA, "anna@example.net")
+        own.set(ANNA, "mail", MailVerify(ANNA, [FolderVerify("INBOX", 10, 10, 0, 0, 7, 10,
+                                                             True)]))
+        own.set(ANNA, "status", "ok")
+        path = own.write(1)
+        # an external CLI run of the same command writes a newer report meanwhile
+        _write_report(client.state_dir, "99999999T999999Z.json", _verify_report(10, 0),
+                      time.time() + 60)
+        print(f"report: {path}", file=stderr)
+        return 1
+
+    job = _run_job(client, monkeypatch, main)
+    assert job["outcome"] == {"level": "warn", "text": "3 items have not arrived in mailcow"}
+
+
+def test_no_report_line_means_no_outcome(client, monkeypatch):
+    def main(argv=None, *, stdout=None, stderr=None):
+        _write_report(client.state_dir, "fresh.json", _verify_report(10, 0), time.time())
+        return 0  # same command, just written, but not named by this job
+
+    assert _run_job(client, monkeypatch, main)["outcome"] is None
+
+
+@pytest.mark.parametrize("line", ["report: /etc/passwd", "report: ../x.json",
+                                  "report: x.json", "report: {reports}/../x.json",
+                                  "report: {reports}/bad name.json", "report: {reports}/"])
+def test_report_lines_outside_the_reports_directory_are_ignored(client, monkeypatch, line):
+    reports = client.state_dir / "reports"
+    _write_report(client.state_dir, "x.json", _verify_report(10, 0), time.time())
+    (client.state_dir / "x.json").write_text(json.dumps(_verify_report(10, 0)))
+
+    def main(argv=None, *, stdout=None, stderr=None):
+        print(line.format(reports=reports), file=stderr)
+        return 0
+
+    assert _run_job(client, monkeypatch, main)["outcome"] is None
+
+
+def test_the_last_report_line_wins(client, monkeypatch):
+    first = _write_report(client.state_dir, "a.json", _verify_report(10, 0), 1_000)
+    second = _write_report(client.state_dir, "b.json", _verify_report(7, 1), 900)
+
+    def main(argv=None, *, stdout=None, stderr=None):
+        print(f"report: {first}", file=stderr)
+        print(f"report: {second}", file=stderr)
+        return 1
+
+    job = _run_job(client, monkeypatch, main)
+    assert job["outcome"] == {"level": "warn", "text": "3 items have not arrived in mailcow"}
+
+
+def test_a_report_of_another_command_named_by_the_job_is_refused(client, monkeypatch):
+    path = _write_report(client.state_dir, "m.json", _migrate_report(1, False), time.time())
+
+    def main(argv=None, *, stdout=None, stderr=None):
+        print(f"report: {path}", file=stderr)
+        return 0
+
+    assert _run_job(client, monkeypatch, main)["outcome"] is None
+
+
+def test_report_line_tracking_can_never_break_a_write(monkeypatch):
+    def boom(self, line):
+        raise RuntimeError("tracker bug")
+
+    monkeypatch.setattr(web.JobOutput, "_track", boom)
+    out = web.JobOutput(lambda t: t)
+    assert out.write("report: /state/reports/x.json\n") > 0
+    assert out.tail(1) == ["report: /state/reports/x.json"] and out.report_path() is None
+
+
+def test_a_progress_line_longer_than_the_display_limit_still_counts():
+    clock = {"t": 0.0}
+    out, p = _progress_lines(clock)
+    deep = "/".join(f"Folder {i:03d}" for i in range(500))  # ~5,500 characters
+    p.start(f"{ANNA} mail", 100)
+    clock["t"] = 60.0
+    p.advance(f"{ANNA} mail", 30)
+    p.phase(f"{ANNA} mail", f"indexing {deep}: 1/2")
+    p.maybe_print(force=True)
+    assert out.tail(1)[0].endswith(" [line truncated]")  # display is still capped
+    scope = out.progress()["scopes"][0]
+    assert scope["done"] == 30 and scope["total"] == 100 and scope["rate"] == 30
+    assert scope["phase"] == f"indexing {deep}"[:300]
+
+
+def test_long_mailbox_keys_differing_after_300_characters_stay_separate():
+    out = web.JobOutput(lambda t: t)
+    base = "a" * 305
+    out.write(f"[{base}1@example.com mail] 1/2 items, 1/min\n")
+    out.write(f"[{base}2@example.com mail] 2/2 items, 1/min\n")
+    progress = out.progress()
+    assert len(progress["scopes"]) == 2 and progress["done"] == 3
+    assert all(len(scope["mailbox"]) == 300 for scope in progress["scopes"])
+
+
+def test_finished_is_sticky_against_a_stale_line():
+    out = web.JobOutput(lambda t: t)
+    out.write(f"[{ANNA} mail] 10/10 items, 5/min (finished)\n")
+    out.write(f"[{ANNA} mail] 9/10 items, 5/min\n")  # built before finish, printed after
+    scope = out.progress()["scopes"][0]
+    assert scope["finished"] is True and scope["done"] == 10
+    assert out.progress()["rate"] == 0
+
+
+LONG_SECRET = "A" * 300 + "B"
+
+
+def _longest_run(text: str, char: str) -> int:
+    return max((len(m) for m in re.findall(f"{char}+", text)), default=0)
+
+
+def test_exit_code_is_recorded_before_the_report_is_read(client, monkeypatch):
+    """Summarising a huge report may take long: the job's exit code must already be there."""
+    seen: list[int | None] = []
+
+    def fake_main(argv=None, *, stdout=None, stderr=None):
+        return 7
+
+    def slow_outcome(self, job):
+        seen.append(job.exit_code)
+        return None
+
+    monkeypatch.setattr(cli, "main", fake_main)
+    monkeypatch.setattr(web.WebApp, "_job_outcome", slow_outcome)
+    job_id = client.post("/api/jobs", {"command": "cleanup"}).json()["id"]
+    assert wait_job(client, job_id)["exit_code"] == 7
+    assert seen == [7]
+
+
+def test_a_secret_longer_than_the_display_cut_is_redacted_whole(tmp_path, conf, graph,
+                                                               monkeypatch):
+    page = tmp_path / "index.html"
+    page.write_text(PAGE, encoding="utf-8")
+    cfg = make_config(tmp_path, client_secret=LONG_SECRET, mailcow_api_key=API_KEY,
+                      mailboxes=())
+    app = web.WebApp(cfg, TOKEN, PAGE)
+    report = _verify_report(7, 1)
+    report["mailboxes"][ANNA]["errors"] = [f"entry {LONG_SECRET}"]
+    report["mailboxes"][ANNA]["mail"]["errors"] = [f"{LONG_SECRET} in a section"]
+    _write_report(cfg.state_dir, "1.json", report, 1_000)
+    body = json.dumps(app.overview())
+    assert "entry ***" in body and _longest_run(body, "A") < 20
+
+    # a mailbox key is report data too: it is cut to the display length by the summary, so it
+    # has to be redacted before that (the response's own field names are left alone)
+    keyed = _verify_report(10, 0)
+    keyed["mailboxes"] = {f"{LONG_SECRET}@example.com": keyed["mailboxes"][ANNA]}
+    _write_report(cfg.state_dir, "2.json", keyed, 2_000)
+    overview = app.overview()
+    assert _longest_run(json.dumps(overview), "A") < 20
+    assert {"steps", "latest"} == set(overview) and "headline" in overview["latest"]
+
+
+    class FakeOutput:
+        def report_path(self):
+            return str(cfg.state_dir / "reports" / "1.json")
+
+    seen: list[str] = []
+    original = web.summarize_report
+
+    def spying(data):
+        seen.append(json.dumps(data))
+        return original(data)
+
+    monkeypatch.setattr(web, "summarize_report", spying)
+    job = web.Job("j", 1, "verify", [], FakeOutput())  # type: ignore[arg-type]
+    outcome = app._job_outcome(job)
+    assert outcome == {"level": "warn", "text": "3 items have not arrived in mailcow"}
+    assert seen and _longest_run(seen[0], "A") < 20  # redacted before it was summarised
+
+
+def test_redacting_mailbox_keys_keeps_entries_apart_and_field_names_intact(tmp_path):
+    """Only the keys of ``mailboxes`` are data. Two addresses that redact to the same text
+    stay two entries (a failure must not be overwritten by a success), and a secret that
+    happens to equal a field name does not rewrite the report's or the response's keys."""
+    cfg = make_config(tmp_path, client_secret="status", mailcow_api_key=API_KEY, mailboxes=())
+    app = web.WebApp(cfg, TOKEN, PAGE)
+    for value in ("secret-one", "secret-two", "headline", "errors", "mailboxes"):
+        app._secrets.add(value)  # the last three equal field names of reports or responses
+    data = {"command": "provision", "dry_run": False, "exit_code": 1, "scope": FULL,
+            "started": "2026-10-01T01:00:00+00:00", "finished": "2026-10-01T01:00:01+00:00",
+            "duration_s": 1.0, "mailboxes": {
+                "secret-one@example.com": {"errors": ["mailbox: refused"]},
+                "secret-two@example.com": {"errors": [], "provision": "created"}}}
+    redacted = app._redact_report(data)
+    assert set(redacted) == set(data)  # field names survive a secret that equals one
+    assert len(redacted["mailboxes"]) == 2  # "***@example.com" twice: still two entries
+    assert sorted(map(sorted, redacted["mailboxes"].values())) == [
+        ["errors"], ["errors", "provision"]]
+    _write_report(cfg.state_dir, "1.json", data, 1_000)
+    overview = app.overview()
+    latest = overview["latest"]
+    assert latest["headline"]["level"] == "bad" and len(latest["mailboxes"]) == 2
+    assert "secret-one" not in json.dumps(overview) and "secret-two" not in json.dumps(overview)
+    assert {"steps", "latest"} == set(overview) and "headline" in latest
+
+    ok = _verify_report(10, 0)  # entries carry a "status" field: it must still be read
+    _write_report(cfg.state_dir, "2.json", ok, 2_000)
+    assert app.overview()["latest"]["headline"]["text"] == "Everything arrived"

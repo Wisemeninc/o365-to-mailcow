@@ -248,34 +248,97 @@ def test_verify_headline_counts_every_mailbox_not_only_the_shown_ones():
 # -- migrate ---------------------------------------------------------------------------------
 
 def migrate_entry(status: str = "ok", stopped: bool = False, failed: int = 0,
-                  error: str | None = None, dry_run: bool = False, errors=None) -> dict:
+                  error: str | None = None, dry_run: bool = False, errors=None,
+                  too_large: int = 0, warnings=(), fallbacks=()) -> dict:
     mail = MailResult(ANNA, dry_run, [
         FolderResult("f1", "INBOX", listed=1300, appended=0 if dry_run else 1200,
-                     already_done=30, dedup_hits=4, failed=failed, skipped_too_large=2,
+                     already_done=30, dedup_hits=4, failed=failed, skipped_too_large=too_large,
                      would_append=1200 if dry_run else 0, error=error)],
         skipped_folders=["Sync Issues"], stopped=stopped)
     cal = CollectionsResult(ANNA, "calendar", dry_run, [
         CollectionResult("c1", "Calendar", "personal", listed=40, put=0 if dry_run else 34,
-                         unchanged=6, would_put=34 if dry_run else 0)])
-    return entry(status=status, errors=errors, mail=mail, calendar=cal)
+                         unchanged=6, would_put=34 if dry_run else 0)],
+        warnings=list(warnings))
+    contacts = CollectionsResult(ANNA, "contacts", dry_run, [
+        CollectionResult("k1", "Contacts", "personal", listed=1, put=0 if dry_run else 1,
+                         would_put=1 if dry_run else 0)], fallbacks=list(fallbacks))
+    return entry(status=status, errors=errors, mail=mail, calendar=cal, contacts=contacts)
 
 
 def test_migrate_real_run_ok():
     s, step = summarize_with_step(report("migrate", {ANNA: migrate_entry()}))
-    assert s["headline"] == {"level": "ok", "text": "Migrate finished: 1,234 items copied",
-                             "detail": "40 were already there. 2 too large were skipped."}
-    assert step["text"] == "1,234 items copied" and step["level"] == "ok"
+    assert s["headline"] == {"level": "ok", "text": "Migrate finished: 1,235 items copied",
+                             "detail": "40 were already there."}
+    assert step["text"] == "1,235 items copied" and step["level"] == "ok"
     row = only(s)
     assert row["result"] == {"level": "ok", "text": "Copied"}
-    assert row["cells"]["mail"] == {"primary": "1,200 copied",
-                                    "secondary": "34 already there · 2 too large",
+    assert row["cells"]["mail"] == {"primary": "1,200 copied", "secondary": "34 already there",
                                     "level": "ok"}
     assert row["cells"]["calendar"]["secondary"] == "6 already there"
     assert row["detail"]["cards"][0]["rows"] == [["Copied", "1,200"], ["Already there", "34"],
-                                                 ["Failed", "0"], ["Too large", "2"]]
+                                                 ["Failed", "0"], ["Too large", "0"]]
     assert row["detail"]["skipped"] == [{"kind": "Mail", "name": "Sync Issues", "reason": "",
                                          "items": "", "level": "ok"}]
     assert row["detail"]["problems"] == []
+
+
+def test_migrate_singular_counts():
+    mail = MailResult(ANNA, False, [FolderResult("f1", "INBOX", listed=2, appended=1,
+                                                 already_done=1)])
+    s, step = summarize_with_step(report("migrate", {ANNA: entry(mail=mail)}))
+    assert s["headline"] == {"level": "ok", "text": "Migrate finished: 1 item copied",
+                             "detail": "1 was already there."}
+    assert step["text"] == "1 item copied"
+    dry = MailResult(ANNA, True, [FolderResult("f1", "INBOX", listed=1, would_append=1)])
+    s = summarize_report(report("migrate", {ANNA: entry(mail=dry)}, dry_run=True))
+    assert s["headline"]["text"] == "Dry run: 1 item would be copied"
+
+
+def test_migrate_too_large_is_a_warning_not_green():
+    s, step = summarize_with_step(report("migrate", {ANNA: migrate_entry(too_large=2)}))
+    row = only(s)
+    assert row["cells"]["mail"] == {"primary": "1,200 copied",
+                                    "secondary": "34 already there · 2 too large",
+                                    "level": "warn"}
+    assert row["result"] == {"level": "warn", "text": "2 too large"}
+    assert s["headline"] == {"level": "warn",
+                             "text": "Migrate finished with warnings: 1,235 items copied",
+                             "detail": "40 were already there. 2 too large to copy."}
+    assert step == {**step, "level": "warn", "text": "1,235 copied · 2 to check"}
+
+
+def test_migrate_calendar_warnings_are_warnings():
+    s, step = summarize_with_step(report("migrate", {ANNA: migrate_entry(
+        warnings=["Weekly: 1 recurrence exception omitted"])}))
+    row = only(s)
+    assert row["cells"]["calendar"] == {"primary": "34 copied",
+                                        "secondary": "6 already there · 1 warning",
+                                        "level": "warn"}
+    assert row["detail"]["problems"] == ["calendar: Weekly: 1 recurrence exception omitted"]
+    assert row["result"] == {"level": "warn", "text": "1 warning"}
+    assert s["headline"]["text"] == "Migrate finished with warnings: 1,235 items copied"
+    assert s["headline"]["detail"] == ("40 were already there. 1 warning; see the mailbox "
+                                       "details.")
+    assert step["text"] == "1,235 copied · 1 to check"
+
+
+def test_migrate_contacts_fallbacks_are_warnings():
+    row = only(summarize_report(report("migrate", {ANNA: migrate_entry(
+        too_large=1, fallbacks=["Friends -> personal (address book refused)",
+                                "Work -> personal"])})))
+    assert row["cells"]["contacts"]["level"] == "warn"
+    assert row["cells"]["contacts"]["secondary"] == "2 warnings"
+    assert row["detail"]["problems"] == ["contacts: Friends -> personal (address book refused)",
+                                         "contacts: Work -> personal"]
+    assert row["result"] == {"level": "warn", "text": "1 too large · 2 warnings"}
+
+
+def test_migrate_dry_run_with_too_large_items_warns():
+    s = summarize_report(report("migrate", {ANNA: migrate_entry(dry_run=True, too_large=2)},
+                                dry_run=True))
+    assert s["headline"] == {"level": "warn", "detail": "",
+                             "text": "Dry run: 1,235 items would be copied, 2 too large to "
+                                     "copy"}
 
 
 def test_migrate_failures_are_bad():
@@ -287,9 +350,22 @@ def test_migrate_failures_are_bad():
     assert row["detail"]["differences"] == [
         {"kind": "Mail", "name": "INBOX", "source": "", "destination": "",
          "delta": "4 failed", "why": "IMAP APPEND refused"}]
-    assert s["headline"]["text"] == "Migrate finished with 4 failures"
-    assert s["headline"]["detail"] == "1,234 items copied, 40 already there."
-    assert step["text"] == "4 failures"
+    assert s["headline"]["text"] == "Migrate finished with failures in 1 mailbox"
+    assert s["headline"]["detail"] == "1,235 items copied, 40 already there, 4 failed."
+    assert step["text"] == "Failures in 1 mailbox"
+
+
+def test_migrate_mixed_failures_count_every_bad_mailbox():
+    """One mailbox with item failures, another bad for a different reason (entry error)."""
+    boxes = {ANNA: migrate_entry(status="failed", failed=2),
+             BEN: migrate_entry(status="failed",
+                                errors=["app password id=7 not deleted: HTTP 500"])}
+    s, step = summarize_with_step(report("migrate", boxes, exit_code=1))
+    assert [m["result"]["text"] for m in s["mailboxes"]] == ["2 failed", "Failed"]
+    assert s["headline"] == {"level": "bad",
+                             "text": "Migrate finished with failures in 2 mailboxes",
+                             "detail": "2,470 items copied, 80 already there, 2 failed."}
+    assert step["text"] == "Failures in 2 mailboxes"
 
 
 def test_migrate_errors_without_counts_and_stopped_and_pending():
@@ -306,12 +382,11 @@ def test_migrate_errors_without_counts_and_stopped_and_pending():
 def test_migrate_dry_run():
     s = summarize_report(report("migrate", {ANNA: migrate_entry(dry_run=True)}, dry_run=True))
     assert s["dry_run"] is True
-    assert s["headline"]["text"] == "Dry run: 1,234 items would be copied"
+    assert s["headline"]["text"] == "Dry run: 1,235 items would be copied"
     row = only(s)
     assert row["result"] == {"level": "ok", "text": "Dry run"}
     assert row["cells"]["mail"] == {"primary": "1,200 to copy",
-                                    "secondary": "34 already there · 2 too large",
-                                    "level": "ok"}
+                                    "secondary": "34 already there", "level": "ok"}
     assert row["detail"]["cards"][0]["rows"][0] == ["To copy", "1,200"]
 
 
@@ -515,11 +590,9 @@ def test_sample_mismatch_makes_the_mail_cell_warn():
 
 @pytest.mark.parametrize("scope, text", [
     ({"only": "mail", "mailbox": None, "mail_since": None}, "mail only"),
-    ({"only": None, "mailbox": ANNA, "mail_since": None}, "1 mailbox"),
+    ({"only": None, "mailbox": ANNA, "mail_since": None}, "one mailbox address"),
     ({"only": "mail", "mailbox": ANNA, "mail_since": "2025-01-01"},
-     "mail only · 1 mailbox · mail since 2025-01-01"),
-    ({"only": None, "mailbox": None, "mail_since": None, "future": 1}, "a narrowed run"),
-    ([1], "the scope could not be read"),
+     "mail only · one mailbox address · mail since 2025-01-01"),
 ])
 def test_a_clean_partial_verify_says_what_it_checked(scope, text):
     summary, step = summarize_with_step(report("verify", {ANNA: entry(
@@ -551,8 +624,8 @@ def test_other_commands_partial_ok_gets_a_detail_suffix():
     summary, step = summarize_with_step(report(
         "migrate", {ANNA: migrate_entry()},
         scope={"only": None, "mailbox": ANNA, "mail_since": None}))
-    assert summary["headline"]["text"] == "Migrate finished: 1,234 items copied"
-    assert summary["headline"]["detail"].endswith(" Partial run: 1 mailbox.")
+    assert summary["headline"]["text"] == "Migrate finished: 1,235 items copied"
+    assert summary["headline"]["detail"].endswith(" Partial run: one mailbox address.")
     assert step["level"] == "unknown" and step["text"] == "Partial run"
 
 
@@ -614,6 +687,16 @@ def test_provision_alias_failures_are_warnings_not_failures():
         "level": "bad", "text": "Failed"}
 
 
+def test_alias_only_needs_every_error_to_have_been_read():
+    """Beyond the first 1,000 errors the kind of an error is unknown: a mailbox whose list
+    is longer is never downgraded to an alias warning."""
+    errors = ["alias a@example.net: refused"] * 1000 + ["provisioning failed: quota"]
+    s = summarize_report(report("provision", {ANNA: {"errors": errors, "provision": "created"}},
+                                exit_code=1))
+    assert only(s)["result"] == {"level": "bad", "text": "Failed"}
+    assert s["headline"]["level"] == "bad"
+
+
 def test_unreadable_alias_count_is_not_an_alias_error():
     boxes = {ANNA: {"errors": [], "provision": "created"},
              "aliases": {"errors": [], "created": "3"}}
@@ -648,3 +731,85 @@ def test_unreadable_summary_shape():
     assert s["headline"] == {"level": "unknown", "text": "The newest report could not be read",
                              "detail": ""}
     assert s["command"] == "" and s["mailboxes"] == [] and s["partial"] is False
+
+
+@pytest.mark.parametrize("scope", [
+    [1], "garbage", {"only": None, "mailbox": None, "mail_since": None, "future": 1},
+    {"only": "email", "mailbox": None, "mail_since": None},
+    {"only": None, "mailbox": 7, "mail_since": None},
+    # falsy values the CLI never writes are not "no narrowing"
+    {"only": [], "mailbox": None, "mail_since": None},
+    {"only": None, "mailbox": 0, "mail_since": None},
+    {"only": None, "mailbox": None, "mail_since": False},
+    {"only": "", "mailbox": None, "mail_since": None},
+])
+def test_an_unreadable_scope_is_never_green(scope):
+    summary, step = summarize_with_step(report("verify", {ANNA: entry(
+        mail=mail_verify(folder()))}, scope=scope))
+    assert summary["partial"] is True and summary["scope"] == "the scope could not be read"
+    assert summary["headline"]["level"] == "unknown"
+    assert summary["headline"]["text"] == ("Verify finished, but what it covered could not "
+                                           "be read")
+    assert step["level"] == "unknown" and step["text"] == "Scope unknown"
+    failing = summarize_report(report("verify", {ANNA: entry(mail=mail_verify(
+        folder("INBOX", 10, 7, expected=10)))}, exit_code=1, scope=scope))
+    assert failing["headline"]["level"] == "warn"  # its problems are real
+
+
+@pytest.mark.parametrize("command, text", [
+    ("verify", "Verify could not start"), ("migrate", "Migrate could not start"),
+    ("plan", "Plan could not start"), ("provision", "Provision could not start"),
+    ("cleanup", "Clean up could not start"),
+])
+def test_exit_code_2_without_mailboxes_could_not_start(command, text):
+    """What cli.main writes when sign-in fails before any mailbox ran (or verify
+    --dry-run): an empty mailboxes dict and exit code 2."""
+    data = {"command": command, "dry_run": command == "verify", "exit_code": 2,
+            "started": "2026-10-01T01:00:00+00:00", "finished": "2026-10-01T01:00:01+00:00",
+            "duration_s": 0.4, "mailboxes": {}, "scope": FULL}
+    summary, step = summarize_with_step(data)
+    assert summary["headline"] == {"level": "bad", "text": text,
+                                   "detail": "The job log has the reason."}
+    assert step["level"] == "bad" and step["text"] == "Could not start"
+
+
+@pytest.mark.parametrize("code", [10**5000, -(10**5000), 256, -256],
+                         ids=["huge", "-huge", "256", "-256"])
+def test_absurd_exit_codes_never_raise(code):
+    summary, step = summarize_with_step({"command": "verify", "exit_code": code,
+                                         "mailboxes": {}})
+    assert summary["exit_code"] is None and step["exit_code"] is None
+    summary, _ = summarize_with_step({"command": f"x{code % 7}", "exit_code": code})
+    assert summary["headline"]["level"] == "unknown"
+
+
+def test_singular_sample_and_verify_detail():
+    mail = mail_verify(folder("INBOX", 1, 1), sample_requested=1, sample_checked=1)
+    s = summarize_report(report("verify", {ANNA: entry(mail=mail)}))
+    assert only(s)["detail"]["sample"]["text"] == "1 of 1 sampled message matches"
+    assert s["headline"]["detail"] == "1 of 1 item is in mailcow."
+    plan = summarize_report(report("plan", {ANNA: entry(mail_plan=MailPlan(
+        ANNA, "/", [], total_messages=1))}, dry_run=True))
+    assert plan["headline"]["text"] == "Plan: 1 item in 1 mailbox"
+
+
+def test_construction_is_bounded_for_huge_error_lists(monkeypatch):
+    import o365_to_mailcow.summary as summary_mod
+
+    calls = {"n": 0}
+    original = summary_mod._text
+
+    def counting(value):
+        calls["n"] += 1
+        return original(value)
+
+    monkeypatch.setattr(summary_mod, "_text", counting)
+    errors = [f"e{i}" for i in range(200_000)]
+    mail = {**_plain(mail_verify(folder())), "errors": errors}
+    s = summarize_report(report("verify", {ANNA: {**entry(), "errors": errors,
+                                                  "mail": mail}}, exit_code=1))
+    detail = only(s)["detail"]
+    assert len(detail["errors"]) == summary_mod.MAX_DETAIL
+    assert detail["errors"][0] == "e0" and len(detail["problems"]) == summary_mod.MAX_DETAIL
+    assert only(s)["cells"]["mail"]["secondary"] == "200,000 errors"
+    assert calls["n"] < 10_000  # at most MAX_TEXTS per list, never one per error string

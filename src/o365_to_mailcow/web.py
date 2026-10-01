@@ -2,7 +2,8 @@
 
 A standard-library HTTP server with one embedded page and a small JSON API: list the
 tenant's mailboxes, check which exist in mailcow, save the mailbox list, start commands,
-watch their output (with live per-mailbox progress) and read the reports, raw or summarised
+watch their output (with live per-mailbox progress and, once done, the headline of the
+report the job itself named in its ``report: <path>`` line) and read the reports, raw or summarised
 for the page (``/api/overview``: the newest run of each step plus the latest report, judged by
 ``summary.py``). It is meant for the operator's own machine.
 
@@ -98,7 +99,7 @@ TAIL_LINES = 200
 MAX_JOBS_KEPT = 20
 MAX_REPORTS_SCANNED = 200  # report files considered per overview / job-outcome lookup
 MAX_REPORT_BYTES = 64 * 1024 * 1024  # a bigger report file is unreadable, never read
-MTIME_TOLERANCE_SECONDS = 1.0  # file times can lag the clock (coarse kernel clock, FAT/SMB)
+MAX_PROGRESS_LINE = 20_000  # longer lines are never parsed (the phase bound is below)
 MAX_SCOPES = 6_000  # progress scopes tracked per job; new ones beyond this are ignored
 MAX_SCOPES_SHOWN = 600
 STEP_COMMANDS = ("provision", "migrate", "verify", "cleanup")
@@ -137,7 +138,10 @@ _JOB_PATH = re.compile(r"/api/jobs/([A-Za-z0-9_-]{1,64})(/output)?")
 _PROGRESS_LINE = re.compile(
     r"\[(?P<mailbox>[^\s\[\]]{1,320}) (?P<kind>mail|calendar|contacts)\] "
     r"(?P<done>[0-9]{1,15})/(?P<total>[0-9]{1,15}) items, (?P<rate>[0-9]{1,15})/min"
-    r"(?: \((?P<phase>.{1,4000})\))?")
+    r"(?: \((?P<phase>.{1,16000})\))?")
+# What cli.main prints to stderr in its `finally`: the job's own report, by path.
+_REPORT_LINE = re.compile(r"report: (?P<path>[^\x00]{1,4096})")
+_REPORT_NAME = re.compile(r"[0-9A-Za-z_-]{1,80}\.json")
 
 
 def page_csp(nonce: str) -> str:
@@ -300,6 +304,7 @@ class JobOutput:
         self._dropped = 0
         self._partial = ""
         self._scopes: dict[tuple[str, str], dict[str, Any]] = {}
+        self._report_path: str | None = None  # from the job's last "report: <path>" line
         self._lock = threading.Lock()
 
     def write(self, text: str) -> int:
@@ -327,6 +332,12 @@ class JobOutput:
 
     def _store(self, line: str) -> None:  # caller holds the lock
         line = self._redact(line.rstrip("\r"))  # redact first: truncation must not split
+        if line.startswith(("[", "report: ")) and len(line) <= MAX_PROGRESS_LINE:
+            # parsed whole, before display truncation; never let it break the print() of the
+            # migration that wrote it, and no logging here: the job's log handler writes
+            # into this very object
+            with contextlib.suppress(Exception):
+                self._track(line)
         if len(line) > MAX_LINE_CHARS:
             line = line[:MAX_LINE_CHARS] + " [line truncated]"
         size = len(line.encode("utf-8"))
@@ -338,26 +349,40 @@ class JobOutput:
             self._dropped += 1
         self._lines.append(line)
         self._bytes += size
-        if line.startswith("["):
-            # never let a progress line break the print() of the migration that wrote it;
-            # no logging here either: the job's log handler writes into this very object
-            with contextlib.suppress(Exception):
-                self._track_progress(line)
+
+    def _track(self, line: str) -> None:  # caller holds the lock
+        if line.startswith("report: "):
+            match = _REPORT_LINE.fullmatch(line)
+            if match is not None:
+                self._report_path = match["path"]
+            return
+        self._track_progress(line)
 
     def _track_progress(self, line: str) -> None:  # caller holds the lock
         """Latest numbers per (mailbox, kind) from the tool's own progress lines."""
         match = _PROGRESS_LINE.fullmatch(line)
         if match is None:
             return
-        key = (clean(match["mailbox"])[:300], match["kind"])
-        if key not in self._scopes and len(self._scopes) >= MAX_SCOPES:
+        key = (match["mailbox"], match["kind"])  # the whole address: the scope's identity
+        current = self._scopes.get(key)
+        if current is None and len(self._scopes) >= MAX_SCOPES:
             return
         phase = match["phase"] or ""
         finished = phase == "finished"
+        if current is not None and current["finished"] and not finished:
+            # Progress.maybe_print prints lines it built before releasing its lock, so a
+            # stale unfinished line can arrive after the scope's "(finished)" line
+            return
         self._scopes[key] = {
-            "mailbox": key[0], "kind": key[1], "done": int(match["done"]),
+            "mailbox": clean(key[0])[:300], "kind": key[1], "done": int(match["done"]),
             "total": int(match["total"]), "rate": int(match["rate"]),
             "phase": "" if finished else clean(phase)[:300], "finished": finished}
+
+    def report_path(self) -> str | None:
+        """The path from the job's last ``report: <path>`` line (what ``cli.main`` prints
+        when it wrote the run report), or ``None``."""
+        with self._lock:
+            return self._report_path
 
     def progress(self) -> dict[str, Any] | None:
         """Sums over all scopes plus the first ``MAX_SCOPES_SHOWN`` of them; ``None`` until
@@ -369,6 +394,10 @@ class JobOutput:
         scopes.sort(key=lambda s: (s["mailbox"], SCOPE_KINDS.index(s["kind"])))
         return {"done": sum(s["done"] for s in scopes), "total": sum(s["total"] for s in scopes),
                 "rate": sum(s["rate"] for s in scopes if not s["finished"]),
+                # what the unfinished scopes still have to do: a finished scope that stopped
+                # short has no rate, so its remainder must not count towards the time left
+                "remaining": sum(max(s["total"] - s["done"], 0) for s in scopes
+                                 if not s["finished"]),
                 "scopes": scopes[:MAX_SCOPES_SHOWN],
                 "more_scopes": max(len(scopes) - MAX_SCOPES_SHOWN, 0)}
 
@@ -393,7 +422,6 @@ class Job:
     args: list[str]
     output: JobOutput
     started: str = field(default_factory=_now)
-    created: float = field(default_factory=time.time)  # precise; `started` is per second
     finished: str | None = None
     exit_code: int | None = None
     outcome: dict[str, str] | None = None  # headline of the report the job wrote, once done
@@ -924,35 +952,34 @@ class WebApp:
                         if snap.parent == (self.cfg.state_dir / "jobs").resolve():
                             snap.unlink()
             job.output.close()  # before `finished`: a finished job's output is complete
-            outcome = self._job_outcome(job)  # before `finished` too: an outcome is final
+            with self._lock:  # the exit code first: reading the report must never cost it
+                job.exit_code = code
+            outcome = self._job_outcome(job)  # before `finished`: an outcome is final
             with self._lock:
                 job.outcome = outcome
-                job.exit_code = code
                 job.finished = _now()
 
     def _job_outcome(self, job: Job) -> dict[str, str] | None:
-        """Headline of the report ``job`` wrote: the newest one of its command whose
-        ``started`` is not before the job was created. Strict, so a job that wrote no report
-        (lock held, bad arguments) never inherits the one before it. Never raises: the job
-        thread must always get to record its exit code."""
+        """Headline of the report this job wrote, named by its own ``report: <path>`` line:
+        never another run's report (an external CLI run of the same command, an earlier
+        job). Only a plain file name directly inside ``<state_dir>/reports`` is accepted, and
+        the report must be of the job's command. Never raises: the job thread must always
+        get to record its exit code."""
         try:
-            for report_file, data in self._reports(MAX_REPORTS_SCANNED):
-                # written before the job existed: neither this file nor any older one is its
-                # report (the tolerance only covers file times that lag the clock)
-                if report_file.mtime < job.created - MTIME_TOLERANCE_SECONDS:
-                    return None
-                if not isinstance(data, dict) or data.get("command") != job.command:
-                    continue
-                started = data.get("started")
-                if not isinstance(started, str):
-                    continue
-                with contextlib.suppress(ValueError, OverflowError):
-                    stamp = datetime.fromisoformat(started)
-                    if stamp.tzinfo is not None and stamp.timestamp() >= job.created:
-                        headline = summarize_report(data)["headline"]
-                        return {"level": headline["level"],
-                                "text": self.redact(headline["text"])}
-        except Exception as exc:  # e.g. an unreadable reports directory
+            raw = job.output.report_path()
+            if raw is None:
+                return None
+            named = Path(raw)
+            reports = self.cfg.state_dir / "reports"
+            if (not _REPORT_NAME.fullmatch(named.name)
+                    or named.parent.resolve() != reports.resolve()):
+                return None
+            data = self._read_report(reports / named.name)
+            if not isinstance(data, dict) or data.get("command") != job.command:
+                return None
+            headline = summarize_report(self._redact_report(data))["headline"]
+            return {"level": headline["level"], "text": self.redact(headline["text"])}
+        except Exception as exc:  # e.g. an unresolvable path
             log.warning("job %s (%s): could not read its report: %s", job.id, job.command,
                         exc.__class__.__name__)
         return None
@@ -1051,6 +1078,12 @@ class WebApp:
             # not cached: a permission or descriptor problem can clear up without the
             # file's name, mtime or size (the cache key) changing
             return _ReportMeta(readable=False)
+        if data is not _UNREADABLE:
+            try:  # redact the report whole first: summarising cuts strings to 300 characters,
+                # and a longer secret cut in half would no longer be recognised afterwards
+                data = self._redact_report(data)
+            except RecursionError:  # nested deeper than the redactor can walk
+                data = _UNREADABLE
         if data is _UNREADABLE:
             meta = _ReportMeta(readable=False)
         else:
@@ -1064,7 +1097,8 @@ class WebApp:
         return meta
 
     def _redact_tree(self, value: Any) -> Any:
-        """Every string inside ``value`` (dicts and lists, recursively) through ``redact``."""
+        """Every string value inside ``value`` (dicts and lists, recursively) through
+        ``redact``. Dict keys are left alone: they are field names."""
         if isinstance(value, str):
             return self.redact(value)
         if isinstance(value, dict):
@@ -1072,6 +1106,25 @@ class WebApp:
         if isinstance(value, list):
             return [self._redact_tree(item) for item in value]
         return value
+
+    def _redact_report(self, data: Any) -> Any:
+        """A report read from disk, redacted before it is summarised (the summary cuts
+        strings to their display length, after which a longer secret would no longer
+        match). The keys of ``mailboxes`` are data too (addresses) and are redacted as well;
+        two that become equal stay two entries. Every other key is a field name."""
+        data = self._redact_tree(data)
+        mailboxes = data.get("mailboxes") if isinstance(data, dict) else None
+        if not isinstance(mailboxes, dict):
+            return data
+        renamed: dict[Any, Any] = {}
+        for key, entry in mailboxes.items():
+            shown = self.redact(key) if isinstance(key, str) else key
+            n = 1
+            while shown in renamed:  # never let one entry replace another
+                n += 1
+                shown = f"{self.redact(key)} ({n})"
+            renamed[shown] = entry
+        return {**data, "mailboxes": renamed}
 
     def _report_files(self) -> list[_ReportFile]:
         """``<state_dir>/reports/*.json`` that are regular files (no symlinks), newest first

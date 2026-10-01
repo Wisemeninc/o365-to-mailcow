@@ -15,6 +15,13 @@ Partial runs (``--only``, ``--mailbox``, a per-run ``--mail-since``; recorded in
 checked: a clean partial run keeps a green headline that says what it covered, but its step
 is ``unknown`` so it cannot stand in for a full run.
 
+A migrate that skipped oversized messages or left something out (calendar ``warnings``,
+contacts ``fallbacks``) is ``warn``, never green: verify would count the same things.
+
+Construction is bounded, not only the output: at most ``MAX_TEXTS`` strings are converted
+per report list, detail lists stop at ``MAX_DETAIL`` and count the rest, and mailboxes
+beyond ``MAX_MAILBOXES`` keep only the numbers the headline needs.
+
 Reports are read from disk, so every field is treated as untrusted: wrong types never raise,
 every string is cleaned and cut to ``MAX_TEXT`` characters, counts above ``MAX_COUNT`` are
 not believed, and data that cannot be read is reported as ``unknown`` — never as ``ok`` or
@@ -23,7 +30,7 @@ as "0 missing".
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,6 +40,7 @@ MAX_TEXT = 300
 MAX_MAILBOXES = 500
 MAX_DETAIL = 200
 MAX_COUNT = 10**15  # matches the 15-digit bound of the web server's progress parser
+MAX_TEXTS = 1_000  # strings converted per report list; the rest is only counted
 KINDS = ("mail", "calendar", "contacts")
 TITLES = {"mail": "Mail", "calendar": "Calendar", "contacts": "Contacts"}
 LEVELS = ("ok", "warn", "bad", "unknown")
@@ -60,7 +68,10 @@ def _opt_text(value: object) -> str | None:
 
 
 def _exit_code(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
+    """A process exit code (-255..255); anything else, absurd integers included, is None."""
+    if isinstance(value, int) and not isinstance(value, bool) and -255 <= value <= 255:
+        return value
+    return None
 
 
 def _number(value: object) -> int | float | None:
@@ -77,9 +88,62 @@ def _plural(count: int, one: str, many: str) -> str:
     return f"{count:,} {one if count == 1 else many}"
 
 
+def _items(count: int) -> str:
+    return _plural(count, "item", "items")
+
+
+def _items_are(count: int) -> str:
+    return f"{count:,} item is" if count == 1 else f"{count:,} items are"
+
+
 def _parts(items: Iterable[tuple[int, str]]) -> list[str]:
     """``(3, "missing"), (0, "failed")`` -> ``["3 missing"]`` (labels that do not inflect)."""
     return [f"{count:,} {label}" for count, label in items if count > 0]
+
+
+class _Texts:
+    """The first ``MAX_TEXTS`` strings of a report list, cleaned, plus the list's length:
+    a report with millions of error strings costs a count, not millions of conversions."""
+
+    def __init__(self, items: list[str], total: int) -> None:
+        self.items = items
+        self.total = total
+
+    def __len__(self) -> int:
+        return self.total
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.items)
+
+
+class _Capped:
+    """A detail list that keeps at most ``MAX_DETAIL`` entries and counts the rest."""
+
+    def __init__(self) -> None:
+        self.items: list[Any] = []
+        self.total = 0
+
+    def add(self, item: Any) -> None:
+        self.total += 1
+        if len(self.items) < MAX_DETAIL:
+            self.items.append(item)
+
+    def add_texts(self, texts: _Texts, prefix: str = "") -> None:
+        for text in texts:
+            if len(self.items) >= MAX_DETAIL:
+                break
+            self.items.append(_text(prefix + text) if prefix else text)
+        self.total += len(texts)
+
+    def __len__(self) -> int:
+        return self.total
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self.items)
+
+    @property
+    def more(self) -> int:
+        return self.total - len(self.items)
 
 
 class _Reader:
@@ -133,15 +197,15 @@ class _Reader:
             self.suspect = True
         return rows
 
-    def texts(self, section: JsonDict, key: str) -> list[str]:
+    def texts(self, section: JsonDict, key: str) -> _Texts:
         """A list of messages (errors, skipped names); a lone value is kept, but suspect."""
         value = section.get(key)
         if value is None:
-            return []
+            return _Texts([], 0)
         if not isinstance(value, list):
             self.suspect = True
-            return [_text(value)]
-        return [_text(item) for item in value]
+            return _Texts([_text(value)], 1)
+        return _Texts([_text(item) for item in value[:MAX_TEXTS]], len(value))
 
 
 # -- building blocks of a mailbox row ------------------------------------------------------
@@ -149,22 +213,22 @@ class _Reader:
 @dataclass
 class _Detail:
     cards: list[JsonDict] = field(default_factory=list)
-    differences: list[JsonDict] = field(default_factory=list)
-    skipped: list[JsonDict] = field(default_factory=list)
+    differences: _Capped = field(default_factory=_Capped)
+    skipped: _Capped = field(default_factory=_Capped)
     sample: JsonDict | None = None
-    problems: list[str] = field(default_factory=list)
-    errors: list[str] = field(default_factory=list)
+    problems: _Capped = field(default_factory=_Capped)
+    errors: _Capped = field(default_factory=_Capped)
 
     def view(self) -> JsonDict:
         return {
             "cards": self.cards,
-            "differences": self.differences[:MAX_DETAIL],
-            "more_differences": max(len(self.differences) - MAX_DETAIL, 0),
-            "skipped": self.skipped[:MAX_DETAIL],
-            "more_skipped": max(len(self.skipped) - MAX_DETAIL, 0),
+            "differences": self.differences.items,
+            "more_differences": self.differences.more,
+            "skipped": self.skipped.items,
+            "more_skipped": self.skipped.more,
             "sample": self.sample,
-            "problems": self.problems[:MAX_DETAIL],
-            "errors": self.errors[:MAX_DETAIL],
+            "problems": self.problems.items,
+            "errors": self.errors.items,
         }
 
 
@@ -251,7 +315,7 @@ def _verify_kind(box: _Mailbox, kind: str, value: object) -> bool:
         if mismatch or row_failed or row_large:
             delta = _parts(((row_missing, "missing"), (row_failed, "failed"),
                             (row_large, "too large"), (row_extra, "more than expected")))
-            box.detail.differences.append({
+            box.detail.differences.add({
                 "kind": title, "name": _text(name), "source": _n(row_source),
                 "destination": _n(row_found), "delta": " · ".join(delta) or "count mismatch",
                 "why": _text(why) if why else ""})
@@ -261,7 +325,7 @@ def _verify_kind(box: _Mailbox, kind: str, value: object) -> bool:
         for row in reader.rows(sec, "skipped_folders", required=False):
             total = reader.num(row, "total")
             in_skipped += total
-            box.detail.skipped.append({
+            box.detail.skipped.add({
                 "kind": title, "name": _text(row.get("path")), "reason": _text(row.get("reason")),
                 "items": _n(total), "level": "warn" if total else "ok"})
         if surplus:
@@ -272,15 +336,16 @@ def _verify_kind(box: _Mailbox, kind: str, value: object) -> bool:
     else:
         by_design = reader.texts(sec, "skipped")  # shared calendars: not copied by design
         for name in by_design:
-            box.detail.skipped.append({
+            box.detail.skipped.add({
                 "kind": title, "name": name, "reason": "skipped by design (not owned by "
                 "this mailbox)", "items": "", "level": "ok"})
+        box.detail.skipped.total += len(by_design) - len(by_design.items)
         if kind == "calendar" and by_design:
             notes.append(_plural(len(by_design), "shared calendar", "shared calendars")
                          + " not copied")
     errors = reader.texts(sec, "errors")
     fallbacks = reader.texts(sec, "fallbacks")
-    box.detail.errors.extend(f"{kind}: {e}" for e in errors)
+    box.detail.errors.add_texts(errors, f"{kind}: ")
     parts = _parts(((missing, "missing"), (failed, "failed"), (too_large, "too large"),
                     (in_skipped, "in skipped folders"), (extra, "more than expected")))
     if sample_mismatches:
@@ -315,8 +380,8 @@ def _sample(reader: _Reader, mail: JsonDict) -> JsonDict | None:
     if unverifiable:
         notes.append(f"{_n(unverifiable)} without Message-ID or gone at the source")
     return {"level": "warn" if mismatches else "ok",
-            "text": f"{_n(max(checked - mismatches, 0))} of {_n(checked)} sampled messages "
-                    "match",
+            "text": f"{_n(max(checked - mismatches, 0))} of {_n(checked)} sampled "
+                    + ("message matches" if checked == 1 else "messages match"),
             "detail": (", ".join(notes) + ".") if notes else ""}
 
 
@@ -328,15 +393,19 @@ def _verify_box(key: str, entry: object) -> _Mailbox:
     box = _Mailbox(key, _opt_text(entry.get("destination")))
     readable = True
     errors = _Reader()
-    box.detail.errors.extend(errors.texts(entry, "errors"))
+    box.detail.errors.add_texts(errors.texts(entry, "errors"))
     ran = [kind for kind in KINDS if entry.get(kind) is not None]
     for kind in ran:
         readable = _verify_kind(box, kind, entry.get(kind)) and readable
     box.first_error = next((e for e in box.detail.errors if e), "")
     try:
         lines, problems = verify_summary({key: entry})
-        box.detail.problems = [_text(line.strip()[1:].strip()) for line in lines
-                               if isinstance(line, str) and line.strip().startswith("!")]
+        for line in lines:  # its own list is the CLI's cost; ours stops at the cap
+            if isinstance(line, str) and line.lstrip().startswith("!"):
+                if len(box.detail.problems.items) < MAX_DETAIL:
+                    box.detail.problems.add(_text(line.strip()[1:].strip()))
+                else:
+                    box.detail.problems.total += 1
     except Exception:  # malformed rows: verify_summary indexes keys directly
         box.result("unknown", "Results could not be read")
         box.add(unknown=1)
@@ -362,7 +431,7 @@ def _verify_box(key: str, entry: object) -> _Mailbox:
 
 
 def _verify(boxes: list[_Mailbox], exit_code: int | None) -> tuple[JsonDict, str]:
-    found, source = _n(_total(boxes, "found")), _n(_total(boxes, "source"))
+    found, source_n = _n(_total(boxes, "found")), _total(boxes, "source")
     missing, problems = _total(boxes, "missing"), _total(boxes, "problems")
     if not boxes:
         return _headline("unknown", "Verify checked no mailboxes"), "Nothing checked"
@@ -370,11 +439,11 @@ def _verify(boxes: list[_Mailbox], exit_code: int | None) -> tuple[JsonDict, str
         return _headline("bad", "Verify could not finish", _first_error(boxes)), \
             "Could not finish"
     if problems == 0 and exit_code == 0 and not _total(boxes, "unknown"):
-        detail = f"{found} of {source} items are in mailcow."
+        detail = f"{found} of {_items_are(source_n)} in mailcow."
         if _total(boxes, "skipped_rows"):
             detail += " Items skipped by design are listed per mailbox."
         return _headline("ok", "Everything arrived", detail), "Everything arrived"
-    detail = f"{found} of {source} items are at the destination."
+    detail = f"{found} of {_items_are(source_n)} at the destination."
     others = _parts(((_total(boxes, "failed"), "failed"), (_total(boxes, "too_large"), "too large"),
                      (_total(boxes, "in_skipped"), "in skipped folders"),
                      (_total(boxes, "extra"), "more than expected")))
@@ -415,22 +484,29 @@ def _migrate_kind(box: _Mailbox, kind: str, value: object, dry_run: bool) -> boo
         row_failed = reader.num(row, "failed") + (1 if error else 0)
         failed += row_failed
         if row_failed:
-            box.detail.differences.append({
+            box.detail.differences.add({
                 "kind": title, "name": _text(name), "source": "", "destination": "",
                 "delta": f"{_n(row_failed)} failed", "why": error})
     errors = reader.texts(sec, "errors")
-    box.detail.errors.extend(f"{kind}: {e}" for e in errors)
+    box.detail.errors.add_texts(errors, f"{kind}: ")
+    # known omissions verify would count as problems: an event's recurrence exception or a
+    # contact photo left out (warnings), an address book refused and redirected (fallbacks)
+    warning_texts, fallback_texts = reader.texts(sec, "warnings"), reader.texts(sec, "fallbacks")
+    box.detail.problems.add_texts(warning_texts, f"{kind}: ")
+    box.detail.problems.add_texts(fallback_texts, f"{kind}: ")
     mail_errors = 0
     if kind == "mail":
-        for name in reader.texts(sec, "skipped_folders"):
-            box.detail.skipped.append({"kind": title, "name": name, "reason": "", "items": "",
-                                       "level": "ok"})
+        skipped = reader.texts(sec, "skipped_folders")
+        for name in skipped:
+            box.detail.skipped.add({"kind": title, "name": name, "reason": "", "items": "",
+                                    "level": "ok"})
+        box.detail.skipped.total += len(skipped) - len(skipped.items)
         if sec.get("stopped") is True:
             box.add(stopped=1)
         mail_errors = len(errors)  # MailResult keeps errors apart from the failed count
     else:  # like CollectionsResult.failed: section errors count as failures
         failed += len(errors)
-    bad = failed > 0 or bool(errors)
+    warnings = len(warning_texts) + len(fallback_texts)
     if dry_run:
         primary = f"{_n(would)} to copy"
         parts = _parts(((already, "already there"), (too_large, "too large")))
@@ -442,17 +518,32 @@ def _migrate_kind(box: _Mailbox, kind: str, value: object, dry_run: bool) -> boo
         rows = [["Copied", _n(copied)], ["Already there", _n(already)], ["Failed", _n(failed)]]
     if kind == "mail":
         rows.append(["Too large", _n(too_large)])
+    if warnings:
+        parts.append(_plural(warnings, "warning", "warnings"))
+        rows.append(["Warnings", _n(warnings)])
     if mail_errors:
         parts.append(_plural(mail_errors, "error", "errors"))
         rows.append(["Errors", _n(mail_errors)])
-    level = "bad" if bad else ("unknown" if reader.suspect else "ok")
+    if failed or errors:
+        level = "bad"
+    elif too_large or warnings:
+        level = "warn"
+    else:
+        level = "unknown" if reader.suspect else "ok"
     secondary = " · ".join(parts)
     box.cells[kind] = _cell(primary, secondary, level)
     verdict = secondary or {"bad": "Failed", "unknown": "Some counts could not be read",
                             "ok": "Nothing to copy" if dry_run else "Copied"}[level]
     box.detail.cards.append(_card(kind, rows, level, verdict))
-    box.add(copied=copied, already=already, failed=failed, too_large=too_large, would=would)
+    box.add(copied=copied, already=already, failed=failed, too_large=too_large, would=would,
+            warnings=warnings)
     return not reader.suspect
+
+
+def _to_check(box: _Mailbox) -> list[str]:
+    return [*_parts(((box.counts.get("too_large", 0), "too large"),)),
+            *([_plural(box.counts["warnings"], "warning", "warnings")]
+              if box.counts.get("warnings") else [])]
 
 
 def _migrate_box(key: str, entry: object, dry_run: bool) -> _Mailbox:
@@ -462,7 +553,7 @@ def _migrate_box(key: str, entry: object, dry_run: bool) -> _Mailbox:
         return box
     box = _Mailbox(key, _opt_text(entry.get("destination")))
     errors = _Reader()
-    box.detail.errors.extend(errors.texts(entry, "errors"))
+    box.detail.errors.add_texts(errors.texts(entry, "errors"))
     ran = [kind for kind in KINDS if entry.get(kind) is not None]
     readable = not errors.suspect
     for kind in ran:
@@ -479,6 +570,8 @@ def _migrate_box(key: str, entry: object, dry_run: bool) -> _Mailbox:
         box.result("bad", f"{_n(failed)} failed" if failed else "Failed")
     elif not readable or status != "ok" or not ran:
         box.result("unknown", "Results could not be read" if ran else "Nothing was copied")
+    elif _to_check(box):
+        box.result("warn", " · ".join(_to_check(box)))
     else:
         box.result("ok", "Dry run" if dry_run else "Copied")
     box.add(bad=box.level == "bad", unknown=box.level == "unknown",
@@ -489,28 +582,42 @@ def _migrate_box(key: str, entry: object, dry_run: bool) -> _Mailbox:
 def _migrate(boxes: list[_Mailbox], exit_code: int | None,
              dry_run: bool) -> tuple[JsonDict, str]:
     copied, already = _total(boxes, "copied"), _total(boxes, "already")
+    too_large, warnings = _total(boxes, "too_large"), _total(boxes, "warnings")
+    would = _total(boxes, "would")
     if not boxes:
         return _ended("Migrate", exit_code)
     if exit_code == 2 or _total(boxes, "bad"):
-        detail = f"{_n(copied)} items copied, {_n(already)} already there."
+        failed = _total(boxes, "failed")
         if dry_run:
-            detail = f"Dry run: {_n(_total(boxes, 'would'))} items would be copied."
+            detail = (f"Dry run: {_items(would)} would be copied, {_n(failed)} failed.")
+        else:
+            detail = (f"{_items(copied)} copied, {_n(already)} already there, "
+                      f"{_n(failed)} failed.")
         if exit_code == 2 or _total(boxes, "incomplete"):
             return _headline("bad", "Migrate did not finish", detail), "Did not finish"
-        failures = _total(boxes, "failed") or _total(boxes, "bad")
-        return (_headline("bad", f"Migrate finished with "
-                                 f"{_plural(failures, 'failure', 'failures')}", detail),
-                _plural(failures, "failure", "failures"))
+        bad = _plural(_total(boxes, "bad"), "mailbox", "mailboxes")
+        return (_headline("bad", f"Migrate finished with failures in {bad}", detail),
+                f"Failures in {bad}")
     if exit_code != 0 or _total(boxes, "unknown"):
         return _ended("Migrate", exit_code)
     if dry_run:
-        would = _n(_total(boxes, "would"))
-        return _headline("ok", f"Dry run: {would} items would be copied"), f"{would} to copy"
-    detail = f"{_n(already)} were already there."
-    if _total(boxes, "too_large"):
-        detail += f" {_n(_total(boxes, 'too_large'))} too large were skipped."
-    return (_headline("ok", f"Migrate finished: {_n(copied)} items copied", detail),
-            _plural(copied, "item copied", "items copied"))
+        extra = _parts(((too_large, "too large to copy"),))
+        if warnings:
+            extra.append(_plural(warnings, "warning", "warnings"))
+        text = f"Dry run: {_items(would)} would be copied"
+        if extra:
+            return _headline("warn", f"{text}, {', '.join(extra)}"), f"{_n(would)} to copy"
+        return _headline("ok", text), f"{_n(would)} to copy"
+    detail = f"{_n(already)} {'was' if already == 1 else 'were'} already there."
+    if too_large:
+        detail += f" {_n(too_large)} too large to copy."
+    if warnings:
+        detail += f" {_plural(warnings, 'warning', 'warnings')}; see the mailbox details."
+    if too_large or warnings:
+        return (_headline("warn", f"Migrate finished with warnings: {_items(copied)} copied",
+                          detail), f"{_n(copied)} copied · {_n(too_large + warnings)} to check")
+    return (_headline("ok", f"Migrate finished: {_items(copied)} copied", detail),
+            f"{_items(copied)} copied")
 
 
 # -- plan ------------------------------------------------------------------------------------
@@ -522,7 +629,7 @@ def _plan_box(key: str, entry: object) -> _Mailbox:
         return box
     box = _Mailbox(key, _opt_text(entry.get("destination")))
     reader = _Reader()
-    box.detail.errors.extend(reader.texts(entry, "errors"))
+    box.detail.errors.add_texts(reader.texts(entry, "errors"))
     planned = 0
     for kind in KINDS:
         value = entry.get(f"{kind}_plan")
@@ -571,7 +678,7 @@ def _plan(boxes: list[_Mailbox], exit_code: int | None) -> tuple[JsonDict, str]:
     if exit_code != 0 or _total(boxes, "unknown"):
         return _ended("Plan", exit_code)
     items = _total(boxes, "items")
-    return (_headline("ok", f"Plan: {_n(items)} items in "
+    return (_headline("ok", f"Plan: {_items(items)} in "
                             f"{_plural(len(boxes), 'mailbox', 'mailboxes')}"),
             _plural(items, "item to copy", "items to copy"))
 
@@ -589,10 +696,12 @@ def _provision_box(key: str, entry: object) -> _Mailbox:
         return box
     reader = _Reader()
     errors = reader.texts(entry, "errors")
-    box.detail.errors.extend(errors)
+    box.detail.errors.add_texts(errors)
     box.first_error = next((e for e in errors if e), "")
     outcome = entry.get("provision")
-    alias_only = bool(errors) and all(e.startswith("alias ") for e in errors)
+    # only when every error was looked at: beyond the first MAX_TEXTS the kind is unknown
+    alias_only = (bool(errors) and len(errors) == len(errors.items)
+                  and all(e.startswith("alias ") for e in errors))
     if outcome not in _PROVISIONED or (errors and not alias_only) or reader.suspect:
         box.result("bad", "Failed")
         box.add(bad=1)
@@ -667,7 +776,7 @@ def _cleanup_box(key: str, entry: object, dry_run: bool) -> _Mailbox:
         return box
     reader = _Reader()
     errors = reader.texts(entry, "errors")
-    box.detail.errors.extend(errors)
+    box.detail.errors.add_texts(errors)
     box.first_error = next((e for e in errors if e), "")
     deleted = reader.num(entry, "deleted_app_passwords", required=bool(not errors))
     if errors:
@@ -704,27 +813,43 @@ def _cleanup(boxes: list[_Mailbox], exit_code: int | None,
 
 # -- scope (partial runs) ------------------------------------------------------------------
 
-def _scope(report: JsonDict, command: str, columns: list[str]) -> tuple[bool, str]:
-    """``(partial, display text)`` from the report's ``scope``; for reports written before
-    it existed, inferred from the kinds present (plan/migrate/verify only)."""
+@dataclass(frozen=True)
+class _Scope:
+    partial: bool = False
+    text: str = ""
+    unreadable: bool = False  # recorded, but not in a form this version understands
+
+
+_SCOPE_KEYS = frozenset({"only", "mailbox", "mail_since"})
+
+
+def _scope(report: JsonDict, command: str, columns: list[str]) -> _Scope:
+    """What the run covered, from the report's ``scope``; for reports written before it
+    existed, inferred from the kinds present (plan/migrate/verify only)."""
     if "scope" not in report:
         if command in _KIND_SCOPED and 0 < len(columns) < len(KINDS):
-            return True, " and ".join(columns) + " only"
-        return False, ""
+            return _Scope(True, " and ".join(columns) + " only")
+        return _Scope()
     scope = report["scope"]
+    unreadable = _Scope(True, "the scope could not be read", unreadable=True)
     if not isinstance(scope, dict):
-        return True, "the scope could not be read"  # never claim a full run on doubt
+        return unreadable
+    if any(value for key, value in scope.items() if key not in _SCOPE_KEYS):
+        return unreadable  # a narrowing this version does not know
+    only, mailbox, since = scope.get("only"), scope.get("mailbox"), scope.get("mail_since")
+    # the CLI writes None or a string for each; anything else, falsy or not, is not its work
+    if ((only is not None and only not in KINDS)
+            or (mailbox is not None and not isinstance(mailbox, str))
+            or (since is not None and not isinstance(since, str))):
+        return unreadable
     parts = []
-    if scope.get("only"):
-        parts.append(f"{_text(scope['only'])} only")
-    if scope.get("mailbox"):
-        parts.append("1 mailbox")
-    if scope.get("mail_since"):
-        parts.append(f"mail since {_text(scope['mail_since'])}")
-    partial = any(scope.values())
-    if partial and not parts:
-        parts.append("a narrowed run")
-    return partial, " · ".join(parts)
+    if only:
+        parts.append(f"{only} only")
+    if mailbox:
+        parts.append("one mailbox address")  # --mailbox can select more than one mapping
+    if since:
+        parts.append(f"mail since {_text(since)}")
+    return _Scope(bool(parts), " · ".join(parts))
 
 
 def _narrow(command: str, headline: JsonDict, step_text: str,
@@ -778,44 +903,85 @@ def unreadable_summary() -> JsonDict:
     return _empty(_base({}), _headline("unknown", "The newest report could not be read"))
 
 
+def _build(command: str, entries: list[tuple[str, object]],
+           dry_run: bool) -> list[_Mailbox]:
+    """One ``_Mailbox`` per entry. Rows beyond ``MAX_MAILBOXES`` keep their numbers for the
+    headline but drop their detail at once, so a huge report never holds every detail."""
+    boxes: list[_Mailbox] = []
+    for key, entry in entries:
+        if command == "verify":
+            box = _verify_box(key, entry)
+        elif command == "migrate":
+            box = _migrate_box(key, entry, dry_run)
+        elif command == "plan":
+            box = _plan_box(key, entry)
+        elif command == "provision":
+            box = _provision_box(key, entry)
+        else:
+            box = _cleanup_box(key, entry, dry_run)
+        if len(boxes) >= MAX_MAILBOXES:
+            box.detail = _Detail()
+        boxes.append(box)
+    return boxes
+
+
 def _summarize(report: object) -> tuple[JsonDict, str, str]:
     """``(summary, step text, step level)``."""
     data = report if isinstance(report, dict) else {}
     base = _base(data)
     mailboxes = data.get("mailboxes")
     command, exit_code, dry_run = base["command"], base["exit_code"], base["dry_run"]
+    if command in _DISPLAY and exit_code == 2 and not mailboxes:
+        # nothing ran: sign-in or configuration failed, or the command refused its options
+        return (_empty(base, _headline("bad", f"{_DISPLAY[command]} could not start",
+                                       "The job log has the reason.")),
+                "Could not start", "bad")
     if command not in _DISPLAY or not isinstance(mailboxes, dict):
         return _unknown(base)
     entries = _entries(mailboxes)
     notes: list[str] = []
-    if command == "verify":
-        boxes = [_verify_box(key, entry) for key, entry in entries]
-        headline, step = _verify(boxes, exit_code)
-    elif command == "migrate":
-        boxes = [_migrate_box(key, entry, dry_run) for key, entry in entries]
-        headline, step = _migrate(boxes, exit_code, dry_run)
-    elif command == "plan":
-        boxes = [_plan_box(key, entry) for key, entry in entries]
-        headline, step = _plan(boxes, exit_code)
-    elif command == "provision":
+    aliases = None
+    if command == "provision":
         aliases = _aliases_note(mailboxes["aliases"]) if "aliases" in mailboxes else None
         if aliases is not None:
             notes.append(aliases.note)
-        boxes = [_provision_box(key, entry) for key, entry in entries if key != "aliases"]
+        entries = [(key, entry) for key, entry in entries if key != "aliases"]
+    boxes = _build(command, entries, dry_run)
+    if command == "verify":
+        headline, step = _verify(boxes, exit_code)
+    elif command == "migrate":
+        headline, step = _migrate(boxes, exit_code, dry_run)
+    elif command == "plan":
+        headline, step = _plan(boxes, exit_code)
+    elif command == "provision":
         headline, step = _provision(boxes, exit_code, dry_run, aliases)
     else:
-        boxes = [_cleanup_box(key, entry, dry_run) for key, entry in entries]
         headline, step = _cleanup(boxes, exit_code, dry_run)
     columns = [kind for kind in KINDS if any(box.cells[kind] is not None for box in boxes)]
-    partial, scope = _scope(data, command, columns)
+    scope = _scope(data, command, columns)
     step_level = headline["level"]
-    if partial and headline["level"] == "ok":
-        headline, step, step_level = _narrow(command, headline, step, scope)
-    summary = {**base, "partial": partial, "scope": scope, "headline": headline,
+    if scope.unreadable and headline["level"] == "ok":
+        headline = _headline("unknown", f"{_DISPLAY[command]} finished, but what it covered "
+                                        "could not be read", headline["detail"])
+        step, step_level = "Scope unknown", "unknown"
+    elif scope.partial and headline["level"] == "ok":
+        headline, step, step_level = _narrow(command, headline, step, scope.text)
+    summary = {**base, "partial": scope.partial, "scope": scope.text, "headline": headline,
                "columns": columns,
                "mailboxes": [box.view() for box in boxes[:MAX_MAILBOXES]],
                "more_mailboxes": max(len(boxes) - MAX_MAILBOXES, 0), "notes": notes}
     return summary, step, step_level
+
+
+_LAST_RESORT_STEP = "Unknown"
+
+
+def _last_resort() -> JsonDict:
+    """Built from literals only, so the error path itself cannot fail."""
+    return {"command": "", "dry_run": False, "started": None, "finished": None,
+            "duration_s": None, "exit_code": None, "partial": False, "scope": "",
+            "headline": {"level": "unknown", "text": "Run ended", "detail": ""},
+            "columns": [], "mailboxes": [], "more_mailboxes": 0, "notes": []}
 
 
 def summarize_with_step(report: object) -> tuple[JsonDict, JsonDict]:
@@ -824,7 +990,10 @@ def summarize_with_step(report: object) -> tuple[JsonDict, JsonDict]:
     try:
         summary, text, level = _summarize(report)
     except Exception:  # a shape no reader anticipated: grey, never a 500 or a green
-        summary, text, level = _unknown(_base(report if isinstance(report, dict) else {}))
+        try:
+            summary, text, level = _unknown(_base(report if isinstance(report, dict) else {}))
+        except Exception:
+            summary, text, level = _last_resort(), _LAST_RESORT_STEP, "unknown"
     step = {"started": summary["started"], "finished": summary["finished"],
             "exit_code": summary["exit_code"], "level": level, "text": text}
     return summary, step
