@@ -635,16 +635,17 @@ class WebApp:
         with self._lock:
             job = self._running()
             running = {"id": job.id, "command": job.command} if job else None
-            sign_in = self._sign_ins.current()
-        return {"version": __version__, "auth_mode": self.cfg.auth_mode,
-                "mailcow_host": self.cfg.mailcow_host, "state_dir": str(self.cfg.state_dir),
+            # one snapshot: a prompt is only ever paired with the settings it belongs to
+            cfg, sign_in = self.cfg, self._sign_ins.current()
+        return {"version": __version__, "auth_mode": cfg.auth_mode,
+                "mailcow_host": cfg.mailcow_host, "state_dir": str(cfg.state_dir),
                 "selection_path": str(self.selection_path), "running_job": running,
-                "configured": self._configured(), "sign_in": sign_in}
+                "configured": self._configured(cfg), "sign_in": sign_in}
 
     # -- settings (saved to <state_dir>/settings.toml; secrets never returned) ----------
 
-    def _configured(self) -> bool:
-        cfg = self.cfg
+    def _configured(self, cfg: Config | None = None) -> bool:
+        cfg = cfg or self.cfg
         return bool(cfg.tenant_id and cfg.client_id and cfg.mailcow_host and cfg.mailcow_api_key
                     and (cfg.auth_mode == "delegated" or cfg.client_secret))
 
@@ -803,15 +804,17 @@ class WebApp:
     def test_settings(self) -> dict[str, Any]:
         """Try a Microsoft sign-in, a Graph user listing and a mailcow API call."""
         result: dict[str, Any] = {}
-        if not self._configured():
+        with self._lock:
+            cfg = self.cfg  # one snapshot for every check below: settings may change meanwhile
+        if not self._configured(cfg):
             raise HttpError(400, "save the settings first")
-        if self.cfg.auth_mode == "delegated":
+        if cfg.auth_mode == "delegated":
             result["microsoft"] = {"ok": None, "message": "delegated sign-in happens on the "
-                                   "first job (device code in its output)"}
+                                   "first job or tenant load (the page shows the code)"}
             result["graph_users"] = {"ok": None, "message": "checked after sign-in"}
         else:
             try:
-                tokens = TokenProvider(self.cfg, cache_path=self._web_cache_path(), out=self.out)
+                tokens = TokenProvider(cfg, cache_path=self._web_cache_path(cfg), out=self.out)
                 tokens.get_token()
                 result["microsoft"] = {"ok": True, "message": "signed in (client credentials)"}
                 try:
@@ -824,8 +827,8 @@ class WebApp:
                 result["microsoft"] = {"ok": False, "message": self._upstream_error(exc)}
                 result["graph_users"] = {"ok": None, "message": "not checked"}
         try:
-            api = MailcowApi(self.cfg.mailcow_host, self.cfg.mailcow_api_key,
-                             verify=self.cfg.mailcow_ca_file or True)
+            api = MailcowApi(cfg.mailcow_host, cfg.mailcow_api_key,
+                             verify=cfg.mailcow_ca_file or True)
             api.mailbox_exists("probe@example.invalid")
             result["mailcow"] = {"ok": True, "message": "API key accepted"}
         except (MailcowError, OSError, ValueError) as exc:
