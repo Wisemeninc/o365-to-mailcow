@@ -316,17 +316,17 @@ def _card(kind: str, rows: list[list[str]], level: str, verdict: str, note: str 
 
 
 def _failed_items(box: _Mailbox, reader: _Reader, kind: str, sec: JsonDict) -> int:
-    """Add a section's ``failed_items`` to the detail; returns how many the section has
-    (0 for a report written before the list existed). Only the first ``MAX_DETAIL`` rows are
-    looked at and the rest is counted; a total with nothing to show names nothing and is
-    not counted either."""
+    """Add a section's ``failed_items`` to the detail; returns how many of them the detail
+    now shows (0 for a report written before the list existed, and once the mailbox's list
+    is full). Only the first ``MAX_DETAIL`` rows are looked at and the rest is counted; a
+    total with nothing to show names nothing and is not counted either."""
     if "failed_items" not in sec:
         return 0
     rows = sec["failed_items"]
     if not isinstance(rows, list):
         reader.suspect = True
         return 0
-    shown = 0
+    shown, kept = 0, len(box.detail.failed_items.items)
     for row in rows[:MAX_DETAIL]:
         if not isinstance(row, dict):
             reader.suspect = True
@@ -339,7 +339,7 @@ def _failed_items(box: _Mailbox, reader: _Reader, kind: str, sec: JsonDict) -> i
     total = max(reader.num(sec, "failed_items_total", required=False), len(rows))
     if shown:
         box.detail.failed_items.total += total - shown
-    return total if shown else 0
+    return len(box.detail.failed_items.items) - kept
 
 
 # -- verify ----------------------------------------------------------------------------------

@@ -318,7 +318,7 @@ def failed_item_lines(section: Any) -> list[str]:
     total = section.get("failed_items_total")
     if not isinstance(total, int) or isinstance(total, bool):
         total = len(items)
-    if total > len(lines):
+    if lines and total > len(lines):  # a count alone names nothing: only after items
         lines.append(f"    … and {total - len(lines)} more (the report file lists up to "
                      f"{FAILED_ITEMS_LIMIT})")
     return lines

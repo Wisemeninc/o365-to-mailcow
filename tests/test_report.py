@@ -225,5 +225,6 @@ def test_a_title_that_looks_like_a_problem_line_is_not_one():
 
 def test_failed_item_lines_look_at_no_more_rows_than_a_report_holds():
     beyond = [1] * 100 + [_item()]  # the only readable row sits past the report's limit
-    assert failed_item_lines({"failed_items": beyond, "failed_items_total": 101}) == [
-        "    … and 101 more (the report file lists up to 100)"]
+    assert failed_item_lines({"failed_items": beyond, "failed_items_total": 101}) == []
+    # a count alone names nothing: no "… and N more" without an item line before it
+    assert failed_item_lines({"failed_items": [], "failed_items_total": 5}) == []

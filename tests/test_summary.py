@@ -950,19 +950,27 @@ def test_a_total_without_a_list_names_nothing():
         assert row["result"]["level"] == "bad" and row["detail"]["cards"][0]["note"] == ""
 
 
-def test_only_the_shown_failed_items_are_looked_at(monkeypatch):
-    import o365_to_mailcow.summary as summary_mod
+class _NoWalk(list):
+    """A list that may be sliced and measured, but never walked as a whole."""
 
-    calls = {"n": 0}
-    original = summary_mod._reason
+    def __iter__(self):
+        raise AssertionError("the whole failed_items list was walked")
 
-    def counting(status, error):
-        calls["n"] += 1
-        return original(status, error)
 
-    monkeypatch.setattr(summary_mod, "_reason", counting)
-    many = [dict(BIG) for _ in range(50_000)]
+def test_only_the_shown_failed_items_are_looked_at():
+    many = _NoWalk(dict(BIG) for _ in range(5_000))
     detail = only(summarize_report(report("migrate", {ANNA: with_failed(
         migrate_entry(), "mail", many)})))["detail"]
     assert len(detail["failed_items"]) == MAX_DETAIL
-    assert detail["more_failed_items"] == 50_000 - MAX_DETAIL and calls["n"] == MAX_DETAIL
+    assert detail["more_failed_items"] == 5_000 - MAX_DETAIL
+
+
+def test_a_card_only_says_listed_below_when_its_items_are_shown():
+    full = [{**BIG, "status": "failed", "error": "NO"} for _ in range(MAX_DETAIL)]
+    e = with_failed(migrate_entry(status="failed", failed=MAX_DETAIL), "mail", full)
+    e["contacts"]["collections"][0]["failed"] = 1
+    e = with_failed(e, "contacts", [{**EVENT, "place": "Contacts"}], 1)
+    detail = only(summarize_report(report("migrate", {ANNA: e}, exit_code=1)))["detail"]
+    notes = {c["title"]: c["note"] for c in detail["cards"]}
+    assert notes["Mail"].endswith("They are listed below.") and notes["Contacts"] == ""
+    assert len(detail["failed_items"]) == MAX_DETAIL and detail["more_failed_items"] == 1
