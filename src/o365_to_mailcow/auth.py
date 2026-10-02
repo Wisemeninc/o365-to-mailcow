@@ -116,9 +116,9 @@ class TokenProvider:
 
     def _hook(self, name: str, *args: object) -> None:
         """Call an optional sign-in hook of the output stream; it can never affect sign-in."""
-        hook = getattr(self._out, name, None)
-        if callable(hook):
-            with contextlib.suppress(Exception):
+        with contextlib.suppress(Exception):  # the lookup too: a stream's __getattr__ may raise
+            hook = getattr(self._out, name, None)
+            if callable(hook):
                 hook(*args)
 
     def invalidate(self) -> None:

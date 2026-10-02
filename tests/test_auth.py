@@ -244,6 +244,32 @@ def test_a_raising_hook_never_breaks_the_sign_in(tmp_path):
     assert [e for e in out.events if e[0] != "write"] == [PROMPT, ("done",)]
 
 
+class LookupFails:
+    """A stream whose hook attributes cannot even be looked up."""
+
+    def __init__(self) -> None:
+        self.text = io.StringIO()
+
+    def write(self, text: str) -> int:
+        return self.text.write(text)
+
+    def flush(self) -> None:
+        pass
+
+    def __getattr__(self, name: str):
+        raise RuntimeError(f"lookup of {name} failed")
+
+
+def test_a_failing_hook_lookup_neither_blocks_nor_masks_the_sign_in(tmp_path):
+    out = LookupFails()
+    assert _delegated(tmp_path, out).get_token() == "tok"  # the prompt lookup raised: ignored
+    assert "enter ABCD" in out.text.getvalue()
+    tp = _delegated(tmp_path, LookupFails())
+    FakeApp.instances[-1].result = RuntimeError("network down")
+    with pytest.raises(RuntimeError, match="network down"):  # not "lookup of … failed"
+        tp.get_token()
+
+
 def test_silent_sign_in_calls_no_hooks(tmp_path):
     out = HookOut()
     tp = _delegated(tmp_path, out)

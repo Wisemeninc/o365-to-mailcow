@@ -249,6 +249,9 @@ def test_sign_in_callout_markers() -> None:
     assert "noopener" in SCRIPT_TEXT, "The sign-in link must use rel=noopener"
     assert '"https:"' in SCRIPT_TEXT, "The sign-in link must be checked for the https: scheme"
     assert "navigator.clipboard" in SCRIPT_TEXT, "Copy code must use the clipboard API"
+    for call in ('showSignIn("job-signin", d.running', 'showSignIn("tenant-signin", data.sign_in'):
+        assert call in SCRIPT_TEXT, f"The callout must be driven by the API: {call}"
+    assert "seq !== state.statusSeq" in SCRIPT_TEXT, "A stale status answer must be dropped"
     for element_id in ("job-signin", "tenant-signin"):
         attrs = next(a for _, a in TAGS if a.get("id") == element_id)
         assert "hidden" in attrs, f"#{element_id} must be hidden by default"

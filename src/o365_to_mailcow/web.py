@@ -151,6 +151,7 @@ SIGN_IN_HOSTS = frozenset({"microsoft.com", "www.microsoft.com", "login.microsof
                            "aka.ms"})
 MAX_SIGN_IN_URL = 200
 MAX_SIGN_IN_SECONDS = 3600
+MAX_SIGN_INS = 64  # device flows waited on at once per job / per web UI; the oldest goes
 _SIGN_IN_CODE = re.compile(r"[A-Za-z0-9-]{4,32}")
 _SIGN_IN_PATH = re.compile(r"[A-Za-z0-9/_.-]{0,100}")
 _SIGN_IN_CHARS = re.compile(r"[A-Za-z0-9:/._-]+")  # no userinfo, query, escapes or spaces
@@ -217,6 +218,41 @@ def sign_in_prompt(uri: object, code: object, expires_in: object,
         start = now or datetime.now(UTC)
         expires = (start + timedelta(seconds=expires_in)).isoformat(timespec="seconds")
     return {"url": _sign_in_url(uri), "code": code, "expires": expires}
+
+
+class SignIns:
+    """Device-code prompts being waited on: one per thread that is inside a device flow,
+    oldest first. The page shows the newest still pending, so when two flows overlap, the
+    one that ends first neither hides nor loses the other's code. The methods run inside
+    the sign-in itself: they never raise, never log, and take only this object's own lock."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: dict[int, dict[str, Any]] = {}
+
+    def prompt(self, uri: object, code: object, expires_in: object) -> None:
+        shown = None
+        with contextlib.suppress(Exception):
+            shown = sign_in_prompt(uri, code, expires_in)
+        ident = threading.get_ident()
+        with self._lock:
+            self._pending.pop(ident, None)  # this thread's earlier prompt, if any
+            if shown is not None:
+                while len(self._pending) >= MAX_SIGN_INS:
+                    del self._pending[next(iter(self._pending))]
+                self._pending[ident] = shown
+
+    def done(self) -> None:
+        with self._lock:
+            self._pending.pop(threading.get_ident(), None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._pending.clear()
+
+    def current(self) -> dict[str, Any] | None:
+        with self._lock:
+            return dict(next(reversed(self._pending.values()))) if self._pending else None
 
 
 # -- responses and input validation ------------------------------------------------------
@@ -350,7 +386,7 @@ class JobOutput:
         self._partial = ""
         self._scopes: dict[tuple[str, str], dict[str, Any]] = {}
         self._report_path: str | None = None  # from the job's last "report: <path>" line
-        self._sign_in: dict[str, Any] | None = None  # a device-code prompt being waited on
+        self._sign_ins = SignIns()  # device-code prompts the job is waiting on
         self._lock = threading.Lock()
 
     def write(self, text: str) -> int:
@@ -371,8 +407,8 @@ class JobOutput:
 
     def close(self) -> None:
         """Store the last line even without a trailing newline; no sign-in is pending."""
+        self._sign_ins.clear()
         with self._lock:
-            self._sign_in = None
             if self._partial:
                 self._store(self._partial)
                 self._partial = ""
@@ -380,20 +416,15 @@ class JobOutput:
     # The two optional hooks of auth.TokenProvider: called inside the job's own sign-in,
     # so they never raise, and never log (the job's log handler writes into this object).
     def sign_in_prompt(self, uri: object, code: object, expires_in: object) -> None:
-        prompt = None
-        with contextlib.suppress(Exception):
-            prompt = sign_in_prompt(uri, code, expires_in)
-        with self._lock:
-            self._sign_in = prompt
+        self._sign_ins.prompt(uri, code, expires_in)
 
     def sign_in_done(self) -> None:
-        with self._lock:
-            self._sign_in = None
+        self._sign_ins.done()
 
     def sign_in(self) -> dict[str, Any] | None:
-        """The validated device-code prompt the job is waiting on, or ``None``."""
-        with self._lock:
-            return dict(self._sign_in) if self._sign_in else None
+        """The validated device-code prompt the job is waiting on (the newest, if several
+        mailbox threads sign in at once), or ``None``."""
+        return self._sign_ins.current()
 
     def _store(self, line: str) -> None:  # caller holds the lock
         line = self._redact(line.rstrip("\r"))  # redact first: truncation must not split
@@ -528,6 +559,9 @@ class _SignInRelay:
 
     def __init__(self, app: WebApp) -> None:
         self._app = app
+        # the holder of the connection this provider was built for: after a settings
+        # change the app has a new one, and this relay's prompts are no longer shown
+        self._sign_ins = app._sign_ins
 
     def _stream(self) -> TextIO:
         return self._app.out or sys.stderr
@@ -539,10 +573,10 @@ class _SignInRelay:
         self._stream().flush()
 
     def sign_in_prompt(self, uri: object, code: object, expires_in: object) -> None:
-        self._app._set_sign_in(uri, code, expires_in)
+        self._sign_ins.prompt(uri, code, expires_in)
 
     def sign_in_done(self) -> None:
-        self._app._end_sign_in()
+        self._sign_ins.done()
 
 
 class WebApp:
@@ -567,8 +601,7 @@ class WebApp:
         self._latest_summary: tuple[tuple[str, int, int], dict[str, Any]] | None = None
         self._tenant: tuple[float, dict[str, Any]] | None = None
         self._tokens: TokenProvider | None = None
-        self._sign_in: dict[str, Any] | None = None  # the tenant listing's device-code prompt
-        self._sign_in_thread: int | None = None  # the request thread waiting in that sign-in
+        self._sign_ins = SignIns()  # the tenant listing's device-code prompts (see _reload)
         self._secrets = cli.SecretFilter()
         for value in (cfg.client_secret, cfg.mailcow_api_key, token):
             self._secrets.add(value)
@@ -601,28 +634,11 @@ class WebApp:
         with self._lock:
             job = self._running()
             running = {"id": job.id, "command": job.command} if job else None
-            sign_in = dict(self._sign_in) if self._sign_in else None
+            sign_in = self._sign_ins.current()
         return {"version": __version__, "auth_mode": self.cfg.auth_mode,
                 "mailcow_host": self.cfg.mailcow_host, "state_dir": str(self.cfg.state_dir),
                 "selection_path": str(self.selection_path), "running_job": running,
                 "configured": self._configured(), "sign_in": sign_in}
-
-    def _set_sign_in(self, uri: object, code: object, expires_in: object) -> None:
-        """Keep (or, without a valid code, clear) the tenant listing's sign-in prompt.
-        Called from inside that sign-in: never raises."""
-        prompt = None
-        with contextlib.suppress(Exception):
-            prompt = sign_in_prompt(uri, code, expires_in)
-        with self._lock:
-            self._sign_in = prompt
-            self._sign_in_thread = threading.get_ident()
-
-    def _end_sign_in(self) -> None:
-        """Drop the prompt, unless a later listing's sign-in (another request thread, which
-        the same thread then ends) has replaced it."""
-        with self._lock:
-            if self._sign_in_thread == threading.get_ident():
-                self._sign_in = None
 
     # -- settings (saved to <state_dir>/settings.toml; secrets never returned) ----------
 
@@ -764,6 +780,7 @@ class WebApp:
                 path.unlink()
         with self._lock:
             self._tokens = None
+            self._sign_ins = SignIns()  # a prompt of the old connection is not shown again
 
     def _reload(self) -> None:
         """Re-read the effective configuration after settings changed."""
@@ -773,6 +790,9 @@ class WebApp:
             self.cfg = cfg
             self._tokens = None
             self._tenant = None
+            # a provider built for the old settings keeps its own holder: whatever it still
+            # prompts for is not this connection's sign-in and is not shown
+            self._sign_ins = SignIns()
         for value in (cfg.client_secret, cfg.mailcow_api_key):
             self._secrets.add(value)
 

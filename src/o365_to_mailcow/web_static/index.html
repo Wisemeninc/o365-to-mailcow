@@ -485,6 +485,7 @@
     authFailed: false,
     status: null,
     statusGen: 0,
+    statusSeq: 0,
     savedRows: [],
     selectionDigest: null,
     selectionPath: "",
@@ -883,7 +884,11 @@
   };
 
   const loadStatus = async () => {
+    const seq = ++state.statusSeq;
     const data = await api("GET", "/api/status");
+    if (seq !== state.statusSeq) {
+      return; // a newer status request is out: this older answer must not undo what it shows
+    }
     if (!isObject(data)) {
       throw badResponse("/api/status");
     }
@@ -1360,9 +1365,9 @@
     const delegated = isObject(state.status) && state.status.auth_mode === "delegated";
     let watching = delegated;
     const watch = () => {
-      if (watching) {
+      if (watching && !state.authFailed) {
         loadStatus().catch(reportError).finally(() => {
-          if (watching) {
+          if (watching && !state.authFailed) {
             setTimeout(watch, 2000);
           }
         });
@@ -1479,7 +1484,9 @@
       btnRefresh.disabled = false;
       if (watching) {
         watching = false;
-        loadStatus().catch(reportError); // the sign-in has ended or still waits: show which
+        if (!state.authFailed) {
+          loadStatus().catch(reportError); // the sign-in has ended or still waits: show which
+        }
       }
     }
   };

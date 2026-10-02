@@ -2093,6 +2093,105 @@ def test_an_earlier_listing_ending_keeps_a_later_listings_prompt(tmp_path):
     assert app.status()["sign_in"] is None
 
 
+def _in_thread(fn) -> None:
+    thread = threading.Thread(target=fn)
+    thread.start()
+    thread.join(5)
+    assert not thread.is_alive()
+
+
+def test_a_later_sign_in_ending_first_brings_back_the_one_still_waiting(tmp_path):
+    """The opposite order: the second flow ends while the first still waits (Load pressed
+    again after the first browser request timed out). The first code must show again."""
+    cfg = make_config(tmp_path, auth_mode="delegated", client_secret=None, mailboxes=())
+    app = web.WebApp(cfg, TOKEN, PAGE, out=io.StringIO())
+    relay = web._SignInRelay(app)
+    relay.sign_in_prompt(DEVICE_URL, "FIRST-CODE", 900)  # this thread still waits
+    second = threading.Event()
+
+    def later() -> None:
+        relay.sign_in_prompt(DEVICE_URL, "SECOND-CODE", 900)
+        second.set()
+
+    done = threading.Event()
+
+    def later_whole() -> None:
+        later()
+        assert app.status()["sign_in"]["code"] == "SECOND-CODE"  # the newest is shown
+        relay.sign_in_done()
+        done.set()
+
+    _in_thread(later_whole)
+    assert second.is_set() and done.is_set()
+    assert app.status()["sign_in"]["code"] == "FIRST-CODE"
+    relay.sign_in_done()
+    assert app.status()["sign_in"] is None
+
+
+def test_job_output_keeps_each_threads_prompt_apart():
+    """Mailbox workers can each re-enter the device flow: one finishing must not clear the
+    code another is still waiting on."""
+    out = web.JobOutput(lambda s: s)
+    out.sign_in_prompt(DEVICE_URL, "WORKER-A", 900)
+
+    def worker_b() -> None:
+        out.sign_in_prompt(DEVICE_URL, "WORKER-B", 900)
+        assert out.sign_in()["code"] == "WORKER-B"
+        out.sign_in_done()
+
+    _in_thread(worker_b)
+    assert out.sign_in()["code"] == "WORKER-A"
+    out.close()
+    assert out.sign_in() is None
+
+
+def test_a_settings_change_retires_the_old_connections_prompt(tmp_path):
+    """A listing waits in a device flow, then the connection settings change: the old
+    connection's code is no longer shown, and what its provider still reports is ignored."""
+    cfg = make_config(tmp_path, auth_mode="delegated", client_secret=None, mailboxes=())
+    app = web.WebApp(cfg, TOKEN, PAGE, out=io.StringIO())
+    old = web._SignInRelay(app)
+    old.sign_in_prompt(DEVICE_URL, "OLD-CODE", 900)
+    assert app.status()["sign_in"]["code"] == "OLD-CODE"
+    app._discard_sign_ins()  # what a host, id or mode change does before reloading
+    assert app.status()["sign_in"] is None
+    old.sign_in_prompt(DEVICE_URL, "OLD-AGAIN", 900)  # the obsolete provider prompts again
+    assert app.status()["sign_in"] is None
+    new = web._SignInRelay(app)
+    new.sign_in_prompt(DEVICE_URL, "NEW-CODE", 900)
+    assert app.status()["sign_in"]["code"] == "NEW-CODE"
+    old.sign_in_done()  # the old flow ending does not touch the new connection's prompt
+    assert app.status()["sign_in"]["code"] == "NEW-CODE"
+
+
+def test_pending_sign_ins_are_bounded(monkeypatch):
+    """Many flows waiting at once (threads that are all still alive): the oldest go."""
+    monkeypatch.setattr(web, "MAX_SIGN_INS", 4)
+    holder = web.SignIns()
+    release = threading.Event()
+    threads = []
+    for i in range(7):
+        prompted = threading.Event()
+
+        def waiter(i=i, prompted=prompted) -> None:
+            holder.prompt(DEVICE_URL, f"CODE-{i}", 900)
+            prompted.set()
+            release.wait(5)
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        threads.append(thread)
+        assert prompted.wait(5)  # one after the other: insertion order is the age
+    assert sorted(p["code"] for p in holder._pending.values()) == [
+        "CODE-3", "CODE-4", "CODE-5", "CODE-6"]
+    assert holder.current()["code"] == "CODE-6"
+    release.set()
+    for thread in threads:
+        thread.join(5)
+    holder.clear()
+    assert holder.current() is None
+
+
 class _AnyStr:
     def __eq__(self, other: object) -> bool:
         return isinstance(other, str)
