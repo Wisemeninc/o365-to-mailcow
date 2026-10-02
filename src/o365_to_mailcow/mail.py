@@ -617,10 +617,6 @@ class MailMigrator:
         queue, self._label_queue = self._label_queue, []
         failures = 0
         for fid, gid, place in queue:
-            if failures >= LABEL_LOOKUP_FAILURES:
-                log.warning("%s: %d message title lookup(s) failed; the remaining failed "
-                            "messages are listed without a title", self._src, failures)
-                return
             try:
                 if self._state.message_status(self._src, fid, gid) not in (
                         STATUS_FAILED, STATUS_SKIPPED):
@@ -635,8 +631,14 @@ class MailMigrator:
                                        headers=PREFER_IMMUTABLE)
                 title, hint = message_label(meta if isinstance(meta, dict) else {})
                 self._state.set_label(self._src, "mail", fid, gid, place, title, hint)
-            except Exception:  # noqa: BLE001 - a label must never change an outcome
+            except Exception as exc:  # noqa: BLE001 - a label must never change an outcome
+                if isinstance(exc, GraphError) and exc.status == 404:
+                    continue  # Graph is healthy; this one item was deleted at source
                 failures += 1
+                if failures >= LABEL_LOOKUP_FAILURES:
+                    log.warning("%s: %d message title lookup(s) failed; the remaining failed "
+                                "messages are listed without a title", self._src, failures)
+                    return
 
     def _fill_failed_items(self, result: MailResult | MailVerify) -> None:
         try:

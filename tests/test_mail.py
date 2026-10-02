@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from datetime import UTC, datetime
 
@@ -688,6 +689,52 @@ def test_lookups_stop_after_three_failures(env):
     assert len(label_lookups(graph)) == 3
     assert res.total("failed") == 5 and res.failed_items_total == 5
     assert {i["hint"] for i in res.failed_items} == {"received 2024-01-02 03:04 UTC"}
+
+
+def test_lookup_404s_do_not_trip_the_breaker(env):
+    cfg, state, world, graph = env
+    msgs = _many(5)
+    graph.routes[f"{U}/mailFolders/f-inbox/messages"] = msgs
+    for m in msgs:
+        graph.routes[f"{U}/messages/{m['id']}/$value"] = GraphError(500, "boom", "x")
+        graph.routes[f"{U}/messages/{m['id']}"] = GraphError(404, "not found", "x")
+    res = migrator(cfg, state, world, graph).migrate()
+    assert len(label_lookups(graph)) == 5
+    assert res.total("failed") == 5 and res.failed_items_total == 5
+    assert len(res.failed_items) == 5
+    assert {i["hint"] for i in res.failed_items} == {"received 2024-01-02 03:04 UTC"}
+
+
+def test_breaker_counts_only_non_404_lookup_failures(env):
+    cfg, state, world, graph = env
+    msgs = _many(7)
+    graph.routes[f"{U}/mailFolders/f-inbox/messages"] = msgs
+    for i, m in enumerate(msgs):
+        graph.routes[f"{U}/messages/{m['id']}/$value"] = GraphError(500, "boom", "x")
+        status = 404 if i % 2 == 0 else 503
+        detail = "not found" if status == 404 else "unavailable"
+        graph.routes[f"{U}/messages/{m['id']}"] = GraphError(status, detail, "x")
+    res = migrator(cfg, state, world, graph).migrate()
+    assert label_lookups(graph) == [f"{U}/messages/{m['id']}" for m in msgs[:6]]
+    assert res.total("failed") == 7 and res.failed_items_total == 7
+
+
+def test_breaker_warning_is_logged_when_the_last_item_trips_it(env, caplog):
+    cfg, state, world, graph = env
+    msgs = _many(3)
+    subjects = [f"never-log-{i}" for i in range(3)]
+    for msg, subject in zip(msgs, subjects, strict=True):
+        msg["subject"] = subject
+    graph.routes[f"{U}/mailFolders/f-inbox/messages"] = msgs
+    for m in msgs:
+        graph.routes[f"{U}/messages/{m['id']}/$value"] = GraphError(500, "boom", "x")
+        graph.routes[f"{U}/messages/{m['id']}"] = GraphError(503, "unavailable", "x")
+    caplog.set_level(logging.WARNING, logger="o365_to_mailcow.mail")
+    migrator(cfg, state, world, graph).migrate()
+    warnings = [r for r in caplog.records if "title lookup(s) failed" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "3 message title lookup(s) failed" in warnings[0].getMessage()
+    assert all(subject not in caplog.text for subject in subjects)
 
 
 def test_successful_run_makes_no_lookup_and_lists_nothing(env):
