@@ -59,11 +59,14 @@ class FakeApp:
 
     def initiate_device_flow(self, scopes):
         self.calls.append(("device", scopes))
-        return {"user_code": "ABCD", "message": "Go to https://microsoft.com/devicelogin "
-                                                "and enter ABCD"}
+        return {"user_code": "ABCD", "verification_uri": "https://microsoft.com/devicelogin",
+                "expires_in": 900,
+                "message": "Go to https://microsoft.com/devicelogin and enter ABCD"}
 
     def acquire_token_by_device_flow(self, flow):
         self.calls.append(("device_token", flow["user_code"]))
+        if isinstance(self.result, Exception):
+            raise self.result
         return self.result
 
 
@@ -158,6 +161,95 @@ def test_invalidate_removes_access_tokens(tmp_path):
     tp = TokenProvider(make_config(tmp_path))
     tp.invalidate()
     assert tp._cache.removed == [{"secret": "at-1"}, {"secret": "at-2"}]
+
+
+class HookOut:
+    """A stream with the two optional sign-in hooks, recording the order of events."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.events: list[tuple] = []
+        self.text = io.StringIO()
+        self.fail = fail
+
+    def write(self, text: str) -> int:
+        self.events.append(("write",))
+        return self.text.write(text)
+
+    def flush(self) -> None:
+        pass
+
+    def sign_in_prompt(self, uri, code, expires_in) -> None:
+        self.events.append(("prompt", uri, code, expires_in))
+        if self.fail:
+            raise RuntimeError("hook broke")
+
+    def sign_in_done(self) -> None:
+        self.events.append(("done",))
+        if self.fail:
+            raise RuntimeError("hook broke")
+
+
+def _delegated(tmp_path, out) -> TokenProvider:
+    return TokenProvider(make_config(tmp_path, auth_mode="delegated", client_secret=None),
+                         out=out)
+
+
+PROMPT = ("prompt", "https://microsoft.com/devicelogin", "ABCD", 900)
+
+
+def test_sign_in_hooks_get_the_flow_data_and_bracket_the_wait(tmp_path):
+    out = HookOut()
+    tp = _delegated(tmp_path, out)
+    app = FakeApp.instances[0]
+    seen_during: list = []
+    original = app.acquire_token_by_device_flow
+
+    def acquire(flow):
+        seen_during.extend(out.events)
+        return original(flow)
+
+    app.acquire_token_by_device_flow = acquire
+    assert tp.get_token() == "tok"
+    assert PROMPT in seen_during and ("done",) not in seen_during  # still waiting
+    assert out.events[-1] == ("done",)
+    assert out.events.index(PROMPT) > 0  # after Microsoft's message was printed
+    assert "Go to https://microsoft.com/devicelogin and enter ABCD" in out.text.getvalue()
+
+
+def test_sign_in_done_is_called_when_the_device_flow_raises(tmp_path):
+    out = HookOut()
+    tp = _delegated(tmp_path, out)
+    FakeApp.instances[0].result = RuntimeError("network down")
+    with pytest.raises(RuntimeError, match="network down"):
+        tp.get_token()
+    assert [e for e in out.events if e[0] != "write"] == [PROMPT, ("done",)]
+
+
+def test_a_plain_stream_still_gets_the_message_and_no_hooks(tmp_path):
+    out = io.StringIO()
+    assert _delegated(tmp_path, out).get_token() == "tok"
+    assert "Go to https://microsoft.com/devicelogin and enter ABCD" in out.getvalue()
+
+
+def test_a_non_callable_hook_attribute_is_ignored(tmp_path):
+    out = io.StringIO()
+    out.sign_in_prompt = "not callable"  # type: ignore[attr-defined]
+    out.sign_in_done = None  # type: ignore[attr-defined]
+    assert _delegated(tmp_path, out).get_token() == "tok"
+
+
+def test_a_raising_hook_never_breaks_the_sign_in(tmp_path):
+    out = HookOut(fail=True)
+    assert _delegated(tmp_path, out).get_token() == "tok"
+    assert [e for e in out.events if e[0] != "write"] == [PROMPT, ("done",)]
+
+
+def test_silent_sign_in_calls_no_hooks(tmp_path):
+    out = HookOut()
+    tp = _delegated(tmp_path, out)
+    FakeApp.instances[0].accounts = [{"username": "admin"}]
+    assert tp.get_token() == "silent-tok"
+    assert out.events == []
 
 
 def test_no_write_scope_anywhere_in_src_isc_27():

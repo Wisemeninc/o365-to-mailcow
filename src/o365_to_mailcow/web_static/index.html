@@ -181,6 +181,11 @@
     pre#job-output { margin: 0 0 12px; padding: 12px; max-height: 50vh; min-height: 6rem; overflow: auto; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
     summary { min-height: 44px; display: flex; align-items: center; font-weight: 600; cursor: pointer; }
     .log { padding-top: 4px; }
+    .signin { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; border: 1px solid var(--warn); border-radius: 6px; background: var(--warn-bg); overflow-wrap: anywhere; }
+    .signin ol { margin: 0; padding-left: 22px; }
+    .signin li + li { margin-top: 8px; }
+    .signin a { color: var(--accent); font-weight: 600; }
+    .si-code { display: inline-block; margin: 0 12px 0 4px; font-size: 26px; font-weight: 700; letter-spacing: 0.08em; vertical-align: middle; user-select: all; }
 
     /* mailbox detail */
     .kv2 { display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; font-variant-numeric: tabular-nums; }
@@ -293,6 +298,7 @@
             </div>
             <button id="btn-job-close" type="button" hidden>Close</button>
           </div>
+          <div id="job-signin" class="signin" aria-live="polite" hidden></div>
           <div id="job-prog" class="stack" hidden>
             <div class="j-line"><p id="job-count" class="h-xl"></p><span id="job-rate" class="muted"></span></div>
             <progress id="job-progress" max="1" value="0" aria-label="Overall progress"></progress>
@@ -369,6 +375,7 @@
           </div>
         </div>
         <p id="tenant-status" class="msg" aria-live="polite"></p>
+        <div id="tenant-signin" class="signin" aria-live="polite" hidden></div>
 
         <div id="tenant-filters" class="row" hidden>
           <label for="f-search">Search</label>
@@ -547,6 +554,8 @@
         name === "step" ||
         name === "placeholder" ||
         name === "href" ||
+        name === "target" ||
+        name === "rel" ||
         name === "download" ||
         name === "htmlFor" ||
         name === "colSpan" ||
@@ -819,6 +828,60 @@
     node.className = "msg" + (kind === "error" ? " error" : kind === "ok" ? " ok" : "");
   };
 
+  // ==== device-code sign-in callout (job view and selection panel) ====
+  const signInCallout = (s) => {
+    let href = null;
+    try {
+      href = isStr(s.url) && new URL(s.url).protocol === "https:" ? s.url : null;
+    } catch (_err) {
+      href = null;
+    }
+    const code = el("code", { className: "si-code", text: s.code });
+    const copy = el("button", { type: "button", text: "Copy code" });
+    copy.addEventListener("click", () => {
+      const select = () => {
+        const range = document.createRange();
+        range.selectNodeContents(code);
+        const sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+      };
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+        select();
+        return;
+      }
+      navigator.clipboard.writeText(s.code).then(() => {
+        copy.textContent = "Copied";
+        setTimeout(() => {
+          copy.textContent = "Copy code";
+        }, 2000);
+      }, select);
+    });
+    const expires = isStr(s.expires) ? Date.parse(s.expires) : Number.NaN;
+    return [
+      el("h3", { text: "Sign in to Microsoft to continue" }),
+      el("ol", {}, [
+        el("li", {}, href ? ["Open ", el("a", { href, target: "_blank", rel: "noopener noreferrer", text: href })]
+          : "Open the device sign-in page named in the log"),
+        el("li", {}, ["Enter the code ", code, copy]),
+      ]),
+      el("p", { className: "muted small", text: "This continues by itself once you have signed in." +
+        (Number.isFinite(expires) ? " The code expires at " + new Date(expires).toLocaleTimeString() + "." : "") }),
+    ];
+  };
+
+  const signInShown = {};
+  const showSignIn = (id, s) => {
+    const ok = isObject(s) && isStr(s.code);
+    const key = ok ? JSON.stringify([s.url, s.code, s.expires]) : "";
+    if (signInShown[id] === key) {
+      return; // unchanged: keep the Copy button's state and focus across polls
+    }
+    signInShown[id] = key;
+    $(id).replaceChildren(...(ok ? signInCallout(s) : []));
+    $(id).hidden = !ok;
+  };
+
   const loadStatus = async () => {
     const data = await api("GET", "/api/status");
     if (!isObject(data)) {
@@ -853,6 +916,7 @@
     };
     chip("chip-ms", "Microsoft 365 · " + (data.auth_mode === "delegated" ? "delegated" : "app-only"));
     chip("chip-mc", "mailcow" + (data.mailcow_host ? " · " + data.mailcow_host : ""));
+    showSignIn("tenant-signin", data.sign_in);
     if (!configured && !state.connOpen) {
       setConnOpen(true, false);
     }
@@ -1292,6 +1356,21 @@
     btnLoad.disabled = true;
     btnRefresh.disabled = true;
     setMsg($("tenant-status"), "Loading…");
+    // delegated: the server may wait in a device-code sign-in; /api/status carries its code
+    const delegated = isObject(state.status) && state.status.auth_mode === "delegated";
+    let watching = delegated;
+    const watch = () => {
+      if (watching) {
+        loadStatus().catch(reportError).finally(() => {
+          if (watching) {
+            setTimeout(watch, 2000);
+          }
+        });
+      }
+    };
+    if (watching) {
+      setTimeout(watch, 2000);
+    }
 
     try {
       const data = await api(
@@ -1390,10 +1469,18 @@
       }
       setMsg($("tenant-status"), text);
     } catch (err) {
-      setMsg($("tenant-status"), err.message, "error");
+      if (delegated && !$("tenant-signin").hidden && / no answer within /.test(err.message)) {
+        setMsg($("tenant-status"), "Sign in with the code above, then press Load again.");
+      } else {
+        setMsg($("tenant-status"), err.message, "error");
+      }
     } finally {
       btnLoad.disabled = false;
       btnRefresh.disabled = false;
+      if (watching) {
+        watching = false;
+        loadStatus().catch(reportError); // the sign-in has ended or still waits: show which
+      }
     }
   };
 
@@ -2006,6 +2093,7 @@
       : outcome ? outcome.text : cmdName(d.command) + " finished";
     $("job-args").textContent = args.join(" ");
     $("btn-job-close").hidden = d.running;
+    showSignIn("job-signin", d.running ? d.sign_in : null);
     renderProgress(d, dry);
 
     const pre = $("job-output");
@@ -2096,6 +2184,7 @@
         $("job-title").textContent = cmdName(state.job.command) + ": no longer tracked";
         $("job-state").textContent = "The server restarted and no longer knows this job. Its state is on disk; a new run resumes it.";
         $("job-rate").textContent = "";
+        showSignIn("job-signin", null);
         $("btn-job-close").hidden = false; // watching again would only meet the same 404
         updateRunButtons();
         loadJobs().catch(reportError);
@@ -2135,6 +2224,7 @@
     $("job-state").textContent = "loading…";
     $("job-args").textContent = "";
     $("job-prog").hidden = true;
+    showSignIn("job-signin", null);
     clear($("job-cards"));
     $("job-more").hidden = true;
     $("btn-job-close").hidden = true;

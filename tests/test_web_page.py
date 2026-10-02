@@ -210,6 +210,8 @@ def test_expected_controls_exist() -> None:
         "hdr-job",
         "settings-section",
         "tenant-section",
+        "job-signin",
+        "tenant-signin",
     }
     missing_ids = sorted(required_ids.difference(ids))
     assert not missing_ids, "Missing required ids: " + ", ".join(missing_ids)
@@ -240,6 +242,17 @@ def test_expected_controls_exist() -> None:
 
     live = [attrs for _, attrs in TAGS if "aria-live" in attrs]
     assert len(live) >= 5, f"Expected at least five aria-live regions, found {len(live)}"
+
+
+def test_sign_in_callout_markers() -> None:
+    """The device-code callout opens Microsoft's page safely and only over https."""
+    assert "noopener" in SCRIPT_TEXT, "The sign-in link must use rel=noopener"
+    assert '"https:"' in SCRIPT_TEXT, "The sign-in link must be checked for the https: scheme"
+    assert "navigator.clipboard" in SCRIPT_TEXT, "Copy code must use the clipboard API"
+    for element_id in ("job-signin", "tenant-signin"):
+        attrs = next(a for _, a in TAGS if a.get("id") == element_id)
+        assert "hidden" in attrs, f"#{element_id} must be hidden by default"
+        assert attrs.get("aria-live") == "polite", f"#{element_id} must be aria-live=polite"
 
 
 def test_cancel_is_the_run_sheets_default_button() -> None:

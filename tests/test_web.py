@@ -16,6 +16,7 @@ import stat
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -295,7 +296,7 @@ def test_status_has_settings_and_no_secrets_isc_166(client, tmp_path):
         "version": __version__, "auth_mode": "app", "mailcow_host": "mail.example.net",
         "state_dir": str(tmp_path / "state"),
         "selection_path": str(tmp_path / "state" / "mailboxes.csv"), "running_job": None,
-        "configured": True,
+        "configured": True, "sign_in": None,
     }
     for secret in SECRETS:
         assert secret not in r.body.decode()
@@ -1817,3 +1818,284 @@ def test_redacting_mailbox_keys_keeps_entries_apart_and_field_names_intact(tmp_p
     ok = _verify_report(10, 0)  # entries carry a "status" field: it must still be read
     _write_report(cfg.state_dir, "2.json", ok, 2_000)
     assert app.overview()["latest"]["headline"]["text"] == "Everything arrived"
+
+
+# -- device-code sign-in callout --------------------------------------------------------
+
+NOW = datetime(2026, 10, 2, 12, 0, 0, tzinfo=UTC)
+DEVICE_URL = "https://microsoft.com/devicelogin"
+
+
+@pytest.mark.parametrize("uri", [
+    DEVICE_URL,
+    "https://www.microsoft.com/devicelogin",
+    "https://login.microsoftonline.com/common/oauth2/deviceauth",
+    "https://login.microsoftonline.us/common/oauth2/deviceauth",
+    "https://login.partner.microsoftonline.cn/common/oauth2/deviceauth",
+    "https://aka.ms/devicelogin",
+    "https://MICROSOFT.com/devicelogin",  # the host is compared lower-cased
+    "https://microsoft.com:443/devicelogin",
+    "https://microsoft.com",
+])
+def test_sign_in_prompt_keeps_an_allowed_url(uri):
+    assert web.sign_in_prompt(uri, "ABCD-1234", 900, now=NOW) == {
+        "url": uri, "code": "ABCD-1234", "expires": "2026-10-02T12:15:00+00:00"}
+
+
+@pytest.mark.parametrize("uri", [
+    "http://microsoft.com/devicelogin",
+    "https://user@microsoft.com/devicelogin",
+    "https://user:pw@microsoft.com/devicelogin",
+    "https://microsoft.com:8443/devicelogin",
+    "https://microsoft.com:99999/devicelogin",  # an invalid port must not raise
+    "https://microsoft.com/devicelogin?next=evil",
+    "https://microsoft.com/devicelogin?",
+    "https://microsoft.com/devicelogin#frag",
+    "https://evil.example/devicelogin",
+    "https://microsoft.com.evil.example/devicelogin",
+    "https://evilmicrosoft.com/devicelogin",
+    "https://microsoft.com./devicelogin",
+    "https://evil.example\\@microsoft.com/",
+    "https://microsoft.com/device login",
+    "https://microsoft.com/device%20login",
+    "https://micro\nsoft.com/devicelogin",  # urlsplit drops the newline; we must not
+    "https://microsoft.com/" + "a" * 101,
+    "https://microsoft.com/" + "a" * 200,
+    "https://[::1]/devicelogin",
+    "https://[::1/devicelogin",  # unparsable
+    "javascript:alert(1)",
+    "//microsoft.com/devicelogin",
+    "microsoft.com/devicelogin",
+    "",
+    None, 42, b"https://microsoft.com/devicelogin", ["x"], {"url": DEVICE_URL},
+])
+def test_sign_in_prompt_drops_any_other_url(uri):
+    assert web.sign_in_prompt(uri, "ABCD1234", 900, now=NOW) == {
+        "url": None, "code": "ABCD1234", "expires": "2026-10-02T12:15:00+00:00"}
+
+
+@pytest.mark.parametrize("code", [
+    "ABC", "A" * 33, "AB CD", "<b>ABCD</b>", "ABCD\n", "ABCDÄ", "", None, 1234, b"ABCD",
+    ["ABCD"],
+])
+def test_sign_in_prompt_without_a_valid_code_is_none(code):
+    assert web.sign_in_prompt(DEVICE_URL, code, 900, now=NOW) is None
+
+
+@pytest.mark.parametrize("code", ["ABCD", "A" * 32, "a-b-9Z"])
+def test_sign_in_prompt_code_bounds(code):
+    assert web.sign_in_prompt(DEVICE_URL, code, 900, now=NOW)["code"] == code
+
+
+@pytest.mark.parametrize(("expires_in", "expires"), [
+    (1, "2026-10-02T12:00:01+00:00"),
+    (3600, "2026-10-02T13:00:00+00:00"),
+    (0, None), (-5, None), (3601, None), (900.0, None), ("900", None), (True, None),
+    (None, None), (10 ** 30, None),
+])
+def test_sign_in_prompt_expiry(expires_in, expires):
+    assert web.sign_in_prompt(DEVICE_URL, "ABCD", expires_in, now=NOW)["expires"] == expires
+
+
+def test_sign_in_prompt_defaults_to_the_current_time():
+    got = web.sign_in_prompt(DEVICE_URL, "ABCD", 60)
+    expires = datetime.fromisoformat(got["expires"])
+    assert expires.utcoffset() == timedelta(0)
+    assert 0 < (expires - datetime.now(UTC)).total_seconds() <= 60
+
+
+def test_job_output_sign_in_lifecycle():
+    out = web.JobOutput(lambda s: s)
+    assert out.sign_in() is None
+    out.sign_in_prompt(DEVICE_URL, "ABCD-EFGH", 900)
+    got = out.sign_in()
+    assert got["url"] == DEVICE_URL and got["code"] == "ABCD-EFGH" and got["expires"]
+    got["code"] = "changed"  # a copy: callers cannot change the stored prompt
+    assert out.sign_in()["code"] == "ABCD-EFGH"
+    out.sign_in_done()
+    assert out.sign_in() is None
+    out.sign_in_prompt(DEVICE_URL, "ABCD-EFGH", 900)
+    out.close()
+    assert out.sign_in() is None
+    out.sign_in_prompt(DEVICE_URL, "ABCD-EFGH", 900)
+    out.sign_in_prompt(DEVICE_URL, "bad code", 900)  # invalid: replaces it with no callout
+    assert out.sign_in() is None
+
+
+@pytest.mark.parametrize("args", [
+    (None, None, None), (object(), object(), object()), ("x" * 10_000, "y" * 10_000, 10 ** 100),
+    ("https://[", "ABCD-", float("nan")),
+])
+def test_job_output_sign_in_hooks_never_raise(args):
+    out = web.JobOutput(lambda s: s)
+    out.sign_in_prompt(*args)
+    out.sign_in_done()
+    out.sign_in_done()
+    assert out.sign_in() is None
+
+
+def test_job_output_sign_in_prompt_survives_a_failing_validation(monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(web, "sign_in_prompt", broken)
+    out = web.JobOutput(lambda s: s)
+    out.sign_in_prompt(DEVICE_URL, "ABCD", 900)
+    assert out.sign_in() is None
+
+
+def test_running_job_detail_carries_the_sign_in_prompt(client, monkeypatch):
+    release, prompted = threading.Event(), threading.Event()
+
+    def main(argv=None, *, stdout=None, stderr=None):
+        print("To sign in, open the page and enter the code ABCD-EFGH", file=stdout)
+        stdout.sign_in_prompt(DEVICE_URL, "ABCD-EFGH", 900)
+        prompted.set()
+        release.wait(15)
+        stdout.sign_in_done()
+        return 0
+
+    monkeypatch.setattr(cli, "main", main)
+    try:
+        digest = _saved(client)
+        job_id = client.post("/api/jobs", {"command": "plan",
+                                           "selection_digest": digest}).json()["id"]
+        assert prompted.wait(5)
+        running = client.get(f"/api/jobs/{job_id}").json()
+        assert running["running"] is True
+        assert running["sign_in"]["url"] == DEVICE_URL
+        assert running["sign_in"]["code"] == "ABCD-EFGH"
+        assert all("sign_in" not in j for j in client.get("/api/jobs").json())
+    finally:
+        release.set()
+    assert wait_job(client, job_id)["sign_in"] is None
+    assert all("sign_in" not in j for j in client.get("/api/jobs").json())
+
+
+def test_finished_job_never_shows_a_prompt_left_behind(client, monkeypatch):
+    def main(argv=None, *, stdout=None, stderr=None):
+        stdout.sign_in_prompt(DEVICE_URL, "ABCD-EFGH", 900)  # never says done
+        return 1
+
+    monkeypatch.setattr(cli, "main", main)
+    digest = _saved(client)
+    job_id = client.post("/api/jobs", {"command": "plan",
+                                       "selection_digest": digest}).json()["id"]
+    assert wait_job(client, job_id)["sign_in"] is None
+
+
+@pytest.fixture
+def delegated(tmp_path, conf, monkeypatch):
+    """A server in delegated mode whose tenant listing blocks in a device-code sign-in."""
+    gate = {"release": threading.Event(), "prompted": threading.Event(), "out": None}
+
+    class PromptingTokens:
+        def __init__(self, cfg, cache_path=None, out=None) -> None:
+            gate["out"] = out
+
+        def get_token(self) -> str:
+            out = gate["out"]
+            print("To sign in, use a web browser and enter the code ABCD-EFGH", file=out,
+                  flush=True)
+            out.sign_in_prompt(DEVICE_URL, "ABCD-EFGH", 900)
+            gate["prompted"].set()
+            try:
+                gate["release"].wait(15)
+            finally:
+                out.sign_in_done()
+            return "tok"
+
+    class Graph:
+        def __init__(self, tokens) -> None:
+            self.tokens = tokens
+
+        def iter_pages(self, path, params=None):
+            self.tokens.get_token()
+            return iter(USERS)
+
+    monkeypatch.setattr(web, "TokenProvider", PromptingTokens)
+    monkeypatch.setattr(web, "GraphClient", Graph)
+    page = tmp_path / "index.html"
+    page.write_text(PAGE, encoding="utf-8")
+    cfg = make_config(tmp_path, auth_mode="delegated", client_secret=None,
+                      mailcow_api_key=API_KEY, mailboxes=())
+    err = io.StringIO()
+    srv = web.make_server(cfg, "127.0.0.1", 0, TOKEN, page, config_path=str(conf), out=err)
+    thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05},
+                              daemon=True)
+    thread.start()
+    c = Client(srv.server_address[1])
+    c.err, c.gate = err, gate
+    yield c
+    gate["release"].set()
+    srv.shutdown()
+    srv.server_close()
+    thread.join(5)
+
+
+def test_tenant_listing_sign_in_shows_in_status_while_it_blocks(delegated):
+    assert delegated.get("/api/status").json()["sign_in"] is None
+    result: dict = {}
+    loader = threading.Thread(target=lambda: result.update(
+        resp=delegated.get("/api/tenant/mailboxes")), daemon=True)
+    loader.start()
+    assert delegated.gate["prompted"].wait(5)
+    status = delegated.get("/api/status").json()
+    assert status["auth_mode"] == "delegated"
+    assert status["sign_in"]["url"] == DEVICE_URL and status["sign_in"]["code"] == "ABCD-EFGH"
+    delegated.gate["release"].set()
+    loader.join(10)
+    assert result["resp"].status == 200
+    assert delegated.get("/api/status").json()["sign_in"] is None
+    # the relay still forwards Microsoft's text to the server's own output
+    assert "enter the code ABCD-EFGH" in delegated.err.getvalue()
+
+
+def test_sign_in_relay_falls_back_to_stderr(tmp_path, capsys):
+    cfg = make_config(tmp_path, auth_mode="delegated", client_secret=None, mailboxes=())
+    app = web.WebApp(cfg, TOKEN, PAGE)  # no `out`
+    relay = web._SignInRelay(app)
+    print("hello relay", file=relay, flush=True)
+    assert "hello relay" in capsys.readouterr().err
+    relay.sign_in_prompt(DEVICE_URL, "not valid!", 900)
+    assert app.status()["sign_in"] is None
+    relay.sign_in_prompt("https://evil.example/", "ABCD", 900)
+    assert app.status()["sign_in"] == {"url": None, "code": "ABCD", "expires": ANY_STR}
+    relay.sign_in_prompt(object(), object(), object())  # never raises
+    relay.sign_in_done()
+    assert app.status()["sign_in"] is None
+
+
+def test_an_earlier_listing_ending_keeps_a_later_listings_prompt(tmp_path):
+    """Two tenant loads can overlap (Load pressed again while the first one still waits):
+    the first sign-in ending must not hide the code the second one is waiting on."""
+    cfg = make_config(tmp_path, auth_mode="delegated", client_secret=None, mailboxes=())
+    app = web.WebApp(cfg, TOKEN, PAGE, out=io.StringIO())
+    relay = web._SignInRelay(app)
+    first_prompted, second_prompted, first_done = (threading.Event() for _ in range(3))
+
+    def first() -> None:
+        relay.sign_in_prompt(DEVICE_URL, "FIRST-CODE", 900)
+        first_prompted.set()
+        assert second_prompted.wait(5)
+        relay.sign_in_done()
+        first_done.set()
+
+    thread = threading.Thread(target=first)
+    thread.start()
+    assert first_prompted.wait(5)
+    relay.sign_in_prompt(DEVICE_URL, "SECOND-CODE", 900)  # this (test) thread is the second
+    second_prompted.set()
+    assert first_done.wait(5)
+    thread.join(5)
+    assert app.status()["sign_in"]["code"] == "SECOND-CODE"
+    relay.sign_in_done()
+    assert app.status()["sign_in"] is None
+
+
+class _AnyStr:
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, str)
+
+
+ANY_STR = _AnyStr()

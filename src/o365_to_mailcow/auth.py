@@ -13,6 +13,7 @@ MSAL refreshes tokens itself; callers simply ask for a token before every reques
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
@@ -30,7 +31,14 @@ class AuthError(Exception):
 
 
 class TokenProvider:
-    """Returns a valid bearer token for Microsoft Graph, refreshing as needed."""
+    """Returns a valid bearer token for Microsoft Graph, refreshing as needed.
+
+    ``out`` (default stdout) receives Microsoft's device-code message in delegated mode.
+    It may also offer two optional methods, called only if present and callable, whose
+    exceptions are ignored: ``sign_in_prompt(verification_uri, user_code, expires_in)``
+    right after the message (the values as MSAL's flow gave them, unchecked), and
+    ``sign_in_done()`` once the device flow has ended, whether it succeeded or raised.
+    """
 
     def __init__(self, cfg: Config, cache_path: Path | None = None, out=None) -> None:
         self._cfg = cfg
@@ -99,7 +107,19 @@ class TokenProvider:
         if "user_code" not in flow:
             raise AuthError(f"device flow failed: {flow.get('error_description', flow)}")
         print(flow["message"], file=self._out, flush=True)
-        return self._app.acquire_token_by_device_flow(flow)
+        self._hook("sign_in_prompt", flow.get("verification_uri"), flow.get("user_code"),
+                   flow.get("expires_in"))
+        try:
+            return self._app.acquire_token_by_device_flow(flow)
+        finally:
+            self._hook("sign_in_done")
+
+    def _hook(self, name: str, *args: object) -> None:
+        """Call an optional sign-in hook of the output stream; it can never affect sign-in."""
+        hook = getattr(self._out, name, None)
+        if callable(hook):
+            with contextlib.suppress(Exception):
+                hook(*args)
 
     def invalidate(self) -> None:
         """Drop cached access tokens so the next call fetches a fresh one (after a 401)."""

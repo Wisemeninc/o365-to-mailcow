@@ -259,6 +259,10 @@ total, the rate and an estimate of the time left, and a card per mailbox; the ot
 print no item counts, so they show only the last lines of the log. The job runs on the
 server, so closing the page does not stop it.
 
+In delegated mode, the page shows the Microsoft sign-in link and the device code in a
+callout with a Copy button, both when a job starts and when the tenant list is loaded. The
+callout disappears once the sign-in has ended.
+
 ```sh
 docker compose up -d web
 docker compose logs web    # web UI: http://0.0.0.0:8080/#token=<token>

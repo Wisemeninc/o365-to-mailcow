@@ -5,7 +5,9 @@ tenant's mailboxes, check which exist in mailcow, save the mailbox list, start c
 watch their output (with live per-mailbox progress and, once done, the headline of the
 report the job itself named in its ``report: <path>`` line) and read the reports, raw or summarised
 for the page (``/api/overview``: the newest run of each step plus the latest report, judged by
-``summary.py``). It is meant for the operator's own machine.
+``summary.py``). In delegated mode a pending device-code sign-in (link and code, validated
+by ``sign_in_prompt``) is ``sign_in`` in a running job's detail and, for the tenant listing,
+in ``/api/status``. It is meant for the operator's own machine.
 
 Security model
 --------------
@@ -56,18 +58,19 @@ import secrets
 import socket
 import socketserver
 import stat
+import sys
 import tempfile
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, TextIO
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 from . import __version__, cli
 from . import config as config_mod
@@ -142,6 +145,15 @@ _PROGRESS_LINE = re.compile(
 # What cli.main prints to stderr in its `finally`: the job's own report, by path.
 _REPORT_LINE = re.compile(r"report: (?P<path>[^\x00]{1,4096})")
 _REPORT_NAME = re.compile(r"[0-9A-Za-z_-]{1,80}\.json")
+# Device-code sign-in: where the callout's link may point, and what a code may look like.
+SIGN_IN_HOSTS = frozenset({"microsoft.com", "www.microsoft.com", "login.microsoftonline.com",
+                           "login.microsoftonline.us", "login.partner.microsoftonline.cn",
+                           "aka.ms"})
+MAX_SIGN_IN_URL = 200
+MAX_SIGN_IN_SECONDS = 3600
+_SIGN_IN_CODE = re.compile(r"[A-Za-z0-9-]{4,32}")
+_SIGN_IN_PATH = re.compile(r"[A-Za-z0-9/_.-]{0,100}")
+_SIGN_IN_CHARS = re.compile(r"[A-Za-z0-9:/._-]+")  # no userinfo, query, escapes or spaces
 
 
 def page_csp(nonce: str) -> str:
@@ -172,6 +184,39 @@ def base_url(host: str, port: int) -> str:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _sign_in_url(uri: object) -> str | None:
+    """``uri`` if it is a plain https link to one of ``SIGN_IN_HOSTS``, else ``None``."""
+    if (not isinstance(uri, str) or len(uri) > MAX_SIGN_IN_URL
+            or not _SIGN_IN_CHARS.fullmatch(uri)):
+        return None
+    try:
+        parts = urlsplit(uri)
+        port = parts.port  # raises ValueError for a port out of range
+    except ValueError:
+        return None
+    if (parts.scheme != "https" or parts.username is not None or parts.password is not None
+            or port not in (None, 443) or (parts.hostname or "").lower() not in SIGN_IN_HOSTS
+            or not _SIGN_IN_PATH.fullmatch(parts.path) or parts.query or parts.fragment):
+        return None
+    return uri
+
+
+def sign_in_prompt(uri: object, code: object, expires_in: object,
+                   now: datetime | None = None) -> dict[str, Any] | None:
+    """What the page's device-code callout may show, from MSAL's flow values: ``None``
+    without a plausible code; the link only if ``_sign_in_url`` accepts it; the expiry as
+    an ISO-8601 UTC time only for a whole number of seconds from 1 to 3600. Never raises
+    on input of any type."""
+    if not isinstance(code, str) or not _SIGN_IN_CODE.fullmatch(code):
+        return None
+    expires = None
+    if (isinstance(expires_in, int) and not isinstance(expires_in, bool)
+            and 1 <= expires_in <= MAX_SIGN_IN_SECONDS):
+        start = now or datetime.now(UTC)
+        expires = (start + timedelta(seconds=expires_in)).isoformat(timespec="seconds")
+    return {"url": _sign_in_url(uri), "code": code, "expires": expires}
 
 
 # -- responses and input validation ------------------------------------------------------
@@ -305,6 +350,7 @@ class JobOutput:
         self._partial = ""
         self._scopes: dict[tuple[str, str], dict[str, Any]] = {}
         self._report_path: str | None = None  # from the job's last "report: <path>" line
+        self._sign_in: dict[str, Any] | None = None  # a device-code prompt being waited on
         self._lock = threading.Lock()
 
     def write(self, text: str) -> int:
@@ -324,11 +370,30 @@ class JobOutput:
         return False
 
     def close(self) -> None:
-        """Store the last line even without a trailing newline."""
+        """Store the last line even without a trailing newline; no sign-in is pending."""
         with self._lock:
+            self._sign_in = None
             if self._partial:
                 self._store(self._partial)
                 self._partial = ""
+
+    # The two optional hooks of auth.TokenProvider: called inside the job's own sign-in,
+    # so they never raise, and never log (the job's log handler writes into this object).
+    def sign_in_prompt(self, uri: object, code: object, expires_in: object) -> None:
+        prompt = None
+        with contextlib.suppress(Exception):
+            prompt = sign_in_prompt(uri, code, expires_in)
+        with self._lock:
+            self._sign_in = prompt
+
+    def sign_in_done(self) -> None:
+        with self._lock:
+            self._sign_in = None
+
+    def sign_in(self) -> dict[str, Any] | None:
+        """The validated device-code prompt the job is waiting on, or ``None``."""
+        with self._lock:
+            return dict(self._sign_in) if self._sign_in else None
 
     def _store(self, line: str) -> None:  # caller holds the lock
         line = self._redact(line.rstrip("\r"))  # redact first: truncation must not split
@@ -456,6 +521,30 @@ def _toml_settings(ms: dict[str, str], mc: dict[str, str]) -> str:
     return "\n".join(lines) + "\n"
 
 
+class _SignInRelay:
+    """``out`` of the tenant listing's ``TokenProvider``: Microsoft's text still goes to the
+    server's own output (``WebApp.out``, else stderr), and the device-code prompt is kept
+    on the app for ``/api/status`` while the sign-in waits."""
+
+    def __init__(self, app: WebApp) -> None:
+        self._app = app
+
+    def _stream(self) -> TextIO:
+        return self._app.out or sys.stderr
+
+    def write(self, text: str) -> int:
+        return self._stream().write(text)
+
+    def flush(self) -> None:
+        self._stream().flush()
+
+    def sign_in_prompt(self, uri: object, code: object, expires_in: object) -> None:
+        self._app._set_sign_in(uri, code, expires_in)
+
+    def sign_in_done(self) -> None:
+        self._app._end_sign_in()
+
+
 class WebApp:
     """What the routes do. ``Handler`` only speaks HTTP and calls into this."""
 
@@ -478,6 +567,8 @@ class WebApp:
         self._latest_summary: tuple[tuple[str, int, int], dict[str, Any]] | None = None
         self._tenant: tuple[float, dict[str, Any]] | None = None
         self._tokens: TokenProvider | None = None
+        self._sign_in: dict[str, Any] | None = None  # the tenant listing's device-code prompt
+        self._sign_in_thread: int | None = None  # the request thread waiting in that sign-in
         self._secrets = cli.SecretFilter()
         for value in (cfg.client_secret, cfg.mailcow_api_key, token):
             self._secrets.add(value)
@@ -510,10 +601,28 @@ class WebApp:
         with self._lock:
             job = self._running()
             running = {"id": job.id, "command": job.command} if job else None
+            sign_in = dict(self._sign_in) if self._sign_in else None
         return {"version": __version__, "auth_mode": self.cfg.auth_mode,
                 "mailcow_host": self.cfg.mailcow_host, "state_dir": str(self.cfg.state_dir),
                 "selection_path": str(self.selection_path), "running_job": running,
-                "configured": self._configured()}
+                "configured": self._configured(), "sign_in": sign_in}
+
+    def _set_sign_in(self, uri: object, code: object, expires_in: object) -> None:
+        """Keep (or, without a valid code, clear) the tenant listing's sign-in prompt.
+        Called from inside that sign-in: never raises."""
+        prompt = None
+        with contextlib.suppress(Exception):
+            prompt = sign_in_prompt(uri, code, expires_in)
+        with self._lock:
+            self._sign_in = prompt
+            self._sign_in_thread = threading.get_ident()
+
+    def _end_sign_in(self) -> None:
+        """Drop the prompt, unless a later listing's sign-in (another request thread, which
+        the same thread then ends) has replaced it."""
+        with self._lock:
+            if self._sign_in_thread == threading.get_ident():
+                self._sign_in = None
 
     # -- settings (saved to <state_dir>/settings.toml; secrets never returned) ----------
 
@@ -705,8 +814,10 @@ class WebApp:
         with self._lock:
             tokens = self._tokens
         if tokens is None:  # built outside the lock: MSAL may contact the authority
-            # own cache file: a job's TokenProvider writes msal_cache_<connection>.bin
-            tokens = TokenProvider(self.cfg, cache_path=self._web_cache_path(), out=self.out)
+            # own cache file: a job's TokenProvider writes msal_cache_<connection>.bin; a
+            # device-code prompt reaches the page through /api/status (see _SignInRelay)
+            tokens = TokenProvider(self.cfg, cache_path=self._web_cache_path(),
+                                   out=_SignInRelay(self))
             with self._lock:
                 self._tokens = tokens = self._tokens or tokens
         return tokens
@@ -1000,7 +1111,8 @@ class WebApp:
         with self._lock:  # state first, then output: "not running" implies complete output
             detail = {**job.summary(), "running": job.running}
         return {**detail, "output_tail": job.output.tail(TAIL_LINES),
-                "progress": job.output.progress()}
+                "progress": job.output.progress(),
+                "sign_in": job.output.sign_in() if detail["running"] else None}
 
     def job_output(self, job_id: str) -> str:
         return self._job(job_id).output.text()
