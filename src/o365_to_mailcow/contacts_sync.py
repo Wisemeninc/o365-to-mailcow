@@ -10,7 +10,6 @@ category and the fallback is reported (ISC-84). Contacts are idempotent on Graph
 from __future__ import annotations
 
 import logging
-import sqlite3
 import time
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -256,7 +255,7 @@ class ContactsMigrator:
         try:
             out.failed_items, out.failed_items_total = self._state.failed_items(
                 self._src, self.kind, FAILED_ITEMS_LIMIT)
-        except sqlite3.Error as exc:
+        except Exception as exc:  # noqa: BLE001 - the list must never change an outcome
             log.warning("%s: could not list failed contacts: %s", self._src,
                         exc.__class__.__name__)
 

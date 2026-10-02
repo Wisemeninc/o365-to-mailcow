@@ -106,6 +106,7 @@ class FakeGraph:
     def __init__(self, routes: dict[str, Any] | None = None) -> None:
         self.routes: dict[str, Any] = dict(routes or {})
         self.calls: list[tuple[str, str, dict | None, dict | None]] = []
+        self.retries: list[tuple[str, int | None]] = []  # get(): path and retry override
 
     def _resolve(self, method: str, path: str, params: dict | None,
                  headers: dict | None) -> Any:
@@ -119,7 +120,9 @@ class FakeGraph:
             raise value
         return value
 
-    def get(self, path: str, params: dict | None = None, headers: dict | None = None) -> dict:
+    def get(self, path: str, params: dict | None = None, headers: dict | None = None,
+            retries: int | None = None) -> dict:
+        self.retries.append((path, retries))
         return self._resolve("get", path, params, headers)
 
     def iter_pages(self, path: str, params: dict | None = None, headers: dict | None = None):

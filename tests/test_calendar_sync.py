@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 
 import pytest
@@ -254,3 +255,26 @@ def test_dry_run_lists_no_failed_events(env):
     state.mark_event(MAPPING.source, "personal", "UID1", None, STATUS_FAILED, "x")
     res = mig(cfg, state, graph, None, dry_run=True).migrate()
     assert (res.failed_items, res.failed_items_total) == ([], 0)
+
+
+@pytest.mark.parametrize(("method", "error"), [
+    ("set_label", sqlite3.OperationalError("database is locked")),
+    ("failed_items", sqlite3.OperationalError("database is locked")),
+    ("failed_items", MemoryError()),
+])
+def test_an_error_in_the_label_code_changes_no_outcome(env, monkeypatch, method, error):
+    cfg, state, graph, dav, _ = env
+    dav.put_errors["UID1"] = DavError(403, "Forbidden: body")
+
+    def boom(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(state, method, boom)
+    res = mig(cfg, state, graph, dav).migrate()
+    assert res.failed == 1 and res.errors == [] and res.duration_s >= 0
+    assert ("PUT", "Calendar/personal/UID2.ics") in dav.writes
+    assert state.event_counts(MAPPING.source)["personal"][STATUS_FAILED] == 1
+    v = mig(cfg, state, graph, dav).verify()
+    assert v.errors == [] and [c.failed for c in v.collections][0] == 1
+    if method == "failed_items":
+        assert res.failed_items == [] and v.failed_items == []

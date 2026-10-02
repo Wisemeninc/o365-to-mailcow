@@ -360,9 +360,16 @@ class State:
         """Remember what a failed or skipped item was (where, title, sender/date)."""
         self._exec(
             "INSERT OR REPLACE INTO item_labels VALUES (?,?,?,?,?,?,?,?)",
-            (mailbox, kind, collection, item, _trim(place), _trim(title), _trim(hint),
-             time.time()),
+            (mailbox, kind, collection, item, _trim_label(place), _trim_label(title),
+             _trim_label(hint), time.time()),
         )
+
+    def label_title(self, mailbox: str, kind: str, collection: str, item: str) -> str:
+        """The title recorded for an item, "" when there is none (yet)."""
+        row = self._row(
+            "SELECT title FROM item_labels WHERE mailbox=? AND kind=? AND collection=? "
+            "AND item=?", (mailbox, kind, collection, item))
+        return row[0] if row and isinstance(row[0], str) else ""
 
     def failed_items(self, mailbox: str, kind: str,
                      limit: int = 100) -> tuple[list[dict[str, str]], int]:
@@ -384,3 +391,12 @@ class State:
 
 def _trim(error: str | None) -> str | None:
     return None if error is None else error[:300]
+
+
+def _trim_label(text: str | None) -> str | None:
+    """At most 300 characters, cut at a space: a label is shown after whole-secret
+    redaction, so a cut must never leave the first half of a (space-free) secret behind."""
+    if text is None or len(text) <= 300:
+        return text
+    head = text[:299]
+    return head[:head.rfind(" ") + 1] + "…"

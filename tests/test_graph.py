@@ -77,6 +77,20 @@ def test_503_exponential_backoff_then_raise_isc_30():
 
 
 @responses.activate
+def test_a_request_without_retries_raises_at_once_when_throttled():
+    responses.get(URL, status=429, headers={"Retry-After": "300"})
+    responses.get(URL, status=429, headers={"Retry-After": "7"})
+    responses.get(URL, json={"ok": True})
+    g, sleeps, _ = client()
+    with pytest.raises(GraphError) as exc:
+        g.get("/users/a@x.com/mailFolders", retries=0)
+    assert exc.value.status == 429 and sleeps == [] and len(responses.calls) == 1
+    # the override is for that one request: the next one retries as configured
+    assert g.get("/users/a@x.com/mailFolders") == {"ok": True}
+    assert sleeps == [7.0]
+
+
+@responses.activate
 def test_504_retried():
     responses.get(URL, status=504)
     responses.get(URL, json={})

@@ -106,11 +106,11 @@ class CollectionsVerify:
     failed_items_total: int = 0
 
 
-_UNSAFE = re.compile(r"[\x00-\x1f\x7f\u200b-\u200f\u2028-\u202e\u2066-\u2069]")
+_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069]")
 
 
 def clean(text: object) -> str:
-    """Strip control and bidi/zero-width characters from tenant-supplied strings before
+    """Strip control (C0 and C1) and bidi/zero-width characters from tenant-supplied strings before
     they reach a terminal or a log line (no escape-sequence or log-forging tricks)."""
     return _UNSAFE.sub("", str(text))
 
@@ -300,7 +300,7 @@ def failed_item_lines(section: Any) -> list[str]:
     if not isinstance(items, list):
         return []
     lines: list[str] = []
-    for item in items:
+    for item in items[:FAILED_ITEMS_LIMIT]:  # never walks more than a report may hold
         if len(lines) >= FAILED_ITEMS_SHOWN:
             break
         if not isinstance(item, dict):

@@ -316,17 +316,30 @@ def _card(kind: str, rows: list[list[str]], level: str, verdict: str, note: str 
 
 
 def _failed_items(box: _Mailbox, reader: _Reader, kind: str, sec: JsonDict) -> int:
-    """Add a section's ``failed_items`` to the detail; returns how many the section has."""
-    rows = reader.rows(sec, "failed_items", required=False)
-    shown = rows[:MAX_DETAIL]
-    for row in shown:
+    """Add a section's ``failed_items`` to the detail; returns how many the section has
+    (0 for a report written before the list existed). Only the first ``MAX_DETAIL`` rows are
+    looked at and the rest is counted; a total with nothing to show names nothing and is
+    not counted either."""
+    if "failed_items" not in sec:
+        return 0
+    rows = sec["failed_items"]
+    if not isinstance(rows, list):
+        reader.suspect = True
+        return 0
+    shown = 0
+    for row in rows[:MAX_DETAIL]:
+        if not isinstance(row, dict):
+            reader.suspect = True
+            continue
+        shown += 1
         box.detail.failed_items.add({
             "kind": TITLES[kind], "place": _str(row.get("place")),
             "title": _str(row.get("title")), "hint": _str(row.get("hint")),
             "reason": _reason(row.get("status"), row.get("error"))})
     total = max(reader.num(sec, "failed_items_total", required=False), len(rows))
-    box.detail.failed_items.total += total - len(shown)
-    return total
+    if shown:
+        box.detail.failed_items.total += total - shown
+    return total if shown else 0
 
 
 # -- verify ----------------------------------------------------------------------------------
@@ -584,9 +597,8 @@ def _migrate_kind(box: _Mailbox, kind: str, value: object, dry_run: bool) -> boo
     box.cells[kind] = _cell(primary, secondary, level)
     verdict = secondary or {"bad": "Failed", "unknown": "Some counts could not be read",
                             "ok": "Nothing to copy" if dry_run else "Copied"}[level]
-    note = "The next Migrate tries the failed items again." if failed and not dry_run else ""
-    if listed and note:
-        note += " They are listed below."
+    note = ("The next Migrate tries the failed items again. They are listed below."
+            if failed and listed and not dry_run else "")
     box.detail.cards.append(_card(kind, rows, level, verdict, note))
     box.add(copied=copied, already=already, failed=failed, too_large=too_large, would=would,
             warnings=warnings)

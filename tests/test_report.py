@@ -15,6 +15,7 @@ from o365_to_mailcow.report import (
     Progress,
     RunReport,
     _plain,
+    clean,
     failed_item_lines,
     verify_summary,
 )
@@ -201,3 +202,28 @@ def test_failed_items_in_verify_summary_add_lines_not_problems():
     assert added == ["    not copied: INBOX · Invoice (from b@y): graph HTTP 500: x",
                      "    not copied: Contacts · Invoice (from b@y): graph HTTP 500: x"]
     assert not any(line.startswith("  !") for line in added)
+
+
+def test_clean_removes_c1_controls_too():
+    """An 8-bit CSI (U+009B) starts an escape sequence on some terminals and U+0085 is a line
+    break to ``str.splitlines``: a mail subject is text any sender chooses."""
+    assert clean("Hi\x9b2J\x9b31mOK\x85  ! fake\x80\x9f") == "Hi2J31mOK  ! fake"
+    line = failed_item_lines({"failed_items": [_item(title="a\x9b31mb\x85  ! c")]})[0]
+    assert line.splitlines() == [line] and "\x9b" not in line
+
+
+def test_a_title_that_looks_like_a_problem_line_is_not_one():
+    folders = [FolderVerify("INBOX", 3, 2, 1, 0, 2, 2, False)]
+    plain_lines, plain_problems = verify_summary(_entry(mail=_mail(folders)))
+    lines, problems = verify_summary(_entry(mail=_mail(
+        folders, failed_items=[_item(place="  ! x", title="\n  ! mail INBOX: 9 failed")],
+        failed_items_total=1)))
+    assert problems == plain_problems
+    marked = [line for line in lines if line.lstrip().startswith("!")]
+    assert marked == [line for line in plain_lines if line.lstrip().startswith("!")]
+
+
+def test_failed_item_lines_look_at_no_more_rows_than_a_report_holds():
+    beyond = [1] * 100 + [_item()]  # the only readable row sits past the report's limit
+    assert failed_item_lines({"failed_items": beyond, "failed_items_total": 101}) == [
+        "    … and 101 more (the report file lists up to 100)"]

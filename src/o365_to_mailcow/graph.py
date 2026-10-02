@@ -83,8 +83,12 @@ class GraphClient:
 
     # -- public ------------------------------------------------------------------------
 
-    def get(self, path: str, params: dict | None = None, headers: dict | None = None) -> dict:
-        resp = self._request(path, params=params, headers=headers, stream=False)
+    def get(self, path: str, params: dict | None = None, headers: dict | None = None,
+            retries: int | None = None) -> dict:
+        """``retries`` overrides the client's retry count for this one request (0: a
+        throttled or failing request raises at once instead of waiting for Retry-After)."""
+        resp = self._request(path, params=params, headers=headers, stream=False,
+                             max_retries=retries)
         return resp.json()
 
     def iter_pages(
@@ -173,15 +177,17 @@ class GraphClient:
     def _request(
         self, path: str, params: dict | None, headers: dict | None, stream: bool,
         reader: Callable[[requests.Response], Any] | None = None,
+        max_retries: int | None = None,
     ) -> Any:
         """GET with retries. With ``reader``, the response body is consumed by ``reader``
         inside the in-flight slot and its result is returned instead of the response."""
+        limit = self._max_retries if max_retries is None else max_retries
         url = self._resolve(path)
         base_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
         if headers:
             base_headers.update(headers)
         refreshed = False
-        for attempt in range(self._max_retries + 1):
+        for attempt in range(limit + 1):
             base_headers["Authorization"] = f"Bearer {self._tokens.get_token()}"
             with self._sem:
                 try:
@@ -190,7 +196,7 @@ class GraphClient:
                         timeout=self._timeout, stream=stream, allow_redirects=False,
                     )
                 except requests.RequestException as exc:
-                    if attempt >= self._max_retries:
+                    if attempt >= limit:
                         name = exc.__class__.__name__
                         raise GraphError(0, f"network error: {name}", path) from exc
                     self._sleep(self._retry_after_network(attempt))
@@ -205,7 +211,7 @@ class GraphClient:
                     self._tokens.invalidate()
                     resp.close()
                     continue
-                if resp.status_code in RETRY_STATUSES and attempt < self._max_retries:
+                if resp.status_code in RETRY_STATUSES and attempt < limit:
                     delay = self._retry_after(resp, attempt)
                     log.info("Graph %s on %s; retrying in %.0fs", resp.status_code, path, delay)
                     resp.close()

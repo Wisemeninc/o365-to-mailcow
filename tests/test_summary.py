@@ -920,7 +920,7 @@ def test_failed_item_texts_are_cleaned_and_cut():
     assert item["reason"] == "e" + "x" * 299
 
 
-@pytest.mark.parametrize("items", ["x", {"a": 1}, [1, 2], [BIG, None]])
+@pytest.mark.parametrize("items", [None, "x", {"a": 1}, [1, 2], [BIG, None]])
 def test_an_unreadable_failed_items_list_is_never_ok(items):
     for command, base in (("migrate", migrate_entry()), ("verify", {**GOOD_VERIFY})):
         s = summarize_report(report(command, {ANNA: with_failed(base, "mail", items)}))
@@ -934,6 +934,35 @@ def test_a_report_without_failed_items_renders_as_before():
     detail = only(summarize_report(report("migrate", {ANNA: migrate_entry(
         status="failed", failed=3)}, exit_code=1)))["detail"]
     assert detail["failed_items"] == [] and detail["more_failed_items"] == 0
-    assert detail["cards"][0]["note"] == "The next Migrate tries the failed items again."
+    assert [card["note"] for card in detail["cards"]] == ["", "", ""]
     assert only(summarize_report(report("verify", {ANNA: GOOD_VERIFY})))["detail"][
         "failed_items"] == []
+
+
+def test_a_total_without_a_list_names_nothing():
+    for drop_list in (False, True):  # an empty list, and a report without the key
+        e = migrate_entry(status="failed", failed=3)
+        e["mail"]["failed_items_total"] = 5
+        if drop_list:
+            del e["mail"]["failed_items"]
+        row = only(summarize_report(report("migrate", {ANNA: e}, exit_code=1)))
+        assert row["detail"]["failed_items"] == [] and row["detail"]["more_failed_items"] == 0
+        assert row["result"]["level"] == "bad" and row["detail"]["cards"][0]["note"] == ""
+
+
+def test_only_the_shown_failed_items_are_looked_at(monkeypatch):
+    import o365_to_mailcow.summary as summary_mod
+
+    calls = {"n": 0}
+    original = summary_mod._reason
+
+    def counting(status, error):
+        calls["n"] += 1
+        return original(status, error)
+
+    monkeypatch.setattr(summary_mod, "_reason", counting)
+    many = [dict(BIG) for _ in range(50_000)]
+    detail = only(summarize_report(report("migrate", {ANNA: with_failed(
+        migrate_entry(), "mail", many)})))["detail"]
+    assert len(detail["failed_items"]) == MAX_DETAIL
+    assert detail["more_failed_items"] == 50_000 - MAX_DETAIL and calls["n"] == MAX_DETAIL

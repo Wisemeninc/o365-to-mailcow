@@ -208,14 +208,35 @@ def test_item_copied_later_is_not_listed_and_its_label_is_deleted(tmp_path):
     s.close()
 
 
-def test_label_texts_trimmed_to_300(tmp_path):
+def test_label_texts_are_cut_at_a_space_never_inside_a_word(tmp_path):
+    """Whole-secret redaction happens when a label is shown; a cut inside a word could leave
+    the first half of a secret behind, which no redaction would recognise."""
     s = State(tmp_path / "s.db")
     s.mark_contact("a@x", "k1", "personal", None, STATUS_FAILED, "x")
-    s.set_label("a@x", "contacts", "", "k1", "p" * 400, "t" * 400, "h" * 400)
+    secret = "S3cr3t-" + "k" * 40
+    title = "w" * 280 + " " + secret + " tail"  # the secret straddles the 300th character
+    s.set_label("a@x", "contacts", "", "k1", "p" * 400, title, "one two " + "h" * 400)
     item = s.failed_items("a@x", "contacts")[0][0]
-    assert (len(item["place"]), len(item["title"]), len(item["hint"])) == (300, 300, 300)
-    s.set_label("a@x", "contacts", "", "k1", None, None, None)
-    assert s.failed_items("a@x", "contacts")[0][0]["title"] == ""
+    assert item["title"] == "w" * 280 + " …" and "S3cr3t" not in item["title"]
+    assert item["place"] == "…" and item["hint"] == "one two …"  # no space: nothing is kept
+    assert all(len(item[k]) <= 300 for k in ("place", "title", "hint"))
+    short = "x" * 300
+    s.set_label("a@x", "contacts", "", "k1", short, None, None)
+    item = s.failed_items("a@x", "contacts")[0][0]
+    assert item["place"] == short and item["title"] == ""
+    s.close()
+
+
+def test_label_title_reads_one_items_title(tmp_path):
+    s = State(tmp_path / "s.db")
+    assert s.label_title("a@x", "mail", "f1", "g1") == ""
+    s.set_label("a@x", "mail", "f1", "g1", "INBOX", "", "received 2024")
+    assert s.label_title("a@x", "mail", "f1", "g1") == ""
+    s.set_label("a@x", "mail", "f1", "g1", "INBOX", "Invoice", "from b@y")
+    assert s.label_title("a@x", "mail", "f1", "g1") == "Invoice"
+    assert s.label_title("a@x", "mail", "f2", "g1") == ""
+    s.set_label("a@x", "mail", "f1", "g1", None, None, None)
+    assert s.label_title("a@x", "mail", "f1", "g1") == ""
     s.close()
 
 

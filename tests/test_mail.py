@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 from datetime import UTC, datetime
 
@@ -735,6 +736,74 @@ def test_breaker_warning_is_logged_when_the_last_item_trips_it(env, caplog):
     assert len(warnings) == 1
     assert "3 message title lookup(s) failed" in warnings[0].getMessage()
     assert all(subject not in caplog.text for subject in subjects)
+
+
+def test_a_later_run_keeps_a_title_and_does_not_look_it_up_again(env):
+    cfg, state, world, graph = env
+    graph.routes[f"{U}/messages/m2/$value"] = GraphError(503, "boom", "x")
+    graph.routes[f"{U}/messages/m2"] = M2_META
+    first = migrator(cfg, state, world, graph).migrate()
+    assert [i["title"] for i in first.failed_items] == ["Quarterly report"]
+    graph.routes[f"{U}/messages/m2"] = GraphError(429, "throttled", "x")
+    graph.calls.clear()
+    second = migrator(cfg, state, world, graph).migrate()
+    assert second.total("failed") == 1 and second.failed_items == first.failed_items
+    assert label_lookups(graph) == []
+
+
+def test_title_lookups_never_wait_for_graph_retries(env):
+    cfg, state, world, graph = env
+    graph.routes[f"{U}/messages/m2/$value"] = GraphError(503, "boom", "x")
+    graph.routes[f"{U}/messages/m2"] = M2_META
+    migrator(cfg, state, world, graph).migrate()
+    assert [r for p, r in graph.retries if p == f"{U}/messages/m2"] == [0]
+    assert {r for p, r in graph.retries if p != f"{U}/messages/m2"} <= {None}
+
+
+def test_title_lookups_stop_at_the_time_budget(env, monkeypatch, caplog):
+    from o365_to_mailcow import mail as mail_mod
+
+    cfg, state, world, graph = env
+    monkeypatch.setattr(mail_mod, "LABEL_BUDGET_S", -1.0)
+    for gid in ("m1", "m2"):
+        graph.routes[f"{U}/messages/{gid}/$value"] = GraphError(500, "boom", "x")
+        graph.routes[f"{U}/messages/{gid}"] = M2_META
+    caplog.set_level(logging.WARNING, logger="o365_to_mailcow.mail")
+    res = migrator(cfg, state, world, graph).migrate()
+    assert label_lookups(graph) == []
+    assert res.total("failed") == 2 and [i["title"] for i in res.failed_items] == ["", ""]
+    assert "took too long" in caplog.text and "Quarterly" not in caplog.text
+
+
+@pytest.mark.parametrize(("method", "error"), [
+    ("set_label", sqlite3.OperationalError("database is locked")),
+    ("label_title", sqlite3.OperationalError("database is locked")),
+    ("failed_items", sqlite3.OperationalError("database is locked")),
+    ("failed_items", MemoryError()),
+    ("message_status", RuntimeError("boom")),
+])
+def test_an_error_in_the_label_code_changes_no_outcome(env, monkeypatch, method, error):
+    cfg, state, world, graph = env
+    graph.routes[f"{U}/messages/m2/$value"] = GraphError(503, "boom", "x")
+    graph.routes[f"{U}/messages/m2"] = M2_META
+    other = State(cfg.state_dir / "other.db")
+    baseline = migrator(cfg, other, ImapWorld(), FakeGraph(dict(graph.routes))).migrate()
+
+    def boom(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(state, method, boom)
+    res = migrator(cfg, state, world, graph).migrate()
+    for attr in ("appended", "failed", "skipped_too_large", "already_done"):
+        assert res.total(attr) == baseline.total(attr), attr
+    assert (res.failed, res.errors, res.stopped) == (baseline.failed, baseline.errors, False)
+    assert res.duration_s >= 0
+    monkeypatch.undo()
+    assert state.message_counts_by_folder_id(MAPPING.source) == (
+        other.message_counts_by_folder_id(MAPPING.source))
+    other.close()
+    if method == "failed_items":
+        assert res.failed_items == [] and res.failed_items_total == 0
 
 
 def test_successful_run_makes_no_lookup_and_lists_nothing(env):

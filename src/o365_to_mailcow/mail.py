@@ -16,7 +16,6 @@ import hashlib
 import logging
 import re
 import secrets
-import sqlite3
 import time
 import traceback
 import unicodedata
@@ -72,6 +71,7 @@ MAX_KEYWORDS = 20
 MAX_KEYWORD_LEN = 50  # Dovecot's default mail_max_keyword_length
 LABEL_LOOKUPS = 100  # Graph lookups for failed/too-large message titles, per mailbox per run
 LABEL_LOOKUP_FAILURES = 3  # lookups that raised before the rest of the run stops looking up
+LABEL_BUDGET_S = 60.0  # no new title lookup starts after this long (Graph retries when throttled)
 LABEL_SELECT = "subject,from,receivedDateTime"
 
 WELL_KNOWN_MAP = {
@@ -602,6 +602,8 @@ class MailMigrator:
     def _remember(self, fp: FolderPlan, msg: dict) -> None:
         try:
             gid = str(msg["id"])
+            if self._state.label_title(self._src, "mail", fp.folder_id, gid):
+                return  # an earlier run looked this one up: keep its title, ask Graph nothing
             received = _utc_minute(msg.get("receivedDateTime"))
             self._state.set_label(self._src, "mail", fp.folder_id, gid, fp.dest_name, "",
                                   f"received {received}" if received else "")
@@ -613,10 +615,16 @@ class MailMigrator:
 
     def _resolve_labels(self) -> None:
         """Look up subject, sender and date of the queued failed/skipped messages; after
-        ``LABEL_LOOKUP_FAILURES`` lookups that raised, the rest keep the listing's label."""
+        ``LABEL_LOOKUP_FAILURES`` lookups that raised, or ``LABEL_BUDGET_S`` seconds, the rest
+        keep the listing's label (a later run looks them up)."""
         queue, self._label_queue = self._label_queue, []
         failures = 0
+        deadline = time.monotonic() + LABEL_BUDGET_S
         for fid, gid, place in queue:
+            if time.monotonic() > deadline:
+                log.warning("%s: message title lookups took too long; the remaining failed "
+                            "messages are listed without a title", self._src)
+                return
             try:
                 if self._state.message_status(self._src, fid, gid) not in (
                         STATUS_FAILED, STATUS_SKIPPED):
@@ -626,9 +634,10 @@ class MailMigrator:
                             exc.__class__.__name__)
                 return
             try:
+                # no retries: a throttled Graph would make each lookup wait for Retry-After
                 meta = self._graph.get(self._user_path(f"messages/{gid}"),
                                        params={"$select": LABEL_SELECT},
-                                       headers=PREFER_IMMUTABLE)
+                                       headers=PREFER_IMMUTABLE, retries=0)
                 title, hint = message_label(meta if isinstance(meta, dict) else {})
                 self._state.set_label(self._src, "mail", fid, gid, place, title, hint)
             except Exception as exc:  # noqa: BLE001 - a label must never change an outcome
@@ -644,7 +653,7 @@ class MailMigrator:
         try:
             result.failed_items, result.failed_items_total = self._state.failed_items(
                 self._src, "mail", FAILED_ITEMS_LIMIT)
-        except sqlite3.Error as exc:
+        except Exception as exc:  # noqa: BLE001 - the list must never change an outcome
             log.warning("%s: could not list failed messages: %s", self._src,
                         exc.__class__.__name__)
 

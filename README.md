@@ -266,8 +266,10 @@ start time, e-mail address). `migrate` and `verify` put up to 100 of them per ma
 kind into the report (`failed_items`, with `failed_items_total`), print the first 20 with
 their reason, and the page lists them under "Details". The titles are kept in
 `state/state.db` (table `item_labels`) only while the item is failed or skipped; a later
-`migrate` that copies the item removes its title. A mail title costs one extra Graph
-request per failed message, made at the end of the mailbox, at most 100 per run; an item
+`migrate` or `verify` of that mailbox removes the title of an item that has been copied
+since. A mail title costs one extra Graph request per failed message that has no title
+yet, made at the end of the mailbox without retries: at most 100 per run, none after
+three have failed or after 60 seconds (the rest are looked up by a later run). An item
 that failed before this was recorded shows "Title not recorded" until `migrate` tries it
 again. Items that verify counts as *missing* (in Microsoft 365, never attempted) are not
 named: only counted per folder.
