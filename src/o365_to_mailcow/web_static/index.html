@@ -222,6 +222,10 @@
       header.top { padding: 10px 16px; }
       .outcome { padding: 16px; }
       .row > input:not([type="checkbox"]), .row > select { flex: 1 1 100%; }
+      table.items thead { display: none; }
+      table.items, table.items tbody, table.items tr, table.items td { display: block; }
+      table.items td { padding: 0 20px 4px; border: 0; overflow-wrap: break-word; }
+      table.items tr { padding: 12px 0 8px; border-bottom: 1px solid var(--line); }
     }
   </style>
 </head>
@@ -3012,7 +3016,7 @@
     if (failed.length > 0) {
       out.push(el("section", { className: "panel stack" }, [
         el("h2", { text: "Items that were not copied" }),
-        el("div", { className: "table-wrap" }, el("table", { className: "list" }, [
+        el("div", { className: "table-wrap" }, el("table", { className: "list items" }, [
           el("thead", {}, el("tr", {}, ["Item", "Where", "Why"].map((h) => el("th", { scope: "col", text: h })))),
           el("tbody", {}, [
             ...failed.map((r) => el("tr", {}, [
