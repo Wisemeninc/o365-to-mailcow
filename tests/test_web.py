@@ -1606,6 +1606,23 @@ def test_secrets_in_reports_never_leave_through_overview_or_outcome(client, monk
     assert job["outcome"] == {"level": "bad", "text": "oops ***"}
 
 
+def test_overview_names_failed_items_and_redacts_their_texts(client):
+    data = _verify_report(10, 1)
+    data["mailboxes"][ANNA]["mail"]["failed_items"] = [
+        {"place": "INBOX", "title": f"Fwd: key {API_KEY}", "hint": "received 2024-01-02",
+         "status": "failed", "error": f"NO refused {CLIENT_SECRET}"}]
+    data["mailboxes"][ANNA]["mail"]["failed_items_total"] = 1
+    _write_report(client.state_dir, "1.json", data, 1_000)
+    response = client.get("/api/overview")
+    detail = response.json()["latest"]["mailboxes"][0]["detail"]
+    assert detail["failed_items"] == [
+        {"kind": "Mail", "place": "INBOX", "title": "Fwd: key ***",
+         "hint": "received 2024-01-02", "reason": "NO refused ***"}]
+    assert detail["more_failed_items"] == 0
+    for secret in SECRETS:
+        assert secret not in response.body.decode()
+
+
 # -- cross-vendor review: outcome ownership, progress robustness, redaction order ------------
 
 def _run_job(client, monkeypatch, main) -> dict:

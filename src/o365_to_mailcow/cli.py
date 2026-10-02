@@ -40,7 +40,14 @@ from .mailcow import (
     generate_password,
     is_our_app_password,
 )
-from .report import Progress, RunReport, clean, utc_stamp, verify_summary
+from .report import (
+    Progress,
+    RunReport,
+    clean,
+    failed_item_lines,
+    utc_stamp,
+    verify_summary,
+)
 from .state import State
 
 log = logging.getLogger("o365_to_mailcow")
@@ -436,6 +443,13 @@ def cmd_plan(r: Runner) -> int:
     return 1 if any(r.mailbox_failed(m.source) for m in r.mailboxes) else 0
 
 
+def _not_copied(res: Any) -> list[str]:
+    """The section's failed/skipped items, indented like its error lines (the summary
+    list itself is printed two spaces in)."""
+    section = {"failed_items": res.failed_items, "failed_items_total": res.failed_items_total}
+    return [line[2:] for line in failed_item_lines(section)]
+
+
 def _run_migrators(r: Runner, m: MailboxMapping, password: str | None) -> None:
     dry = r.opts.dry_run
     graph = r.graph()
@@ -462,6 +476,8 @@ def _run_migrators(r: Runner, m: MailboxMapping, password: str | None) -> None:
         for f in res.folders:
             if f.error and not any(f.error in e for e in res.errors):
                 summary.append(f"  error: {clean(f.dest_name)}: {clean(f.error)}")
+        if not dry:
+            summary.extend(_not_copied(res))
     dav = r.dav(m, password) if password else None
     for kind, cls in (("calendar", CalendarMigrator), ("contacts", ContactsMigrator)):
         if kind not in r.opts.kinds:
@@ -478,6 +494,8 @@ def _run_migrators(r: Runner, m: MailboxMapping, password: str | None) -> None:
             summary.append(f"  warning: {clean(w)}")
         for e in cres.errors:
             summary.append(f"  error: {clean(e)}")
+        if not dry:
+            summary.extend(_not_copied(cres))
     r.report.set(m.source, "status", "failed" if failed else "ok")
     r.say(f"{m.source} -> {m.destination}\n  " + "\n  ".join(summary))
 

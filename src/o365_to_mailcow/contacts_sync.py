@@ -10,6 +10,7 @@ category and the fallback is reported (ISC-84). Contacts are idempotent on Graph
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -19,6 +20,7 @@ from .config import Config, MailboxMapping
 from .dav import DavError, SogoDav, slugify
 from .graph import GraphClient, GraphError
 from .report import (
+    FAILED_ITEMS_LIMIT,
     CollectionPlan,
     CollectionResult,
     CollectionsPlan,
@@ -41,6 +43,22 @@ DEFAULT_SLUG = "personal"
 RESERVED_SLUGS = {"personal", "collected"}  # SOGo's built-in address books
 DEFAULT_ID = "default"
 PAGE_SIZE = 100
+
+
+def contact_label(contact: dict) -> tuple[str, str]:
+    """(title, hint) of a Graph contact for the list of failed items."""
+    title = ""
+    for key in ("displayName", "companyName"):
+        value = contact.get(key)
+        if isinstance(value, str) and value.strip():
+            title = value.strip()
+            break
+    hint = ""
+    emails = contact.get("emailAddresses")
+    if isinstance(emails, list) and emails and isinstance(emails[0], dict):
+        address = emails[0].get("address")
+        hint = address if isinstance(address, str) else ""
+    return title or "(no name)", hint
 
 
 @dataclass
@@ -143,6 +161,8 @@ class ContactsMigrator:
         except GraphError as exc:
             result.errors.append(f"listing contact folders failed: {exc}")
         finally:
+            if not self._dry_run:  # a local query: also when listing failed
+                self._fill_failed_items(result)
             if self._photo_errors:
                 result.warnings.append(f"{self._photo_errors} contact photo(s) could not be "
                                        "fetched and were left out")
@@ -206,12 +226,13 @@ class ContactsMigrator:
         try:
             conv = contacts_conv.convert_contact(contact, photo)
         except Exception as exc:  # a converter bug must not end the whole run
-            self._fail(cr, gid, last_modified, f"conversion failed: {exc.__class__.__name__}")
+            self._fail(cr, contact, gid, last_modified,
+                       f"conversion failed: {exc.__class__.__name__}")
             return
         try:
             self._require_dav().put_contact(cr.slug, conv.uid, conv.vcf)
         except DavError as exc:
-            self._fail(cr, gid, last_modified, str(exc))
+            self._fail(cr, contact, gid, last_modified, str(exc))
             return
         # a contact whose photo could not be fetched is stored without its last_modified
         # so the next run tries again (the vCard itself is complete apart from PHOTO)
@@ -219,11 +240,25 @@ class ContactsMigrator:
                                  last_modified if photo_ok else None, STATUS_DONE)
         cr.put += 1
 
-    def _fail(self, cr: CollectionResult, gid: str, last_modified: str | None,
+    def _fail(self, cr: CollectionResult, contact: dict, gid: str, last_modified: str | None,
               error: str) -> None:
         self._state.mark_contact(self._src, gid, cr.slug, last_modified, STATUS_FAILED, error)
         cr.failed += 1
         log.warning("%s: contact in %s failed: %s", self._src, cr.name, error)
+        try:
+            title, hint = contact_label(contact)
+            self._state.set_label(self._src, self.kind, "", gid, cr.name, title, hint)
+        except Exception as exc:  # noqa: BLE001 - a label must never change an outcome
+            log.warning("%s: could not label a failed contact: %s", self._src,
+                        exc.__class__.__name__)
+
+    def _fill_failed_items(self, out: CollectionsResult | CollectionsVerify) -> None:
+        try:
+            out.failed_items, out.failed_items_total = self._state.failed_items(
+                self._src, self.kind, FAILED_ITEMS_LIMIT)
+        except sqlite3.Error as exc:
+            log.warning("%s: could not list failed contacts: %s", self._src,
+                        exc.__class__.__name__)
 
     # -- verify ------------------------------------------------------------------------
 
@@ -236,6 +271,7 @@ class ContactsMigrator:
             existing = {s for s, _ in self._require_dav().list_addressbooks()}
         except (GraphError, DavError) as exc:
             out.errors.append(f"listing address books failed: {exc}")
+            self._fill_failed_items(out)  # the stored failures are still true
             return out
         per_book: dict[str, tuple[list[str], int]] = {}
         for folder in folders:
@@ -267,4 +303,5 @@ class ContactsMigrator:
                 name=" + ".join(names), slug=slug, graph_count=graph_count,
                 done=c.get(STATUS_DONE, 0), failed=failed, dav_count=dav_count,
                 expected=expected, mismatch=dav_count != expected))
+        self._fill_failed_items(out)
         return out

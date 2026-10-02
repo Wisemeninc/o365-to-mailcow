@@ -2,7 +2,8 @@
 
 Every write is its own transaction so an interrupted run can resume at the item after the
 last one recorded. The file never contains credentials: identifiers, statuses and error
-summaries only.
+summaries, plus the title, sender and date of items that failed (so a report can say which
+item it was).
 """
 
 from __future__ import annotations
@@ -45,7 +46,54 @@ CREATE TABLE IF NOT EXISTS contacts (
     mailbox TEXT NOT NULL, graph_id TEXT NOT NULL, book TEXT NOT NULL,
     last_modified TEXT, status TEXT NOT NULL, error TEXT, updated_at REAL NOT NULL,
     PRIMARY KEY (mailbox, graph_id));
+CREATE TABLE IF NOT EXISTS item_labels (
+    mailbox TEXT NOT NULL, kind TEXT NOT NULL, collection TEXT NOT NULL, item TEXT NOT NULL,
+    place TEXT, title TEXT, hint TEXT, updated_at REAL NOT NULL,
+    PRIMARY KEY (mailbox, kind, collection, item));
 """
+
+# Per kind: (delete labels of items no longer failed/skipped, count them, list them with
+# their label). Contacts are keyed by graph_id alone, so their labels use an empty
+# collection. 'failed'/'skipped' are STATUS_FAILED/STATUS_SKIPPED, spelled out because the
+# statements are literals: no SQL is ever assembled from strings at run time.
+_LABEL_SQL = {
+    "mail": (
+        "DELETE FROM item_labels WHERE mailbox=? AND kind='mail' AND NOT EXISTS ("
+        "SELECT 1 FROM messages t WHERE t.mailbox=item_labels.mailbox "
+        "AND t.folder_id=item_labels.collection AND t.graph_id=item_labels.item "
+        "AND t.status IN ('failed','skipped'))",
+        "SELECT COUNT(*) FROM messages WHERE mailbox=? "
+        "AND status IN ('failed','skipped')",
+        "SELECT COALESCE(l.place, t.folder), COALESCE(l.title, ''), COALESCE(l.hint, ''), "
+        "t.status, COALESCE(t.error, '') FROM messages t LEFT JOIN item_labels l "
+        "ON l.mailbox=t.mailbox AND l.kind='mail' AND l.collection=t.folder_id "
+        "AND l.item=t.graph_id WHERE t.mailbox=? AND t.status IN ('failed','skipped') "
+        "ORDER BY t.updated_at, t.folder_id, t.graph_id LIMIT ?"),
+    "calendar": (
+        "DELETE FROM item_labels WHERE mailbox=? AND kind='calendar' AND NOT EXISTS ("
+        "SELECT 1 FROM events t WHERE t.mailbox=item_labels.mailbox "
+        "AND t.calendar=item_labels.collection AND t.uid=item_labels.item "
+        "AND t.status IN ('failed','skipped'))",
+        "SELECT COUNT(*) FROM events WHERE mailbox=? "
+        "AND status IN ('failed','skipped')",
+        "SELECT COALESCE(l.place, t.calendar), COALESCE(l.title, ''), COALESCE(l.hint, ''), "
+        "t.status, COALESCE(t.error, '') FROM events t LEFT JOIN item_labels l "
+        "ON l.mailbox=t.mailbox AND l.kind='calendar' AND l.collection=t.calendar "
+        "AND l.item=t.uid WHERE t.mailbox=? AND t.status IN ('failed','skipped') "
+        "ORDER BY t.updated_at, t.calendar, t.uid LIMIT ?"),
+    "contacts": (
+        "DELETE FROM item_labels WHERE mailbox=? AND kind='contacts' AND NOT EXISTS ("
+        "SELECT 1 FROM contacts t WHERE t.mailbox=item_labels.mailbox "
+        "AND ''=item_labels.collection AND t.graph_id=item_labels.item "
+        "AND t.status IN ('failed','skipped'))",
+        "SELECT COUNT(*) FROM contacts WHERE mailbox=? "
+        "AND status IN ('failed','skipped')",
+        "SELECT COALESCE(l.place, t.book), COALESCE(l.title, ''), COALESCE(l.hint, ''), "
+        "t.status, COALESCE(t.error, '') FROM contacts t LEFT JOIN item_labels l "
+        "ON l.mailbox=t.mailbox AND l.kind='contacts' AND l.collection='' "
+        "AND l.item=t.graph_id WHERE t.mailbox=? AND t.status IN ('failed','skipped') "
+        "ORDER BY t.updated_at, t.graph_id LIMIT ?"),
+}
 
 
 class State:
@@ -304,6 +352,34 @@ class State:
         ):
             out.setdefault(book, {})[status] = n
         return out
+
+    # -- labels of failed items --------------------------------------------------------
+
+    def set_label(self, mailbox: str, kind: str, collection: str, item: str,
+                  place: str | None, title: str | None, hint: str | None) -> None:
+        """Remember what a failed or skipped item was (where, title, sender/date)."""
+        self._exec(
+            "INSERT OR REPLACE INTO item_labels VALUES (?,?,?,?,?,?,?,?)",
+            (mailbox, kind, collection, item, _trim(place), _trim(title), _trim(hint),
+             time.time()),
+        )
+
+    def failed_items(self, mailbox: str, kind: str,
+                     limit: int = 100) -> tuple[list[dict[str, str]], int]:
+        """The items of one kind whose current status is failed or skipped, oldest first,
+        at most ``limit`` of them, plus how many there are in total. Labels of items that
+        have since been copied are deleted first, so a title does not outlive its failure."""
+        if kind not in _LABEL_SQL:
+            raise ValueError(f"unknown item kind {kind!r}")
+        prune, count, listing = _LABEL_SQL[kind]
+        self._exec(prune, (mailbox,))
+        row = self._row(count, (mailbox,))
+        total = int(row[0]) if row else 0
+        if limit <= 0:
+            return [], total
+        rows = self._rows(listing, (mailbox, limit))
+        keys = ("place", "title", "hint", "status", "error")
+        return [{k: str(v) for k, v in zip(keys, r, strict=True)} for r in rows], total
 
 
 def _trim(error: str | None) -> str | None:

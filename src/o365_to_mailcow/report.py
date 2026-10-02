@@ -24,6 +24,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
+FAILED_ITEMS_LIMIT = 100  # failed/skipped items per mailbox section stored in a report
+FAILED_ITEMS_SHOWN = 20  # of those, lines printed per section
+
 
 @dataclasses.dataclass
 class CollectionPlan:
@@ -69,6 +72,9 @@ class CollectionsResult:
     warnings: list[str] = dataclasses.field(default_factory=list)
     errors: list[str] = dataclasses.field(default_factory=list)
     duration_s: float = 0.0
+    # items currently failed or skipped (state.failed_items); not part of ``failed``
+    failed_items: list[dict] = dataclasses.field(default_factory=list)
+    failed_items_total: int = 0
 
     @property
     def failed(self) -> int:
@@ -96,6 +102,8 @@ class CollectionsVerify:
     skipped: list[str] = dataclasses.field(default_factory=list)
     fallbacks: list[str] = dataclasses.field(default_factory=list)
     errors: list[str] = dataclasses.field(default_factory=list)
+    failed_items: list[dict] = dataclasses.field(default_factory=list)
+    failed_items_total: int = 0
 
 
 _UNSAFE = re.compile(r"[\x00-\x1f\x7f\u200b-\u200f\u2028-\u202e\u2066-\u2069]")
@@ -282,6 +290,40 @@ class RunReport:
 
 # -- verify summary --------------------------------------------------------------------
 
+def failed_item_lines(section: Any) -> list[str]:
+    """One line per failed/skipped item of a plain-dict report section, at most
+    ``FAILED_ITEMS_SHOWN``, plus how many more the report holds. Reports written before
+    items were labelled have no ``failed_items``; anything unreadable is skipped."""
+    if not isinstance(section, dict):
+        return []
+    items = section.get("failed_items")
+    if not isinstance(items, list):
+        return []
+    lines: list[str] = []
+    for item in items:
+        if len(lines) >= FAILED_ITEMS_SHOWN:
+            break
+        if not isinstance(item, dict):
+            continue
+
+        def text(key: str, item: dict = item) -> str:
+            value = item.get(key)
+            return clean(value) if isinstance(value, str) else ""
+
+        title = text("title") or "(title not recorded)"
+        hint = text("hint")
+        reason = text("error") or text("status")
+        lines.append(f"    not copied: {text('place')} · {title}"
+                     + (f" ({hint})" if hint else "") + f": {reason}")
+    total = section.get("failed_items_total")
+    if not isinstance(total, int) or isinstance(total, bool):
+        total = len(items)
+    if total > len(lines):
+        lines.append(f"    … and {total - len(lines)} more (the report file lists up to "
+                     f"{FAILED_ITEMS_LIMIT})")
+    return lines
+
+
 def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int]:
     """Render verify results (plain dicts from ``RunReport``) as lines + problem count.
 
@@ -349,6 +391,8 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
                     problem(f"sample content mismatch: {mm}")
             for err in mail.get("errors", []):
                 problem(f"mail: {clean(err)}")
+            # listed for information: the folders' failed/skipped counts already count them
+            lines.extend(failed_item_lines(mail))
         for kind in ("calendar", "contacts"):
             sec = entry.get(kind)
             if not sec:
@@ -371,6 +415,7 @@ def verify_summary(mailboxes: dict[str, dict[str, Any]]) -> tuple[list[str], int
                 problem(f"{kind} fallback (address book not created): {clean(fb)}")
             for err in sec.get("errors", []):
                 problem(f"{kind}: {clean(err)}")
+            lines.extend(failed_item_lines(sec))
     if problems:
         lines.append(f"VERIFY FAILED: {problems} skipped/failed/mismatched item(s) listed above")
     elif listed_by_design:

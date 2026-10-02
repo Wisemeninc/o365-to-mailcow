@@ -15,6 +15,7 @@ from o365_to_mailcow.report import (
     Progress,
     RunReport,
     _plain,
+    failed_item_lines,
     verify_summary,
 )
 
@@ -148,3 +149,55 @@ def test_run_report_records_the_scope_only_when_given(tmp_path):
     assert data["scope"] == scope
     plain = json.loads(RunReport("verify", tmp_path, now=lambda: now).write(0).read_text())
     assert "scope" not in plain
+
+
+# -- failed item lines ----------------------------------------------------------------------
+
+def _item(**kw):
+    return {"place": "INBOX", "title": "Invoice", "hint": "from b@y", "status": "failed",
+            "error": "graph HTTP 500: x", **kw}
+
+
+def test_failed_item_lines_format():
+    lines = failed_item_lines({"failed_items": [
+        _item(), _item(title="", hint="", error="", status="skipped")], "failed_items_total": 2})
+    assert lines == ["    not copied: INBOX · Invoice (from b@y): graph HTTP 500: x",
+                     "    not copied: INBOX · (title not recorded): skipped"]
+
+
+def test_failed_item_lines_cap_and_more_line():
+    lines = failed_item_lines({"failed_items": [_item()] * 100, "failed_items_total": 250})
+    assert len(lines) == 21 and lines[:20] == [lines[0]] * 20
+    assert lines[-1] == "    … and 230 more (the report file lists up to 100)"
+
+
+def test_failed_item_lines_remove_control_characters():
+    line = failed_item_lines({"failed_items": [_item(title="a\x1b[31mb\u202ec\nd")]})[0]
+    assert "a[31mbcd" in line and "\x1b" not in line and "\n" not in line
+
+
+def test_failed_item_lines_tolerate_malformed_input():
+    for section in (None, "x", {}, {"failed_items": None}, {"failed_items": "abc"},
+                    {"failed_items": [1, 2], "failed_items_total": "many"},
+                    {"failed_items": [{"place": 1, "title": 2, "hint": 3, "error": 4}]}):
+        failed_item_lines(section)
+    assert failed_item_lines({"failed_items": [{"place": 1, "title": None}]}) == [
+        "    not copied:  · (title not recorded): "]
+
+
+def test_failed_items_in_verify_summary_add_lines_not_problems():
+    folders = [FolderVerify("INBOX", 3, 2, 1, 0, 2, 2, False)]
+    contacts = CollectionsVerify("a@x", "contacts", [
+        CollectionVerify("Contacts", "personal", 2, 1, 1, 1, 1, False)])
+    plain_lines, plain_problems = verify_summary(_entry(
+        mail=_mail(folders), contacts=_plain(contacts)))
+    contacts.failed_items, contacts.failed_items_total = [_item(place="Contacts")], 1
+    lines, problems = verify_summary(_entry(
+        mail=_mail(folders, failed_items=[_item()], failed_items_total=1),
+        contacts=_plain(contacts)))
+    assert problems == plain_problems == 2
+    assert lines[-1] == plain_lines[-1]
+    added = [line for line in lines if line not in plain_lines]
+    assert added == ["    not copied: INBOX · Invoice (from b@y): graph HTTP 500: x",
+                     "    not copied: Contacts · Invoice (from b@y): graph HTTP 500: x"]
+    assert not any(line.startswith("  !") for line in added)

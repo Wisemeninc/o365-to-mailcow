@@ -246,9 +246,9 @@ A strip of six steps (Connect, Select, Provision, Migrate, Verify, Clean up) sho
 the migration is, from the newest real run of each command. Under it one outcome line says
 what the latest report means ("28 items have not arrived in mailcow") and offers the next
 step. The mailbox table shows per mailbox and per kind (mail, calendar, contacts) what was
-counted or copied; "Details" opens one mailbox: its counts on both sides, the folders where
-they differ, folders skipped by rule, the sample check, the tool's own problem lines and the
-raw report data. A run limited to one mailbox, one kind or a date is marked as partial: it
+counted or copied; "Details" opens one mailbox: its counts on both sides, the items that
+were not copied (see below), the folders where they differ, folders skipped by rule, the
+sample check, the tool's own problem lines and the raw report data. A run limited to one mailbox, one kind or a date is marked as partial: it
 never turns a step green on its own. Every run starts from a sheet that lists the saved
 mailboxes it acts on, offers only the options that apply to that command (one mailbox,
 mail/calendar/contacts, mail since a date, the verify sample) and, for provision and
@@ -258,6 +258,19 @@ by earlier runs; the sheet says so.) While a `migrate` runs the page shows items
 total, the rate and an estimate of the time left, and a card per mailbox; the other commands
 print no item counts, so they show only the last lines of the log. The job runs on the
 server, so closing the page does not stop it.
+
+**Items that were not copied.** When a message, an event or a contact fails, or a message
+is skipped as too large, the tool records what it was: the folder, calendar or address
+book, the title (subject, event title, contact name) and a hint (sender and date received,
+start time, e-mail address). `migrate` and `verify` put up to 100 of them per mailbox and
+kind into the report (`failed_items`, with `failed_items_total`), print the first 20 with
+their reason, and the page lists them under "Details". The titles are kept in
+`state/state.db` (table `item_labels`) only while the item is failed or skipped; a later
+`migrate` that copies the item removes its title. A mail title costs one extra Graph
+request per failed message, made at the end of the mailbox, at most 100 per run; an item
+that failed before this was recorded shows "Title not recorded" until `migrate` tries it
+again. Items that verify counts as *missing* (in Microsoft 365, never attempted) are not
+named: only counted per folder.
 
 In delegated mode, the page shows the Microsoft sign-in link and the device code in a
 callout with a Copy button, both when a job starts and when the tenant list is loaded. The

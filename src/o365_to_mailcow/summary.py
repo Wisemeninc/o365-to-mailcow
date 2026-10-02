@@ -18,6 +18,11 @@ is ``unknown`` so it cannot stand in for a full run.
 A migrate that skipped oversized messages or left something out (calendar ``warnings``,
 contacts ``fallbacks``) is ``warn``, never green: verify would count the same things.
 
+``failed_items`` (migrate and verify sections) name the items that were not copied: what each
+one was, where, and why. They explain numbers a section already counts, so they add nothing
+to a count or a level; a list that cannot be read makes its section ``unknown`` like any other
+unreadable field.
+
 Construction is bounded, not only the output: at most ``MAX_TEXTS`` strings are converted
 per report list, detail lists stop at ``MAX_DETAIL`` and count the rest, and mailboxes
 beyond ``MAX_MAILBOXES`` keep only the numbers the headline needs.
@@ -30,6 +35,7 @@ as "0 missing".
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -50,6 +56,9 @@ _DISPLAY = {"plan": "Plan", "provision": "Provision", "migrate": "Migrate",
             "verify": "Verify", "cleanup": "Clean up"}
 _KIND_SCOPED = ("plan", "migrate", "verify")  # commands whose sections show the kinds run
 
+_TOO_LARGE = re.compile(r"too large: (over )?(\d{1,15}) bytes")
+_BARE_DAV = re.compile(r"DAV HTTP (\d{3}):?")  # mailcow answered without a body
+
 JsonDict = dict[str, Any]
 
 
@@ -65,6 +74,28 @@ def _text(value: object) -> str:
 
 def _opt_text(value: object) -> str | None:
     return None if value is None else _text(value)
+
+
+def _str(value: object) -> str:
+    """A field that must be a string to be shown at all (anything else is left blank)."""
+    return _text(value) if isinstance(value, str) else ""
+
+
+def _reason(status: object, error: object) -> str:
+    """Why an item was not copied: the recorded error, with its two terse forms spelled out
+    (a size in bytes, an HTTP status without a message)."""
+    text = _str(error).strip()
+    match = _TOO_LARGE.fullmatch(text)
+    if match:
+        size = f"{int(match[2]) / 1_048_576:,.1f} MB"
+        return f"Too large: over the {size} limit" if match[1] else f"Too large: {size}"
+    match = _BARE_DAV.fullmatch(text)
+    if match:
+        return (f"mailcow answered HTTP {match[1]} without a message; "
+                "the SOGo log has the cause")
+    if text:
+        return text
+    return "Skipped" if status == "skipped" else "Failed; no reason was recorded"
 
 
 def _exit_code(value: object) -> int | None:
@@ -213,6 +244,7 @@ class _Reader:
 @dataclass
 class _Detail:
     cards: list[JsonDict] = field(default_factory=list)
+    failed_items: _Capped = field(default_factory=_Capped)
     differences: _Capped = field(default_factory=_Capped)
     skipped: _Capped = field(default_factory=_Capped)
     sample: JsonDict | None = None
@@ -222,6 +254,8 @@ class _Detail:
     def view(self) -> JsonDict:
         return {
             "cards": self.cards,
+            "failed_items": self.failed_items.items,
+            "more_failed_items": self.failed_items.more,
             "differences": self.differences.items,
             "more_differences": self.differences.more,
             "skipped": self.skipped.items,
@@ -279,6 +313,20 @@ def _cell(primary: str, secondary: str, level: str) -> JsonDict:
 def _card(kind: str, rows: list[list[str]], level: str, verdict: str, note: str = "") -> JsonDict:
     return {"title": TITLES[kind], "rows": rows, "verdict": {"level": level, "text": verdict},
             "note": note}
+
+
+def _failed_items(box: _Mailbox, reader: _Reader, kind: str, sec: JsonDict) -> int:
+    """Add a section's ``failed_items`` to the detail; returns how many the section has."""
+    rows = reader.rows(sec, "failed_items", required=False)
+    shown = rows[:MAX_DETAIL]
+    for row in shown:
+        box.detail.failed_items.add({
+            "kind": TITLES[kind], "place": _str(row.get("place")),
+            "title": _str(row.get("title")), "hint": _str(row.get("hint")),
+            "reason": _reason(row.get("status"), row.get("error"))})
+    total = max(reader.num(sec, "failed_items_total", required=False), len(rows))
+    box.detail.failed_items.total += total - len(shown)
+    return total
 
 
 # -- verify ----------------------------------------------------------------------------------
@@ -346,6 +394,7 @@ def _verify_kind(box: _Mailbox, kind: str, value: object) -> bool:
     errors = reader.texts(sec, "errors")
     fallbacks = reader.texts(sec, "fallbacks")
     box.detail.errors.add_texts(errors, f"{kind}: ")
+    _failed_items(box, reader, kind, sec)
     parts = _parts(((missing, "missing"), (failed, "failed"), (too_large, "too large"),
                     (in_skipped, "in skipped folders"), (extra, "more than expected")))
     if sample_mismatches:
@@ -489,6 +538,7 @@ def _migrate_kind(box: _Mailbox, kind: str, value: object, dry_run: bool) -> boo
                 "delta": f"{_n(row_failed)} failed", "why": error})
     errors = reader.texts(sec, "errors")
     box.detail.errors.add_texts(errors, f"{kind}: ")
+    listed = _failed_items(box, reader, kind, sec)
     # known omissions verify would count as problems: an event's recurrence exception or a
     # contact photo left out (warnings), an address book refused and redirected (fallbacks)
     warning_texts, fallback_texts = reader.texts(sec, "warnings"), reader.texts(sec, "fallbacks")
@@ -534,7 +584,10 @@ def _migrate_kind(box: _Mailbox, kind: str, value: object, dry_run: bool) -> boo
     box.cells[kind] = _cell(primary, secondary, level)
     verdict = secondary or {"bad": "Failed", "unknown": "Some counts could not be read",
                             "ok": "Nothing to copy" if dry_run else "Copied"}[level]
-    box.detail.cards.append(_card(kind, rows, level, verdict))
+    note = "The next Migrate tries the failed items again." if failed and not dry_run else ""
+    if listed and note:
+        note += " They are listed below."
+    box.detail.cards.append(_card(kind, rows, level, verdict, note))
     box.add(copied=copied, already=already, failed=failed, too_large=too_large, would=would,
             warnings=warnings)
     return not reader.suspect

@@ -615,3 +615,116 @@ def test_a_big_message_closes_the_batch_early(env, monkeypatch):
         graph.routes[f"{U}/messages/{m['id']}/$value"] = mime(m["internetMessageId"], "y" * 60)
     migrator(cfg, state, world, graph).migrate()
     assert world.batches == [1, 1, 1, 1]  # each ~80 bytes: two never fit under 100
+
+
+# -- labels of failed and skipped messages ------------------------------------------------
+
+M2_META = {"subject": "Quarterly report", "from": {"emailAddress": {"address": "bob@y.test"}},
+           "receivedDateTime": "2024-03-05T09:12:33Z"}
+
+
+def label_lookups(graph) -> list[str]:
+    return [p for m, p, _, _ in graph.calls if m == "get" and p.startswith(f"{U}/messages/")]
+
+
+def test_failed_download_is_listed_with_subject_sender_and_date(env):
+    cfg, state, world, graph = env
+    graph.routes[f"{U}/messages/m2/$value"] = GraphError(503, "retries exhausted", "x")
+    graph.routes[f"{U}/messages/m2"] = M2_META
+    res = migrator(cfg, state, world, graph).migrate()
+    assert res.failed_items == [{
+        "place": "INBOX", "title": "Quarterly report",
+        "hint": "from bob@y.test · received 2024-03-05 09:12 UTC", "status": "failed",
+        "error": "graph HTTP 503: HTTP 503 for x: retries exhausted"}]
+    assert res.failed_items_total == 1
+    lookup = next(c for c in graph.calls if c[1] == f"{U}/messages/m2")
+    assert lookup[2] == {"$select": "subject,from,receivedDateTime"}
+    assert 'IdType="ImmutableId"' in lookup[3]["Prefer"]
+    # looked up at the end of the run, not in the failure path
+    assert graph.calls.index(lookup) > max(
+        i for i, c in enumerate(graph.calls) if c[0] in ("get_bytes", "iter_pages"))
+
+
+def test_too_large_message_is_listed_as_skipped(env, tmp_path):
+    cfg, state, world, graph = env
+    cfg = make_config(tmp_path, max_message_bytes=100)  # M1 reports 120 bytes
+    graph.routes[f"{U}/messages/m1"] = {"subject": "", "receivedDateTime": "bad date"}
+    res = migrator(cfg, state, world, graph).migrate()
+    assert res.failed_items == [{"place": "INBOX", "title": "(no subject)", "hint": "",
+                                 "status": "skipped", "error": "too large: 120 bytes"}]
+
+
+def test_lookup_failure_keeps_the_listings_date_and_counts_once(env):
+    cfg, state, world, graph = env
+    graph.routes[f"{U}/messages/m1/$value"] = GraphError(500, "boom", "x")
+    graph.routes[f"{U}/messages/m1"] = GraphError(429, "throttled", "x")
+    res = migrator(cfg, state, world, graph).migrate()
+    assert res.total("failed") == 1 and res.failed_items_total == 1
+    assert [(i["title"], i["hint"]) for i in res.failed_items] == [
+        ("", "received 2024-01-02 03:04 UTC")]
+
+
+def test_title_lookups_are_capped_per_run(env, monkeypatch):
+    from o365_to_mailcow import mail as mail_mod
+
+    cfg, state, world, graph = env
+    monkeypatch.setattr(mail_mod, "LABEL_LOOKUPS", 1)
+    for gid in ("m1", "m2"):
+        graph.routes[f"{U}/messages/{gid}/$value"] = GraphError(500, "boom", "x")
+        graph.routes[f"{U}/messages/{gid}"] = M2_META
+    res = migrator(cfg, state, world, graph).migrate()
+    assert len(label_lookups(graph)) == 1
+    assert res.failed_items_total == 2 and len(res.failed_items) == 2
+
+
+def test_lookups_stop_after_three_failures(env):
+    cfg, state, world, graph = env
+    msgs = _many(5)
+    graph.routes[f"{U}/mailFolders/f-inbox/messages"] = msgs
+    for m in msgs:
+        graph.routes[f"{U}/messages/{m['id']}/$value"] = GraphError(500, "boom", "x")
+        graph.routes[f"{U}/messages/{m['id']}"] = GraphError(503, "unavailable", "x")
+    res = migrator(cfg, state, world, graph).migrate()
+    assert len(label_lookups(graph)) == 3
+    assert res.total("failed") == 5 and res.failed_items_total == 5
+    assert {i["hint"] for i in res.failed_items} == {"received 2024-01-02 03:04 UTC"}
+
+
+def test_successful_run_makes_no_lookup_and_lists_nothing(env):
+    cfg, state, world, graph = env
+    res = migrator(cfg, state, world, graph).migrate()
+    assert label_lookups(graph) == []
+    assert (res.failed_items, res.failed_items_total) == ([], 0)
+
+
+def test_successful_retry_empties_the_list(env):
+    cfg, state, world, graph = env
+    graph.routes[f"{U}/messages/m2/$value"] = GraphError(503, "retries exhausted", "x")
+    graph.routes[f"{U}/messages/m2"] = M2_META
+    assert migrator(cfg, state, world, graph).migrate().failed_items_total == 1
+    graph.routes[f"{U}/messages/m2/$value"] = mime(None, "two")
+    for fid in ("f-sent", "f-proj", "f-mysent", "f-uni", "f-sub"):
+        link = f"https://graph.microsoft.com/d/{fid}"
+        graph.routes[link] = ([], link)
+    res = migrator(cfg, state, world, graph).migrate()
+    assert res.total("appended") == 1
+    assert (res.failed_items, res.failed_items_total) == ([], 0)
+    assert state._rows("SELECT * FROM item_labels") == []
+
+
+def test_dry_run_leaves_failed_items_empty(env):
+    cfg, state, world, graph = env
+    state.mark_message(MAPPING.source, "f-inbox", "m2", "INBOX", None, STATUS_FAILED)
+    res = migrator(cfg, state, world, graph, dry_run=True).migrate()
+    assert (res.failed_items, res.failed_items_total) == ([], 0)
+    assert label_lookups(graph) == []
+
+
+def test_verify_lists_failed_items(env):
+    cfg, state, world, graph = env
+    graph.routes[f"{U}/messages/m2/$value"] = GraphError(500, "boom", "x")
+    graph.routes[f"{U}/messages/m2"] = M2_META
+    migrator(cfg, state, world, graph).migrate()
+    v = migrator(cfg, state, world, graph).verify()
+    assert v.failed_items_total == 1
+    assert v.failed_items[0]["title"] == "Quarterly report"

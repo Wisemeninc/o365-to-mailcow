@@ -289,3 +289,10 @@ def test_size_encoding_and_no_markers() -> None:
 
     for marker in ["TODO", "FIXME", "XXX"]:
         assert marker not in PAGE_TEXT, f"Forbidden marker found: {marker}"
+
+
+def test_failed_items_table_markers() -> None:
+    """The detail view names the items that were not copied, from the API's own list."""
+    for marker in ("d.failed_items", "d.more_failed_items", "Items that were not copied",
+                   "Title not recorded"):
+        assert marker in SCRIPT_TEXT, f"The failed-items table is missing: {marker}"

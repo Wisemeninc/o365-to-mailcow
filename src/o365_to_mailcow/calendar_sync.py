@@ -10,6 +10,7 @@ folded into the master's resource by ``calendar_conv``. State keeps the Graph
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
@@ -19,6 +20,7 @@ from .config import Config, MailboxMapping
 from .dav import DavError, SogoDav, slugify
 from .graph import GraphClient, GraphError
 from .report import (
+    FAILED_ITEMS_LIMIT,
     CollectionPlan,
     CollectionResult,
     CollectionsPlan,
@@ -53,6 +55,26 @@ PAGE_SIZE = 100
 
 def iso_utc(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def event_label(ev: dict) -> tuple[str, str]:
+    """(title, hint) of a Graph event for the list of failed items. The listing asks for
+    UTC (``PREFER_UTC``), so ``start.dateTime`` is UTC without an offset."""
+    subject = ev.get("subject")
+    title = (subject.strip() if isinstance(subject, str) else "") or "(no title)"
+    start = ev.get("start")
+    raw = start.get("dateTime") if isinstance(start, dict) else None
+    hint = ""
+    if isinstance(raw, str) and len(raw) >= 10:
+        if ev.get("isAllDay"):
+            hint = f"all day {raw[:10]}"
+        elif len(raw) >= 16 and raw[10] == "T":
+            hint = f"starts {raw[:10]} {raw[11:16]} UTC"
+        else:
+            hint = f"starts {raw[:10]}"
+    if ev.get("type") == "seriesMaster":
+        hint = f"{hint} · recurring" if hint else "recurring"
+    return title, hint
 
 
 class CalendarMigrator:
@@ -172,6 +194,8 @@ class CalendarMigrator:
         except GraphError as exc:
             result.errors.append(f"listing calendars failed: {exc}")
         finally:
+            if not self._dry_run:  # a local query: also when listing failed
+                self._fill_failed_items(result)
             result.duration_s = round(time.monotonic() - started, 3)
             self._progress.finish(self._key)
         return result
@@ -227,13 +251,13 @@ class CalendarMigrator:
         try:
             instances = self._instances(ev["id"]) if ev.get("type") == "seriesMaster" else []
         except GraphError as exc:
-            self._fail(cr, key, last_modified, f"instances: {exc}")
+            self._fail(cr, ev, key, last_modified, f"instances: {exc}")
             return
         try:
             conv = calendar_conv.convert_event(ev, instances, window=self._window,
                                                attendees=self._cfg.calendar_attendees)
         except Exception as exc:  # a converter bug must not end the whole run
-            self._fail(cr, key, last_modified,
+            self._fail(cr, ev, key, last_modified,
                        f"conversion failed: {exc.__class__.__name__}: {exc}")
             return
         for warning in conv.warnings:
@@ -244,16 +268,30 @@ class CalendarMigrator:
         try:
             self._require_dav().put_event(cr.slug, conv.uid, conv.ics)
         except DavError as exc:  # ISC-108
-            self._fail(cr, key, last_modified, str(exc))
+            self._fail(cr, ev, key, last_modified, str(exc))
             return
         self._state.mark_event(self._src, cr.slug, key, last_modified, STATUS_DONE)
         cr.put += 1
 
-    def _fail(self, cr: CollectionResult, key: str, last_modified: str | None,
+    def _fail(self, cr: CollectionResult, ev: dict, key: str, last_modified: str | None,
               error: str) -> None:
         self._state.mark_event(self._src, cr.slug, key, last_modified, STATUS_FAILED, error)
         cr.failed += 1
         log.warning("%s: event in %s failed: %s", self._src, cr.name, error)
+        try:
+            title, hint = event_label(ev)
+            self._state.set_label(self._src, self.kind, cr.slug, key, cr.name, title, hint)
+        except Exception as exc:  # noqa: BLE001 - a label must never change an outcome
+            log.warning("%s: could not label a failed event: %s", self._src,
+                        exc.__class__.__name__)
+
+    def _fill_failed_items(self, out: CollectionsResult | CollectionsVerify) -> None:
+        try:
+            out.failed_items, out.failed_items_total = self._state.failed_items(
+                self._src, self.kind, FAILED_ITEMS_LIMIT)
+        except sqlite3.Error as exc:
+            log.warning("%s: could not list failed events: %s", self._src,
+                        exc.__class__.__name__)
 
     # -- verify ------------------------------------------------------------------------
 
@@ -263,6 +301,7 @@ class CalendarMigrator:
             owned, out.skipped = self._calendars()
         except GraphError as exc:
             out.errors.append(f"listing calendars failed: {exc}")
+            self._fill_failed_items(out)  # the stored failures are still true
             return out
         counts = self._state.event_counts(self._src)
         for cal, slug in owned:
@@ -286,4 +325,5 @@ class CalendarMigrator:
                 name=name, slug=slug, graph_count=graph_count, done=c.get(STATUS_DONE, 0),
                 failed=failed, dav_count=dav_count, expected=expected,
                 mismatch=dav_count != expected))
+        self._fill_failed_items(out)
         return out

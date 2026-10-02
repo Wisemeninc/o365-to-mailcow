@@ -3008,6 +3008,25 @@
       })));
     }
 
+    const failed = arr(d.failed_items).filter(isObject);
+    if (failed.length > 0) {
+      out.push(el("section", { className: "panel stack" }, [
+        el("h2", { text: "Items that were not copied" }),
+        el("div", { className: "table-wrap" }, el("table", { className: "list" }, [
+          el("thead", {}, el("tr", {}, ["Item", "Where", "Why"].map((h) => el("th", { scope: "col", text: h })))),
+          el("tbody", {}, [
+            ...failed.map((r) => el("tr", {}, [
+              el("td", {}, [el("div", { text: str(r.title) || "Title not recorded" }),
+                str(r.hint) ? el("div", { className: "muted small", text: r.hint }) : null]),
+              el("td", { text: str(r.kind) + " · " + str(r.place) }),
+              el("td", { text: str(r.reason) }),
+            ])),
+            moreRow(d.more_failed_items, 3),
+          ]),
+        ])),
+      ]));
+    }
+
     const diffs = arr(d.differences).filter(isObject);
     if (diffs.length > 0) {
       out.push(el("section", { className: "panel stack" }, [

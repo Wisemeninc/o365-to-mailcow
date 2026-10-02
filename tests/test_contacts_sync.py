@@ -146,3 +146,41 @@ def test_verify_per_book_isc_91(env):
     v = mig(cfg, state, graph, dav).verify()
     assert [(c.slug, c.graph_count, c.dav_count, c.mismatch) for c in v.collections] == [
         ("personal", 2, 2, False), ("suppliers", 1, 1, False), ("local", 1, 1, False)]
+
+
+# -- labels of failed contacts ------------------------------------------------------------
+
+def test_put_failure_is_listed_with_name_and_address(env):
+    from o365_to_mailcow.dav import DavError
+
+    cfg, state, graph, dav, _ = env
+    graph.routes[f"{U}/contactFolders/cf1/contacts"] = [contact(
+        "c3", displayName="", companyName="Acme Ltd",
+        emailAddresses=[{"address": "sales@acme.test"}, {"address": "other@acme.test"}])]
+    dav.put_errors["uid-c3"] = DavError(400, "bad vcard")
+    res = mig(cfg, state, graph, dav).migrate()
+    expected = [{"place": "Suppliers", "title": "Acme Ltd", "hint": "sales@acme.test",
+                 "status": "failed", "error": "DAV HTTP 400: bad vcard"}]
+    assert (res.failed_items, res.failed_items_total) == (expected, 1)
+    assert res.failed == 1
+    v = mig(cfg, state, graph, dav).verify()
+    assert (v.failed_items, v.failed_items_total) == (expected, 1)
+
+
+def test_contact_without_name_or_address_is_still_listed():
+    from o365_to_mailcow.contacts_sync import contact_label
+
+    assert contact_label({}) == ("(no name)", "")
+    assert contact_label({"displayName": "Jane", "emailAddresses": "x"}) == ("Jane", "")
+    assert contact_label({"emailAddresses": [1]}) == ("(no name)", "")
+
+
+def test_verify_lists_stored_failures_when_listing_fails(env):
+    from o365_to_mailcow.dav import DavError
+
+    cfg, state, graph, dav, _ = env
+    dav.put_errors["uid-c2"] = DavError(400, "bad vcard")
+    mig(cfg, state, graph, dav).migrate()
+    graph.routes[f"{U}/contactFolders"] = GraphError(503, "down", "x")
+    v = mig(cfg, state, graph, dav).verify()
+    assert v.errors and [i["title"] for i in v.failed_items] == ["C2"]

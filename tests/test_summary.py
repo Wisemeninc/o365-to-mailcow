@@ -813,3 +813,127 @@ def test_construction_is_bounded_for_huge_error_lists(monkeypatch):
     assert detail["errors"][0] == "e0" and len(detail["problems"]) == summary_mod.MAX_DETAIL
     assert only(s)["cells"]["mail"]["secondary"] == "200,000 errors"
     assert calls["n"] < 10_000  # at most MAX_TEXTS per list, never one per error string
+
+
+# -- failed items ----------------------------------------------------------------------------
+
+EVENT = {"place": "Calendar", "title": "Budget review", "hint": "starts 2024-03-05 09:00 UTC",
+         "status": "failed", "error": "DAV HTTP 500: "}
+BIG = {"place": "INBOX", "title": "Scans", "hint": "from ben@example.com · received 2023-01-02 "
+       "10:00 UTC", "status": "skipped", "error": "too large: 209715200 bytes"}
+
+
+def with_failed(e: dict, kind: str, items: object, total: object = None) -> dict:
+    e[kind] = {**e[kind], "failed_items": items}
+    if total is not None:
+        e[kind]["failed_items_total"] = total
+    return e
+
+
+def test_migrate_lists_what_failed_where_and_why():
+    e = with_failed(migrate_entry(status="failed", failed=1), "calendar", [EVENT], 1)
+    e = with_failed(e, "mail", [BIG], 1)
+    row = only(summarize_report(report("migrate", {ANNA: e}, exit_code=1)))
+    assert row["detail"]["failed_items"] == [
+        {"kind": "Mail", "place": "INBOX", "title": "Scans",
+         "hint": "from ben@example.com · received 2023-01-02 10:00 UTC",
+         "reason": "Too large: 200.0 MB"},
+        {"kind": "Calendar", "place": "Calendar", "title": "Budget review",
+         "hint": "starts 2024-03-05 09:00 UTC",
+         "reason": "mailcow answered HTTP 500 without a message; the SOGo log has the cause"}]
+    assert row["detail"]["more_failed_items"] == 0
+    notes = {c["title"]: c["note"] for c in row["detail"]["cards"]}
+    assert notes == {"Mail": "The next Migrate tries the failed items again. They are listed "
+                     "below.", "Calendar": "", "Contacts": ""}
+
+
+def test_failed_items_change_no_count_and_no_level():
+    plain = summarize_report(report("migrate", {ANNA: migrate_entry(status="failed", failed=2)},
+                                    exit_code=1))
+    listed = summarize_report(report("migrate", {ANNA: with_failed(
+        migrate_entry(status="failed", failed=2), "mail", [BIG, BIG], 2)}, exit_code=1))
+    for s in (plain, listed):
+        only(s)["detail"].pop("failed_items")
+        for card in only(s)["detail"]["cards"]:
+            card.pop("note")
+    assert plain == listed
+    ok = summarize_report(report("verify", {ANNA: with_failed(
+        {**GOOD_VERIFY}, "mail", [BIG], 1)}))
+    assert ok["headline"]["level"] == "ok" and only(ok)["result"]["level"] == "ok"
+    assert [i["title"] for i in only(ok)["detail"]["failed_items"]] == ["Scans"]
+
+
+def test_verify_lists_failed_items_of_every_section():
+    e = entry(mail=mail_verify(folder("INBOX", 10, 9, expected=9, failed=1)),
+              calendar=CollectionsVerify(ANNA, "calendar", [collection(failed=1)]))
+    e = with_failed(with_failed(e, "mail", [{**BIG, "status": "failed", "error": "NO refused"}]),
+                    "calendar", [EVENT])
+    row = only(summarize_report(report("verify", {ANNA: e}, exit_code=1)))
+    assert [(i["kind"], i["reason"]) for i in row["detail"]["failed_items"]] == [
+        ("Mail", "NO refused"),
+        ("Calendar", "mailcow answered HTTP 500 without a message; the SOGo log has the cause")]
+    assert row["result"] == {"level": "warn", "text": "2 problems"}
+
+
+@pytest.mark.parametrize(("status", "error", "reason"), [
+    ("skipped", "too large: over 157286400 bytes", "Too large: over the 150.0 MB limit"),
+    ("skipped", "too large: 1572864 bytes", "Too large: 1.5 MB"),
+    ("failed", "DAV HTTP 403: Forbidden", "DAV HTTP 403: Forbidden"),
+    ("failed", "DAV HTTP 507:", "mailcow answered HTTP 507 without a message; the SOGo log has "
+     "the cause"),
+    ("failed", "", "Failed; no reason was recorded"),
+    ("failed", None, "Failed; no reason was recorded"),
+    ("skipped", None, "Skipped"),
+    ("failed", 7, "Failed; no reason was recorded"),
+    ("failed", "too large: 99999999999999999999 bytes", "too large: 99999999999999999999 bytes"),
+])
+def test_reason_texts(status, error, reason):
+    e = with_failed(migrate_entry(), "mail", [{**BIG, "status": status, "error": error}])
+    assert only(summarize_report(report("migrate", {ANNA: e})))["detail"]["failed_items"][0][
+        "reason"] == reason
+
+
+def test_an_item_without_a_label_is_still_listed():
+    e = with_failed(migrate_entry(status="failed", failed=1), "calendar",
+                    [{"place": "personal", "title": "", "hint": "", "status": "failed",
+                      "error": "DAV HTTP 500: "}], 1)
+    item = only(summarize_report(report("migrate", {ANNA: e}, 1)))["detail"]["failed_items"][0]
+    assert item["title"] == "" and item["place"] == "personal" and "HTTP 500" in item["reason"]
+
+
+def test_failed_items_are_capped_and_the_rest_is_counted():
+    many = [{**BIG, "title": f"m{i}"} for i in range(MAX_DETAIL + 50)]
+    detail = only(summarize_report(report("migrate", {ANNA: with_failed(
+        migrate_entry(), "mail", many, 1000)})))["detail"]
+    assert len(detail["failed_items"]) == MAX_DETAIL and detail["more_failed_items"] == 800
+    detail = only(summarize_report(report("migrate", {ANNA: with_failed(
+        migrate_entry(), "mail", many, 3)})))["detail"]  # a total below the list: the list wins
+    assert detail["more_failed_items"] == 50
+
+
+def test_failed_item_texts_are_cleaned_and_cut():
+    e = with_failed(migrate_entry(), "mail", [{
+        "place": "IN\x1bBOX", "title": "‮" + "t" * 1000, "hint": 5, "status": "failed",
+        "error": "e\x07" + "x" * 1000}])
+    item = only(summarize_report(report("migrate", {ANNA: e})))["detail"]["failed_items"][0]
+    assert item["place"] == "INBOX" and item["title"] == "t" * 300 and item["hint"] == ""
+    assert item["reason"] == "e" + "x" * 299
+
+
+@pytest.mark.parametrize("items", ["x", {"a": 1}, [1, 2], [BIG, None]])
+def test_an_unreadable_failed_items_list_is_never_ok(items):
+    for command, base in (("migrate", migrate_entry()), ("verify", {**GOOD_VERIFY})):
+        s = summarize_report(report(command, {ANNA: with_failed(base, "mail", items)}))
+        assert only(s)["result"]["level"] != "ok" and s["headline"]["level"] != "ok"
+        json.dumps(s)
+    s = summarize_report(report("migrate", {ANNA: with_failed(migrate_entry(), "mail", [], "9")}))
+    assert only(s)["result"]["level"] != "ok"
+
+
+def test_a_report_without_failed_items_renders_as_before():
+    detail = only(summarize_report(report("migrate", {ANNA: migrate_entry(
+        status="failed", failed=3)}, exit_code=1)))["detail"]
+    assert detail["failed_items"] == [] and detail["more_failed_items"] == 0
+    assert detail["cards"][0]["note"] == "The next Migrate tries the failed items again."
+    assert only(summarize_report(report("verify", {ANNA: GOOD_VERIFY})))["detail"][
+        "failed_items"] == []

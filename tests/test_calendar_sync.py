@@ -202,3 +202,55 @@ def test_verify_counts_isc_82(env):
     dav.calendars["personal"].pop("UID1")
     v = mig(cfg, state, graph, dav).verify()
     assert {c.slug: c for c in v.collections}["personal"].mismatch
+
+
+# -- labels of failed events --------------------------------------------------------------
+
+def test_put_failure_is_listed_with_title_start_and_calendar(env):
+    cfg, state, graph, dav, _ = env
+    graph.routes[f"{U}/calendars/c-def/events"][0].update(
+        subject="Board meeting", start={"dateTime": "2024-03-05T09:00:00.0000000",
+                                        "timeZone": "UTC"})
+    dav.put_errors["UID1"] = DavError(500, "")
+    res = mig(cfg, state, graph, dav).migrate()
+    expected = [{"place": "Calendar", "title": "Board meeting",
+                 "hint": "starts 2024-03-05 09:00 UTC", "status": "failed",
+                 "error": "DAV HTTP 500: "}]
+    assert (res.failed_items, res.failed_items_total) == (expected, 1)
+    assert res.failed == 1  # the listed items are not counted a second time
+    v = mig(cfg, state, graph, dav).verify()
+    assert (v.failed_items, v.failed_items_total) == (expected, 1)
+
+
+def test_event_without_subject_or_start_is_still_listed(env):
+    cfg, state, graph, dav, _ = env
+    dav.put_errors["UID1"] = DavError(500, "")
+    res = mig(cfg, state, graph, dav).migrate()
+    assert [(i["title"], i["hint"]) for i in res.failed_items] == [("(no title)", "")]
+
+
+def test_all_day_and_recurring_hints():
+    from o365_to_mailcow.calendar_sync import event_label
+
+    start = {"dateTime": "2024-03-05T00:00:00.0000000", "timeZone": "UTC"}
+    assert event_label({"subject": "Holiday", "isAllDay": True, "start": start}) == (
+        "Holiday", "all day 2024-03-05")
+    assert event_label({"type": "seriesMaster", "start": start}) == (
+        "(no title)", "starts 2024-03-05 00:00 UTC · recurring")
+    assert event_label({"start": "garbage", "subject": 5}) == ("(no title)", "")
+
+
+def test_verify_lists_stored_failures_when_listing_fails(env):
+    cfg, state, graph, dav, _ = env
+    dav.put_errors["UID1"] = DavError(500, "")
+    mig(cfg, state, graph, dav).migrate()
+    graph.routes[f"{U}/calendars"] = GraphError(503, "down", "x")
+    v = mig(cfg, state, graph, dav).verify()
+    assert v.errors and v.failed_items_total == 1
+
+
+def test_dry_run_lists_no_failed_events(env):
+    cfg, state, graph, _, _ = env
+    state.mark_event(MAPPING.source, "personal", "UID1", None, STATUS_FAILED, "x")
+    res = mig(cfg, state, graph, None, dry_run=True).migrate()
+    assert (res.failed_items, res.failed_items_total) == ([], 0)

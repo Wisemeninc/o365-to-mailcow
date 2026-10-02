@@ -16,6 +16,7 @@ import hashlib
 import logging
 import re
 import secrets
+import sqlite3
 import time
 import traceback
 import unicodedata
@@ -40,7 +41,7 @@ from .imap_dest import (
     ImapError,
     is_quota_error,
 )
-from .report import NullProgress, Progress
+from .report import FAILED_ITEMS_LIMIT, NullProgress, Progress
 from .state import STATUS_DONE, STATUS_FAILED, STATUS_SKIPPED, State
 
 log = logging.getLogger(__name__)
@@ -69,6 +70,9 @@ APPEND_BATCH_BYTES = 8 * 1024 * 1024  # ... or fewer when their MIME exceeds thi
 MIME_OVERHEAD = 1.4  # MAPI size -> rough MIME size (base64 attachments)
 MAX_KEYWORDS = 20
 MAX_KEYWORD_LEN = 50  # Dovecot's default mail_max_keyword_length
+LABEL_LOOKUPS = 100  # Graph lookups for failed/too-large message titles, per mailbox per run
+LABEL_LOOKUP_FAILURES = 3  # lookups that raised before the rest of the run stops looking up
+LABEL_SELECT = "subject,from,receivedDateTime"
 
 WELL_KNOWN_MAP = {
     "inbox": "INBOX",
@@ -149,6 +153,9 @@ class MailResult:
     errors: list[str] = field(default_factory=list)
     stopped: bool = False
     duration_s: float = 0.0
+    # messages currently failed or skipped (state.failed_items); not part of ``failed``
+    failed_items: list[dict] = field(default_factory=list)
+    failed_items_total: int = 0
 
     def total(self, attr: str) -> int:
         return sum(getattr(f, attr) for f in self.folders)
@@ -186,6 +193,8 @@ class MailVerify:
     sample_regenerated: int = 0  # same headers and size class, different MIME rendering
     sample_unverifiable: int = 0
     errors: list[str] = field(default_factory=list)
+    failed_items: list[dict] = field(default_factory=list)
+    failed_items_total: int = 0
 
 
 # -- pure helpers ----------------------------------------------------------------------
@@ -340,6 +349,30 @@ def same_message(source: bytes, dest: bytes) -> str:
     return "regenerated"
 
 
+def _utc_minute(raw: object) -> str:
+    """ISO timestamp -> ``2024-03-05 09:12 UTC``; "" for anything unreadable."""
+    if not isinstance(raw, str) or not raw:
+        return ""
+    try:
+        value = dtparser.isoparse(raw)
+    except (ValueError, OverflowError):
+        return ""
+    value = value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+    return value.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def message_label(meta: dict) -> tuple[str, str]:
+    """(title, hint) of a message from Graph's subject/from/receivedDateTime."""
+    subject = meta.get("subject")
+    title = subject.strip() if isinstance(subject, str) else ""
+    sender = ((meta.get("from") or {}).get("emailAddress") or {}).get("address")
+    parts = [f"from {sender}"] if isinstance(sender, str) and sender else []
+    received = _utc_minute(meta.get("receivedDateTime"))
+    if received:
+        parts.append(f"received {received}")
+    return title or "(no subject)", " · ".join(parts)
+
+
 # -- migrator --------------------------------------------------------------------------
 
 class _DeltaLinkError(Exception):
@@ -366,6 +399,10 @@ class MailMigrator:
         self._dry_run = dry_run
         self._progress = progress or NullProgress()
         self._key = f"{mapping.source} mail"
+        # (folder_id, graph_id, dest_name) of failed/skipped messages whose title is looked
+        # up at the end of migrate(); only the mailbox's own thread touches it: every mark
+        # happens there (downloads run on the pool, their results are consumed here)
+        self._label_queue: list[tuple[str, str, str]] = []
 
     # -- folder plan -------------------------------------------------------------------
 
@@ -546,11 +583,68 @@ class MailMigrator:
             if self._dry_run:
                 self._dry_run_count(result)
             else:
-                self._migrate(result)
+                self._migrate(result)  # a stop or a folder error returns normally
+                # not in finally: an exception propagating (Ctrl-C included) discards the
+                # result, and must not wait for title lookups first
+                self._resolve_labels()
+                self._fill_failed_items(result)
         finally:
             result.duration_s = round(time.monotonic() - started, 3)
             self._progress.finish(self._key)
         return result
+
+    # -- labels of failed items --------------------------------------------------------
+    # Every mark_message(FAILED/SKIPPED) is followed by _remember, which writes a label
+    # from the listing alone. Titles are looked up only at the end of migrate(): Graph may
+    # be throttled or failing exactly when an item fails, and a lookup there could stall
+    # the run. A label must never change an item's outcome, so nothing here raises.
+
+    def _remember(self, fp: FolderPlan, msg: dict) -> None:
+        try:
+            gid = str(msg["id"])
+            received = _utc_minute(msg.get("receivedDateTime"))
+            self._state.set_label(self._src, "mail", fp.folder_id, gid, fp.dest_name, "",
+                                  f"received {received}" if received else "")
+            if len(self._label_queue) < LABEL_LOOKUPS:
+                self._label_queue.append((fp.folder_id, gid, fp.dest_name))
+        except Exception as exc:  # noqa: BLE001 - a label must never change an outcome
+            log.warning("%s: could not label a failed message: %s", self._src,
+                        exc.__class__.__name__)
+
+    def _resolve_labels(self) -> None:
+        """Look up subject, sender and date of the queued failed/skipped messages; after
+        ``LABEL_LOOKUP_FAILURES`` lookups that raised, the rest keep the listing's label."""
+        queue, self._label_queue = self._label_queue, []
+        failures = 0
+        for fid, gid, place in queue:
+            if failures >= LABEL_LOOKUP_FAILURES:
+                log.warning("%s: %d message title lookup(s) failed; the remaining failed "
+                            "messages are listed without a title", self._src, failures)
+                return
+            try:
+                if self._state.message_status(self._src, fid, gid) not in (
+                        STATUS_FAILED, STATUS_SKIPPED):
+                    continue  # copied by a later attempt in this run
+            except Exception as exc:  # noqa: BLE001 - a label must never change an outcome
+                log.warning("%s: message title lookups abandoned: %s", self._src,
+                            exc.__class__.__name__)
+                return
+            try:
+                meta = self._graph.get(self._user_path(f"messages/{gid}"),
+                                       params={"$select": LABEL_SELECT},
+                                       headers=PREFER_IMMUTABLE)
+                title, hint = message_label(meta if isinstance(meta, dict) else {})
+                self._state.set_label(self._src, "mail", fid, gid, place, title, hint)
+            except Exception:  # noqa: BLE001 - a label must never change an outcome
+                failures += 1
+
+    def _fill_failed_items(self, result: MailResult | MailVerify) -> None:
+        try:
+            result.failed_items, result.failed_items_total = self._state.failed_items(
+                self._src, "mail", FAILED_ITEMS_LIMIT)
+        except sqlite3.Error as exc:
+            log.warning("%s: could not list failed messages: %s", self._src,
+                        exc.__class__.__name__)
 
     def _dry_run_count(self, result: MailResult) -> None:
         plan = self.plan()
@@ -756,6 +850,7 @@ class MailMigrator:
             if size is not None and size > self._cfg.max_message_bytes:
                 self._state.mark_message(src, fid, gid, name, mid, STATUS_SKIPPED,
                                          error=f"too large: {size} bytes")
+                self._remember(fp, msg)
                 fr.skipped_too_large += 1
                 self._progress.advance(self._key)
                 continue
@@ -776,6 +871,7 @@ class MailMigrator:
                                 "appended", src, error, name)
                     self._state.mark_message(src, fid, gid, name, mid, STATUS_FAILED,
                                              error=error)
+                    self._remember(fp, msg)
                     fr.failed += 1
                     self._progress.advance(self._key)
                     continue
@@ -801,6 +897,7 @@ class MailMigrator:
         except GraphTooLarge as exc:
             self._state.mark_message(src, fid, gid, name, mid, STATUS_SKIPPED,
                                      error=f"too large: over {exc.limit} bytes")
+            self._remember(fp, msg)
             fr.skipped_too_large += 1
             self._progress.advance(self._key)
             return "skipped"
@@ -858,6 +955,7 @@ class MailMigrator:
                 for m, mid, _ in batch:
                     self._state.mark_message(src, fid, m["id"], name, mid, STATUS_FAILED,
                                              error=str(exc))
+                    self._remember(fp, m)
                     fr.failed += 1
                 for _, other, _e in pending:
                     other.cancel()
@@ -869,6 +967,7 @@ class MailMigrator:
                 if isinstance(outcome, ImapError):  # this one message was refused
                     self._state.mark_message(src, fid, m["id"], name, mid, STATUS_FAILED,
                                              error=str(outcome))
+                    self._remember(fp, m)
                     fr.failed += 1
                     if is_quota_error(outcome):  # ISC-99: out of space, stop this mailbox
                         stop = outcome
@@ -897,12 +996,14 @@ class MailMigrator:
             except GraphTooLarge as exc:  # ISC-52: abandoned while streaming
                 self._state.mark_message(src, fid, gid, name, mid, STATUS_SKIPPED,
                                          error=f"too large: over {exc.limit} bytes")
+                self._remember(fp, msg)
                 fr.skipped_too_large += 1
                 self._progress.advance(self._key)
                 continue
             except GraphError as exc:  # ISC-49: record and continue
                 self._state.mark_message(src, fid, gid, name, mid, STATUS_FAILED,
                                          error=f"graph HTTP {exc.status}: {exc}")
+                self._remember(fp, msg)
                 fr.failed += 1
                 self._progress.advance(self._key)
                 continue
@@ -970,6 +1071,7 @@ class MailMigrator:
                 self._sample(dest, plan, sample, out)
         finally:
             dest.close()
+        self._fill_failed_items(out)
         return out
 
     def _surplus_copies(self, dest: ImapDestination, fp: FolderPlan, fv: FolderVerify) -> None:

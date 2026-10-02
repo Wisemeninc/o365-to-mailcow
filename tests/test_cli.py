@@ -545,3 +545,17 @@ def test_report_records_the_per_run_scope(world, config, mailcow, tmp_path):
                      "--mail-since", "2024-01-01", "plan"]) == 0
     assert _newest_report(tmp_path)["scope"] == {"only": "mail", "mailbox": "alice@contoso.com",
                                                  "mail_since": "2024-01-01"}
+
+
+def test_failed_event_is_named_in_migrate_and_verify_output(world, config, mailcow, capsys):
+    from o365_to_mailcow.dav import DavError
+
+    dav = FakeDav()
+    dav.put_errors["UID1"] = DavError(500, "")
+    world.davs["alice@example.net"] = dav
+    assert cli.main(["--config", config(), "migrate"]) == 1
+    line = "    not copied: Calendar · (no title): DAV HTTP 500: "
+    assert line in capsys.readouterr().out.splitlines()
+    assert cli.main(["--config", config(), "verify"]) == 1
+    out = capsys.readouterr().out
+    assert line in out.splitlines() and "calendar Calendar: 1 failed" in out
