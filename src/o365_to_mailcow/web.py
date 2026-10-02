@@ -557,11 +557,11 @@ class _SignInRelay:
     server's own output (``WebApp.out``, else stderr), and the device-code prompt is kept
     on the app for ``/api/status`` while the sign-in waits."""
 
-    def __init__(self, app: WebApp) -> None:
+    def __init__(self, app: WebApp, sign_ins: SignIns | None = None) -> None:
         self._app = app
         # the holder of the connection this provider was built for: after a settings
         # change the app has a new one, and this relay's prompts are no longer shown
-        self._sign_ins = app._sign_ins
+        self._sign_ins = sign_ins if sign_ins is not None else app._sign_ins
 
     def _stream(self) -> TextIO:
         return self._app.out or sys.stderr
@@ -602,6 +602,7 @@ class WebApp:
         self._tenant: tuple[float, dict[str, Any]] | None = None
         self._tokens: TokenProvider | None = None
         self._sign_ins = SignIns()  # the tenant listing's device-code prompts (see _reload)
+        self._conn_gen = 0  # counts changes of the connection settings (guarded by _lock)
         self._secrets = cli.SecretFilter()
         for value in (cfg.client_secret, cfg.mailcow_api_key, token):
             self._secrets.add(value)
@@ -769,8 +770,9 @@ class WebApp:
             self._reload()
         return self.settings()
 
-    def _web_cache_path(self) -> Path:
-        return self.cfg.state_dir / f"msal_cache_web_{config_mod.connection_id(self.cfg)}.bin"
+    def _web_cache_path(self, cfg: Config | None = None) -> Path:
+        cfg = cfg or self.cfg
+        return cfg.state_dir / f"msal_cache_web_{config_mod.connection_id(cfg)}.bin"
 
     def _discard_sign_ins(self) -> None:
         """Delete every MSAL token cache in the state directory (web and job caches), so a
@@ -780,6 +782,7 @@ class WebApp:
                 path.unlink()
         with self._lock:
             self._tokens = None
+            self._conn_gen += 1
             self._sign_ins = SignIns()  # a prompt of the old connection is not shown again
 
     def _reload(self) -> None:
@@ -792,6 +795,7 @@ class WebApp:
             self._tenant = None
             # a provider built for the old settings keeps its own holder: whatever it still
             # prompts for is not this connection's sign-in and is not shown
+            self._conn_gen += 1
             self._sign_ins = SignIns()
         for value in (cfg.client_secret, cfg.mailcow_api_key):
             self._secrets.add(value)
@@ -831,20 +835,29 @@ class WebApp:
     # -- tenant and mailcow ------------------------------------------------------------
 
     def _token_provider(self) -> TokenProvider:
-        with self._lock:
-            tokens = self._tokens
-        if tokens is None:  # built outside the lock: MSAL may contact the authority
+        """The web UI's own provider for the current connection. It is built outside the
+        lock (MSAL may contact the authority) from one snapshot of the settings and their
+        sign-in holder, and kept only if the settings did not change meanwhile: a provider
+        for an old connection is never installed and never publishes into the new holder."""
+        while True:
+            with self._lock:
+                if self._tokens is not None:
+                    return self._tokens
+                gen, cfg, holder = self._conn_gen, self.cfg, self._sign_ins
             # own cache file: a job's TokenProvider writes msal_cache_<connection>.bin; a
             # device-code prompt reaches the page through /api/status (see _SignInRelay)
-            tokens = TokenProvider(self.cfg, cache_path=self._web_cache_path(),
-                                   out=_SignInRelay(self))
+            built = TokenProvider(cfg, cache_path=self._web_cache_path(cfg),
+                                  out=_SignInRelay(self, holder))
             with self._lock:
-                self._tokens = tokens = self._tokens or tokens
-        return tokens
+                if self._conn_gen == gen:
+                    self._tokens = self._tokens or built
+                    return self._tokens
+            # the settings changed while it was being built: build again for the new ones
 
     def tenant_mailboxes(self, refresh: bool) -> dict[str, Any]:
         with self._lock:
             cached = self._tenant
+            gen = self._conn_gen
         if cached and not refresh and time.monotonic() - cached[0] < TENANT_CACHE_SECONDS:
             return cached[1]
         try:
@@ -855,7 +868,8 @@ class WebApp:
             raise HttpError(502, self._upstream_error(exc)) from exc
         payload = {"fetched_at": _now(), "mailboxes": tenant_rows(users)}
         with self._lock:
-            self._tenant = (time.monotonic(), payload)
+            if self._conn_gen == gen:  # never cache the old tenant's list for new settings
+                self._tenant = (time.monotonic(), payload)
         return payload
 
     def mailcow_check(self, body: object) -> dict[str, Any]:

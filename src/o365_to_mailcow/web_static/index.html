@@ -486,6 +486,7 @@
     status: null,
     statusGen: 0,
     statusSeq: 0,
+    statusApplied: 0,
     savedRows: [],
     selectionDigest: null,
     selectionPath: "",
@@ -886,8 +887,8 @@
   const loadStatus = async () => {
     const seq = ++state.statusSeq;
     const data = await api("GET", "/api/status");
-    if (seq !== state.statusSeq) {
-      return; // a newer status request is out: this older answer must not undo what it shows
+    if (seq < state.statusApplied) {
+      return; // a newer answer is already shown: this older one must not undo it
     }
     if (!isObject(data)) {
       throw badResponse("/api/status");
@@ -912,6 +913,7 @@
       }
     }
 
+    state.statusApplied = seq;
     state.status = data;
     $("hdr-version").textContent = "v" + data.version;
     const configured = data.configured !== false;

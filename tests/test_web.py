@@ -2164,6 +2164,49 @@ def test_a_settings_change_retires_the_old_connections_prompt(tmp_path):
     assert app.status()["sign_in"]["code"] == "NEW-CODE"
 
 
+def test_reload_retires_prompts_and_a_provider_built_across_it(client, monkeypatch):
+    """`_reload()` on its own gives the app a new holder; a provider whose construction
+    straddles the reload is thrown away and built again for the new settings, so the old
+    connection neither gets installed nor publishes into the new holder."""
+    app = client.server.app
+    old_relay = web._SignInRelay(app)
+    old_relay.sign_in_prompt(DEVICE_URL, "OLD-CODE", 900)
+    assert app.status()["sign_in"]["code"] == "OLD-CODE"
+    app._reload()
+    assert app.status()["sign_in"] is None
+    old_relay.sign_in_prompt(DEVICE_URL, "OLD-AGAIN", 900)
+    assert app.status()["sign_in"] is None
+
+    building, proceed = threading.Event(), threading.Event()
+    built: list = []
+
+    class SlowTokens:
+        def __init__(self, cfg, cache_path=None, out=None) -> None:
+            self.cfg, self.out = cfg, out
+            built.append(self)
+            if len(built) == 1:  # only the first construction straddles the reload
+                building.set()
+                assert proceed.wait(5)
+
+    monkeypatch.setattr(web, "TokenProvider", SlowTokens)
+    with app._lock:
+        app._tokens = None
+    got: list = []
+    thread = threading.Thread(target=lambda: got.append(app._token_provider()))
+    thread.start()
+    assert building.wait(5)
+    app._reload()  # the settings change while the first provider is being built
+    proceed.set()
+    thread.join(5)
+    assert len(built) == 2 and got == [built[1]] and app._tokens is built[1]
+    assert built[0].out._sign_ins is not app._sign_ins  # the obsolete one: invisible holder
+    assert built[1].out._sign_ins is app._sign_ins
+    built[0].out.sign_in_prompt(DEVICE_URL, "STALE", 900)
+    assert app.status()["sign_in"] is None
+    built[1].out.sign_in_prompt(DEVICE_URL, "FRESH", 900)
+    assert app.status()["sign_in"]["code"] == "FRESH"
+
+
 def test_pending_sign_ins_are_bounded(monkeypatch):
     """Many flows waiting at once (threads that are all still alive): the oldest go."""
     monkeypatch.setattr(web, "MAX_SIGN_INS", 4)
