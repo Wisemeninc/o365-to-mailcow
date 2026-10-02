@@ -242,6 +242,10 @@ mailboxes, pick the ones to migrate, set destination address, display name and q
 mailbox, check which destinations exist in mailcow, save the list, start `plan`,
 `provision`, `migrate`, `verify` and `cleanup`, watch them run and read what they found.
 
+![The web UI after a verify run: the six steps, the outcome line and the mailbox table](docs/web-ui.png)
+
+*The page after a `verify` of five mailboxes (demo data).*
+
 A strip of six steps (Connect, Select, Provision, Migrate, Verify, Clean up) shows how far
 the migration is, from the newest real run of each command. Under it one outcome line says
 what the latest report means ("28 items have not arrived in mailcow") and offers the next
