@@ -9,3 +9,5 @@ state/
 .claude/
 compose.override.yaml
 config/
+# Local working spec; names the live setup, never published.
+ISA.md
