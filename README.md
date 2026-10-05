@@ -392,6 +392,15 @@ the report says so. Photos are copied when `contacts_photos = true`.
 
 - Teams chats, OneDrive, SharePoint, To Do tasks, OneNote, Outlook rules, signatures,
   category colours, retention and litigation holds.
+- Outlook Notes: the mailbox's Notes folder, which is also where Apple Notes on an
+  iPhone, iPad or Mac keeps the notes of an Exchange account. Graph lists neither the
+  folder nor its items, and Exchange Web Services, the only API that could read them, is
+  blocked for third-party apps since 1 October 2026. Move them with the device instead:
+  add the mailcow mailbox on the iPhone or Mac as an IMAP account with Notes switched on,
+  then in Notes select the notes under the Microsoft 365 account and move them to the
+  mailcow account. Apple Notes stores them as messages in an IMAP folder named `Notes`,
+  which any mail client can open. Move one note first and check that it arrives; a move
+  removes the note from the Microsoft 365 account.
 - Online archive mailboxes (separate Graph resources; not in this version).
 - Sharing permissions, delegates, calendar ACLs: recreate them in SOGo by hand.
 - Personal distribution lists (contact groups): Graph does not expose them.
