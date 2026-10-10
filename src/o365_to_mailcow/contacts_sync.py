@@ -210,9 +210,14 @@ class ContactsMigrator:
                          category: str | None) -> None:
         gid = contact["id"]
         last_modified = contact.get("lastModifiedDateTime")
-        if last_modified and self._state.contact_last_modified(self._src, gid) == last_modified:
+        saved = self._state.contact_saved(self._src, gid)
+        if last_modified and saved and saved[0] == last_modified and (
+                saved[1] or not self._cfg.contacts_photos):
             cr.unchanged += 1
             return
+        # a contact once saved with its photo keeps it: a later run without photos would
+        # otherwise PUT a vCard without PHOTO over it (a PUT replaces the whole card)
+        photos = self._cfg.contacts_photos or bool(saved and saved[1])
         if self._dry_run:
             cr.would_put += 1
             return
@@ -221,7 +226,7 @@ class ContactsMigrator:
             if category not in cats:
                 cats.append(category)
             contact = {**contact, "categories": cats}
-        photo, photo_ok = self._photo(gid) if self._cfg.contacts_photos else (None, True)
+        photo, photo_ok = self._photo(gid) if photos else (None, True)
         try:
             conv = contacts_conv.convert_contact(contact, photo)
         except Exception as exc:  # a converter bug must not end the whole run
@@ -233,10 +238,10 @@ class ContactsMigrator:
         except DavError as exc:
             self._fail(cr, contact, gid, last_modified, str(exc))
             return
-        # a contact whose photo could not be fetched is stored without its last_modified
-        # so the next run tries again (the vCard itself is complete apart from PHOTO)
-        self._state.mark_contact(self._src, gid, cr.slug,
-                                 last_modified if photo_ok else None, STATUS_DONE)
+        # a contact whose photo could not be fetched counts as saved without it, so the
+        # next run with photos tries again (the vCard itself is complete apart from PHOTO)
+        self._state.mark_contact(self._src, gid, cr.slug, last_modified, STATUS_DONE,
+                                 photos=photos and photo_ok)
         cr.put += 1
 
     def _fail(self, cr: CollectionResult, contact: dict, gid: str, last_modified: str | None,

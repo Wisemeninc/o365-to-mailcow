@@ -471,6 +471,7 @@
         <input id="opt-sample" type="number" min="0" max="1000" step="1" value="0" aria-describedby="h-sample">
         <span id="h-sample" class="muted small">Fetches that many messages from both sides and compares them. 0 skips the check.</span>
       </div>
+      <label id="f-photos" class="drybox"><input id="opt-photos" type="checkbox"> <span><span class="strong">Contact photos</span> · also adds them to contacts copied earlier</span></label>
       <label id="f-dry" class="drybox"><input id="opt-dry" type="checkbox"> <span><span class="strong">Dry run</span> · report what would happen, write nothing</span></label>
       <p id="sheet-msg" class="msg error" aria-live="polite"></p>
       <div class="sheet-btns">
@@ -2268,7 +2269,7 @@
 
     // the run sheet chose the options; jobs act on the saved selection only
     // the digest is the one the sheet listed its mailboxes from, not a later reload's
-    const { only, mailbox, sample, since, digest } = opts;
+    const { only, mailbox, sample, since, photos, digest } = opts;
 
     state.starting = true;
     updateRunButtons();
@@ -2284,6 +2285,7 @@
           sample,
           selection_digest: digest,
           mail_since: since,
+          contacts_photos: photos,
         },
       });
       if (!isObject(r) || !(isStr(r.id) || isNum(r.id))) {
@@ -3128,7 +3130,7 @@
   const SHEET = {
     plan: { desc: "Reads both sides and reports what would be copied. Changes nothing.", only: true, dry: false },
     provision: { desc: "Creates the missing mailboxes and aliases in mailcow.", only: false, dry: true },
-    migrate: { desc: "Writes to mailcow. Items already copied are skipped.", only: true, dry: true },
+    migrate: { desc: "Writes to mailcow. Items already copied are skipped.", only: true, dry: true, photos: 1 },
     verify: { desc: "Counts both sides and compares them. Creates temporary app passwords.", only: true, dry: false },
     cleanup: { desc: "Deletes the o365-migration app passwords in mailcow.", only: false, dry: false },
   };
@@ -3193,6 +3195,8 @@
     $("f-sample").hidden = command !== "verify";
     $("f-dry").hidden = !cfg.dry;
     $("opt-dry").checked = false;
+    $("f-photos").hidden = !cfg.photos;
+    $("opt-photos").checked = false;
     setMsg($("sheet-msg"), "", "error");
     renderSheet();
     const sheet = $("run-sheet");
@@ -3237,6 +3241,7 @@
       mailbox: $("opt-mailbox").value || null,
       sample: cmd === "verify" && sampleText ? Number(sampleText) : 0,
       since: cfg.only ? $("opt-since").value || null : null,
+      photos: !!cfg.photos && $("opt-photos").checked,
       digest: sheet.digest,
     }).then(() => {
       if (!$("job-view").hidden) {

@@ -91,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--mail-since", metavar="YYYY-MM-DD", type=_iso_date, default=s,
                         help="copy only mail received on or after this date (overrides "
                              "run.mail_since; calendars and contacts are unaffected)")
+    common.add_argument("--contacts-photos", action="store_true", default=s,
+                        help="also copy contact photos (migrate; overrides "
+                             "run.contacts_photos); contacts copied earlier without their "
+                             "photo are copied again")
     common.add_argument("--only", choices=KINDS, default=s,
                         help="restrict to one kind of data")
     common.add_argument("--mailbox", metavar="ADDRESS", default=s,
@@ -139,6 +143,7 @@ class Options:
     verbose: int
     sample: int
     mail_since: date | None = None
+    contacts_photos: bool = False
 
     @classmethod
     def from_args(cls, ns: argparse.Namespace) -> Options:
@@ -147,6 +152,7 @@ class Options:
             mailboxes_csv=getattr(ns, "mailboxes", None), only=getattr(ns, "only", None),
             mailboxes_only=getattr(ns, "mailboxes_only", False),
             mail_since=getattr(ns, "mail_since", None),
+            contacts_photos=getattr(ns, "contacts_photos", False),
             mailbox=getattr(ns, "mailbox", None), dry_run=getattr(ns, "dry_run", False),
             keep_app_passwords=getattr(ns, "keep_app_passwords", False),
             verbose=getattr(ns, "verbose", 0) or 0, sample=getattr(ns, "sample", 0) or 0,
@@ -804,6 +810,8 @@ def main(argv: Iterable[str] | None = None, *, stdout: TextIO | None = None,
                           require_credentials=opts.command != "web")
         if opts.mail_since is not None:
             cfg = dataclasses.replace(cfg, mail_since=opts.mail_since)
+        if opts.contacts_photos:
+            cfg = dataclasses.replace(cfg, contacts_photos=True)
         mailboxes = select_mailboxes(cfg, opts.mailbox)
         cfg.state_dir.mkdir(parents=True, exist_ok=True)
     except (ConfigError, OSError) as exc:

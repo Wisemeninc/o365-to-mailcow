@@ -82,6 +82,29 @@ def test_events_and_contacts(tmp_path):
     assert s.contact_last_modified("a@x", "c1") == "lm1"
     assert s.contact_last_modified("a@x", "c2") is None
     assert s.contact_counts("a@x") == {"personal": {"done": 1}, "suppliers": {"failed": 1}}
+    assert s.contact_saved("a@x", "c1") == ("lm1", False)
+    assert s.contact_saved("a@x", "c2") is None  # failed
+    s.mark_contact("a@x", "c1", "personal", "lm1", STATUS_DONE, photos=True)
+    assert s.contact_saved("a@x", "c1") == ("lm1", True)
+    s.close()
+
+
+def test_contacts_table_from_before_photos_gets_the_column(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "s.db"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE contacts (mailbox TEXT NOT NULL, graph_id TEXT NOT NULL, "
+                "book TEXT NOT NULL, last_modified TEXT, status TEXT NOT NULL, error TEXT, "
+                "updated_at REAL NOT NULL, PRIMARY KEY (mailbox, graph_id))")
+    old.execute("INSERT INTO contacts VALUES ('a@x','c1','personal','lm1','done',NULL,0)")
+    old.commit()
+    old.close()
+    s = State(path)
+    assert s.contact_saved("a@x", "c1") == ("lm1", False)
+    other = State(path)  # a second process: the column is there already, no error
+    assert other.contact_saved("a@x", "c1") == ("lm1", False)
+    other.close()
     s.close()
 
 

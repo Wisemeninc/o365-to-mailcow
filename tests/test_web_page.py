@@ -206,6 +206,7 @@ def test_expected_controls_exist() -> None:
         "opt-mailbox",
         "opt-since",
         "opt-dry",
+        "opt-photos",
         "btn-conn-toggle",
         "hdr-job",
         "settings-section",

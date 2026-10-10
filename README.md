@@ -219,6 +219,8 @@ Options (before or after the command):
 - `--mail-since YYYY-MM-DD` copy only mail received on or after this date (`plan`,
   `migrate`, `verify`)
 - `--mailboxes-only` use only the `--mailboxes` CSV, ignoring `run.mailboxes` in the config
+- `--contacts-photos` also copy contact photos (`migrate`; overrides
+  `run.contacts_photos`)
 - `-v` debug logging
 
 Exit codes: **0** everything succeeded, **1** something failed (or, for `verify`, anything
@@ -386,7 +388,12 @@ Events are only re-uploaded when Graph's `lastModifiedDateTime` changed.
 **Contacts.** The default contact folder goes to SOGo's `personal` address book; every
 other folder (recursively) becomes its own address book. If SOGo refuses to create an
 address book, those contacts go to `personal` with the folder name as a category, and
-the report says so. Photos are copied when `contacts_photos = true`.
+the report says so. Photos are copied when `contacts_photos = true` or with
+`--contacts-photos` (the "Contact photos" switch in the web UI's run sheet). Turning
+photos on later is enough: contacts copied earlier without their photo are copied
+again, once. A contact saved with its photo keeps it in later runs without photos. This
+adds a column to the state database's `contacts` table; builds from before it cannot
+write contacts to that database any more.
 
 ## What is not migrated
 

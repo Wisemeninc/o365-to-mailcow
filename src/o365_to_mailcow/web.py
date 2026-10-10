@@ -110,7 +110,7 @@ SCOPE_KINDS = ("mail", "calendar", "contacts")
 JOB_COMMANDS = ("plan", "provision", "migrate", "verify", "cleanup")
 _SNAPSHOT_PLACEHOLDER = "<selection-snapshot>"
 JOB_OPTIONS = frozenset({"command", "dry_run", "only", "mailbox", "sample", "selection_digest",
-                         "mail_since"})
+                         "mail_since", "contacts_photos"})
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 ALLOWED_METHODS = "GET, POST, PUT"
 NONCE_PLACEHOLDER = "__CSP_NONCE__"
@@ -1004,6 +1004,9 @@ class WebApp:
                 raise HttpError(400, "mail_since is not a real date") from exc
         else:
             mail_since = None
+        contacts_photos = body.get("contacts_photos", False)
+        if not isinstance(contacts_photos, bool):
+            raise HttpError(400, "contacts_photos must be true or false")
         sample = body.get("sample", 0)
         sample = 0 if sample is None else sample
         if isinstance(sample, bool) or not isinstance(sample, int) or not 0 <= sample <= MAX_SAMPLE:
@@ -1041,6 +1044,8 @@ class WebApp:
             argv += ["--sample", str(sample)]
         if mail_since and command in ("plan", "migrate", "verify"):
             argv += ["--mail-since", mail_since]
+        if contacts_photos and command == "migrate":
+            argv.append("--contacts-photos")
         return command, argv, snapshot
 
     def _running(self) -> Job | None:  # caller holds the lock

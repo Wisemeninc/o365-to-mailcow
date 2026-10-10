@@ -105,6 +105,44 @@ def test_second_run_idempotent_on_last_modified(env):
     assert sorted(c["id"] for c, _ in conv.calls) == ["c2", "c3"]
 
 
+def test_turning_photos_on_recopies_contacts_saved_without_them(env, tmp_path):
+    _, state, graph, dav, conv = env
+    mig(make_config(tmp_path, contacts_photos=False), state, graph, dav).migrate()
+    assert len(conv.calls) == 4
+    conv.calls.clear()
+    on = make_config(tmp_path, contacts_photos=True)
+    plan_run = mig(on, state, graph, None, dry_run=True).migrate()
+    assert sum(c.would_put for c in plan_run.collections) == 4 and not conv.calls
+    res = mig(on, state, graph, dav).migrate()
+    assert {c["id"]: p for c, p in conv.calls} == {
+        "c1": b"\xff\xd8JPEG", "c2": None, "c3": None, "c4": None}
+    assert sum(c.put for c in res.collections) == 4
+    conv.calls.clear()
+    mig(on, state, graph, dav).migrate()  # only c3, whose photo fetch failed, again
+    assert [c["id"] for c, _ in conv.calls] == ["c3"]
+    conv.calls.clear()
+    res = mig(make_config(tmp_path, contacts_photos=False), state, graph, dav).migrate()
+    assert not conv.calls and sum(c.unchanged for c in res.collections) == 4
+
+
+def test_contact_saved_with_photo_keeps_it_in_a_run_without_photos(env, tmp_path):
+    _, state, graph, dav, conv = env
+    mig(make_config(tmp_path, contacts_photos=True), state, graph, dav).migrate()
+    conv.calls.clear()
+    graph.routes[f"{U}/contacts"][0]["lastModifiedDateTime"] = "2025-01-01T00:00:00Z"
+    graph.routes[f"{U}/contacts"][1]["lastModifiedDateTime"] = "2025-01-01T00:00:00Z"
+    graph.routes[f"{U}/contactFolders/cf1/contacts"][0]["lastModifiedDateTime"] = "2025-01-01"
+    off = make_config(tmp_path, contacts_photos=False)
+    mig(off, state, graph, dav).migrate()
+    # c1 and c2 were saved with their photo looked up: looked up again, kept. c3's photo
+    # fetch had failed, so it was saved without one and a run without photos skips it.
+    assert {c["id"]: p for c, p in conv.calls} == {"c1": b"\xff\xd8JPEG", "c2": None,
+                                                   "c3": None}
+    assert graph.paths().count(f"{U}/contacts/c3/photo/$value") == 1  # the first run only
+    assert state.contact_saved(MAPPING.source, "c1")[1] is True
+    assert state.contact_saved(MAPPING.source, "c3")[1] is False
+
+
 def test_mkcol_refused_falls_back_to_personal_with_category_isc_84(env):
     cfg, state, graph, _, conv = env
     dav = FakeDav(refuse_mkcol=True)

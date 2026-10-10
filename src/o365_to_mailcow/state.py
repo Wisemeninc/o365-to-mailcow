@@ -111,6 +111,16 @@ class State:
         self._conn = sqlite3.connect(self._path, check_same_thread=False, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        # added after the first release: 1 = the contact was saved after its photo was
+        # looked up, so turning contacts_photos on later re-copies only the others. Two
+        # processes may open an older database at once: the second ALTER then finds the
+        # column there already, which is fine.
+        try:
+            self._conn.execute(
+                "ALTER TABLE contacts ADD COLUMN photos INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc):
+                raise
 
     def close(self) -> None:
         self._conn.close()
@@ -331,17 +341,26 @@ class State:
     # -- contacts ----------------------------------------------------------------------
 
     def contact_last_modified(self, mailbox: str, graph_id: str) -> str | None:
+        saved = self.contact_saved(mailbox, graph_id)
+        return saved[0] if saved else None
+
+    def contact_saved(self, mailbox: str, graph_id: str) -> tuple[str | None, bool] | None:
+        """``(lastModifiedDateTime, saved with its photo looked up)`` of the copy in
+        mailcow, or None when there is no successful copy."""
         row = self._row(
-            "SELECT last_modified FROM contacts WHERE mailbox=? AND graph_id=? AND status=?",
+            "SELECT last_modified, photos FROM contacts WHERE mailbox=? AND graph_id=? "
+            "AND status=?",
             (mailbox, graph_id, STATUS_DONE),
         )
-        return row[0] if row else None
+        return (row[0], bool(row[1])) if row else None
 
     def mark_contact(self, mailbox: str, graph_id: str, book: str, last_modified: str | None,
-                     status: str, error: str | None = None) -> None:
+                     status: str, error: str | None = None, *, photos: bool = False) -> None:
         self._exec(
-            "INSERT OR REPLACE INTO contacts VALUES (?,?,?,?,?,?,?)",
-            (mailbox, graph_id, book, last_modified, status, _trim(error), time.time()),
+            "INSERT OR REPLACE INTO contacts (mailbox, graph_id, book, last_modified, status, "
+            "error, updated_at, photos) VALUES (?,?,?,?,?,?,?,?)",
+            (mailbox, graph_id, book, last_modified, status, _trim(error), time.time(),
+             int(photos)),
         )
 
     def contact_counts(self, mailbox: str) -> dict[str, dict[str, int]]:

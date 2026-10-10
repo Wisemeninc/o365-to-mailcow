@@ -262,6 +262,20 @@ def test_second_migrate_is_idempotent(world, config, mailcow):
     assert len(dav_writes(world)) == writes  # ISC-81
 
 
+def test_contacts_photos_flag_recopies_contacts_without_photo(world, config, mailcow):
+    assert cli.main(["--config", config(), "--only", "contacts", "migrate"]) == 0
+    writes = len(dav_writes(world))
+    photo_paths = lambda: [p for g in world.graphs for p in g.paths()  # noqa: E731
+                           if p.endswith("/photo/$value")]
+    assert not photo_paths()
+    assert cli.main(["--config", config(), "--only", "contacts", "migrate",
+                     "--contacts-photos"]) == 0
+    assert len(dav_writes(world)) == writes + 2 and len(photo_paths()) == 2  # 2 mailboxes
+    assert cli.main(["--config", config(), "--only", "contacts", "migrate",
+                     "--contacts-photos"]) == 0
+    assert len(dav_writes(world)) == writes + 2  # saved after the photo lookup: unchanged
+
+
 def test_dry_run_zero_writes_isc_96(world, config, mailcow, tmp_path, capsys):
     assert cli.main(["--config", config(), "--dry-run", "migrate"]) == 0
     assert mailcow_calls(mailcow, "POST") == []

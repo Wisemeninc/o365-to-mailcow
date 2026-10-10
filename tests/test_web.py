@@ -599,8 +599,17 @@ def test_job_options_become_cli_arguments_isc_160(client, monkeypatch):
                                   "selection_digest": digest})
     wait_job(client, r.json()["id"])
     assert argvs[1][4:] == ["--mailboxes-only", "migrate"]
+    r = client.post("/api/jobs", {"command": "migrate", "contacts_photos": True,
+                                  "selection_digest": digest})
+    wait_job(client, r.json()["id"])
+    assert argvs[2][4:] == ["--mailboxes-only", "migrate", "--contacts-photos"]
+    r = client.post("/api/jobs", {"command": "verify", "contacts_photos": True,  # migrate only
+                                  "selection_digest": digest})
+    wait_job(client, r.json()["id"])
+    assert argvs[3][4:] == ["--mailboxes-only", "verify"]
     listing = client.get("/api/jobs").json()
-    assert [j["command"] for j in listing] == ["migrate", "verify"]  # newest first
+    assert [j["command"] for j in listing] == ["verify", "migrate", "migrate",
+                                               "verify"]  # newest first
 
 
 @pytest.mark.parametrize("body", [
@@ -608,7 +617,7 @@ def test_job_options_become_cli_arguments_isc_160(client, monkeypatch):
     {"command": "plan", "only": "email"}, {"command": "plan", "dry_run": "yes"},
     {"command": "verify", "sample": -1}, {"command": "verify", "sample": True},
     {"command": "verify", "sample": "3"}, {"command": "plan", "mailbox": "--config=/etc/x"},
-    {"command": "plan", "mailbox": 7}, ["plan"],
+    {"command": "plan", "mailbox": 7}, ["plan"], {"command": "migrate", "contacts_photos": 1},
 ])
 def test_job_rejects_unknown_commands_and_options(client, monkeypatch, body):
     started = []
